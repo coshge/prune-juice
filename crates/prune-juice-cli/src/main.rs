@@ -58,6 +58,8 @@ OPTIONS:
     --vault-dump VOL    Preserve a volume now, without deleting anything
     --vault-verify      Re-read every preserved copy and confirm it is intact
     --vault-restore ID  Recreate a volume from a preserved copy
+    --vault-forget ID   Delete a preserved copy. Irreversible, so it needs
+                        --reason, same as a waiver.
     -h, --help          Show this help
 
 With no arguments on a terminal, `prune-juice` opens an interactive
@@ -108,6 +110,7 @@ enum VaultCmd {
     Verify,
     Dump(String),
     Restore(String),
+    Forget(String),
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -162,6 +165,11 @@ fn parse_args() -> Result<Args, String> {
             "--vault-dump" => {
                 a.vault_cmd = Some(VaultCmd::Dump(
                     it.next().ok_or("--vault-dump needs a volume name")?,
+                ))
+            }
+            "--vault-forget" => {
+                a.vault_cmd = Some(VaultCmd::Forget(
+                    it.next().ok_or("--vault-forget needs an entry id")?,
                 ))
             }
             "--vault-restore" => {
@@ -281,7 +289,7 @@ fn wants_tui(args: &Args) -> bool {
 
 /// The vault subcommands. Read-only except `restore`, which creates a volume
 /// and refuses to overwrite an existing one.
-fn run_vault(cmd: &VaultCmd) -> Result<i32, Error> {
+fn run_vault(cmd: &VaultCmd, reason: Option<&str>) -> Result<i32, Error> {
     let vault = Vault::open()?;
     let entries = vault.entries()?;
 
@@ -359,6 +367,45 @@ fn run_vault(cmd: &VaultCmd) -> Result<i32, Error> {
             println!("  nothing was deleted.");
             Ok(0)
         }
+        VaultCmd::Forget(id) => {
+            // Removing the last copy of something already deleted is the most
+            // irreversible act this tool can perform — more so than the
+            // deletion it backed up, which was recoverable precisely because
+            // this file existed. So it takes a reason, like a waiver.
+            let Some(entry) = entries.iter().find(|e| e.id == *id) else {
+                return Err(Error::Config(format!(
+                    "no vault entry with id {id}; run --vault to list them"
+                )));
+            };
+            let Some(reason) = reason else {
+                return Err(Error::Config(format!(
+                    "--vault-forget needs --reason. This is the last copy of {} \
+                     ({}), and deleting it cannot be undone.",
+                    entry.volume,
+                    entry.archive_bytes.human()
+                )));
+            };
+            if reason.trim().chars().count() < 12 {
+                return Err(Error::Config(
+                    "--reason needs to say something (12 characters or more)".into(),
+                ));
+            }
+            let others = entries
+                .iter()
+                .filter(|e| e.volume == entry.volume && e.id != entry.id)
+                .count();
+            vault.forget(entry)?;
+            println!("  forgot {} ({})", entry.id, reason.trim());
+            if others == 0 {
+                println!(
+                    "  that was the only copy of {} — it is now unrecoverable",
+                    entry.volume
+                );
+            } else {
+                println!("  {others} other cop(y/ies) of {} remain", entry.volume);
+            }
+            Ok(0)
+        }
         VaultCmd::Restore(id) => {
             let Some(entry) = entries.iter().find(|e| e.id == *id) else {
                 return Err(Error::Config(format!(
@@ -424,7 +471,7 @@ fn run(args: &Args) -> Result<i32, Error> {
         return run_waivers(cmd, args.reason.as_deref());
     }
     if let Some(cmd) = &args.vault_cmd {
-        return run_vault(cmd);
+        return run_vault(cmd, args.reason.as_deref());
     }
     let cancel = Cancel::new();
 
@@ -732,7 +779,10 @@ fn render_receipt(r: &Receipt) {
     // whether they are comfortable; "20 networks, 89 containers" does.
     let mut by_kind: std::collections::BTreeMap<&str, usize> = Default::default();
     for i in &r.items {
-        if matches!(i.outcome, ItemOutcome::WouldDelete | ItemOutcome::Deleted) {
+        // `Preserved` means removed *and* copied to the vault first, so it
+        // belongs in the count. Omitting it made a preserved volume disappear
+        // from the breakdown while still being counted in the total.
+        if i.outcome.removed() || i.outcome == ItemOutcome::WouldDelete {
             *by_kind.entry(i.kind.as_str()).or_default() += 1;
         }
     }

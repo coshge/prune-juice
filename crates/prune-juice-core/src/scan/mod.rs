@@ -467,6 +467,24 @@ impl<'a> Scanner<'a> {
                 }
             }
             remembered = index.all_historical_owners(&daemon.id).unwrap_or_default();
+
+            // Also pull absences for paths only the index remembers.
+            //
+            // Once the last container naming a project is gone, that project
+            // drops out of the catalog too — so keying absences off the
+            // catalog alone loses the count exactly when it is needed most.
+            // Found by running --apply for real: afterwards the restored
+            // volumes came back Unattributed because nothing left knew where
+            // "nbk" had lived.
+            for (_, path) in remembered.values() {
+                let Some(path) = path else { continue };
+                if project_absences.contains_key(path) {
+                    continue;
+                }
+                if let Ok(Some(h)) = index.project_history(&daemon.id, path) {
+                    project_absences.insert(path.clone(), h.absent_scans);
+                }
+            }
         }
 
         for p in catalog.projects() {
@@ -523,6 +541,45 @@ impl<'a> Scanner<'a> {
                             since_unix: *since_unix,
                             scans: *n,
                         };
+                    }
+                }
+            }
+
+            // A claim can name its project and still not know where it lived.
+            // That happens the moment the last container carrying the path is
+            // removed: the volume's own label says `project=nbk`, but no label
+            // anywhere says where `nbk` is, so the claim cannot be checked
+            // against a directory and falls to Weak.
+            //
+            // The index remembers. Supplying the path from memory is precisely
+            // what it is for, and the orphan threshold still applies — a
+            // remembered path only matters once the index has also counted the
+            // directory missing across several scans.
+            if r.kind == ResourceKind::Volume {
+                if let Some((_, Some(path))) = remembered.get(&r.name) {
+                    for c in claims.iter_mut() {
+                        if c.root.is_none() {
+                            let root = std::path::PathBuf::from(path);
+                            c.liveness = match project_absences.get(path) {
+                                Some(n) => crate::model::Liveness::Absent {
+                                    since_unix: None,
+                                    scans: *n,
+                                },
+                                None => crate::providers::liveness_of(Some(&root)),
+                            };
+                            c.evidence.push(crate::model::Evidence::new(
+                                crate::model::EvidenceSource::Index,
+                                format!(
+                                    "project path {path} recalled from a container that has since been removed"
+                                ),
+                            ));
+                            c.root = Some(root);
+                            // Ownership was already authoritative from the
+                            // label; only the location was missing.
+                            if c.confidence < Confidence::Strong {
+                                c.confidence = Confidence::Strong;
+                            }
+                        }
                     }
                 }
             }
@@ -987,6 +1044,66 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, "orbstack", "the first context seen wins");
         assert_eq!(out[1].0, "other");
+    }
+
+    #[test]
+    fn the_index_supplies_a_path_the_labels_no_longer_carry() {
+        // Removing the last container that named a project's directory leaves
+        // its volumes labelled but unlocatable — the exact provenance loss the
+        // index exists to prevent. Found by running --apply for real: the
+        // volumes came back Unattributed afterwards.
+        let index = crate::index::Index::in_memory().unwrap();
+        let missing = "/tmp/pj-recalled-absent";
+
+        let with_container = FakeDocker {
+            containers: vec![container(
+                "nbk-wordpress-1",
+                &[(COMPOSE_PROJECT, "nbk"), (COMPOSE_WORKING_DIR, missing)],
+                &["nbk_mysql"],
+            )],
+            volumes: vec![volume("nbk_mysql", &[(COMPOSE_PROJECT, "nbk")])],
+        };
+        // Two scans, so the absence is corroborated.
+        for _ in 0..2 {
+            Scanner::with_index_only(&with_container, &index)
+                .scan(
+                    "t",
+                    &ScanOptions::default(),
+                    Arc::new(NullSink),
+                    &Cancel::new(),
+                )
+                .unwrap();
+        }
+
+        // Now the container is gone. Nothing left says where "nbk" lived.
+        let container_gone = FakeDocker {
+            containers: vec![],
+            volumes: vec![volume("nbk_mysql", &[(COMPOSE_PROJECT, "nbk")])],
+        };
+        let after = Scanner::with_index_only(&container_gone, &index)
+            .scan(
+                "t",
+                &ScanOptions::default(),
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        let v = after.of_kind(ResourceKind::Volume).next().unwrap();
+        assert_eq!(v.owner.as_deref(), Some("nbk"));
+        assert_eq!(
+            v.confidence,
+            Some(Confidence::Strong),
+            "the label owns it; the index only had to supply the path"
+        );
+        assert!(
+            v.claims.iter().any(|c| c.root.is_some()),
+            "the recalled path must be attached to the claim"
+        );
+        assert!(
+            v.orphan_candidate,
+            "and the verdict should now be reachable"
+        );
     }
 
     #[test]
