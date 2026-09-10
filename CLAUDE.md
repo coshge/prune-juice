@@ -10,25 +10,26 @@ model strong enough that the headline action needs no confirmation. Free MIT
 Rust CLI; a free macOS app comes later, architected so a one-time paid tier
 could be added without rework.
 
-## Status: M4a complete (content probe)
+## Status: M4a complete (content probe, both paths)
 
 | milestone | state |
 |---|---|
 | M1 read-only scan with provenance attribution | done |
 | M2 planner, tier classification, apply path | done |
 | M3 interactive ratatui TUI | done |
-| M4a content probe — **unlocks empty and derivative volumes** | done |
+| M4a content probe — native **and** container path | done |
 | M4b vault (dump / verify / restore) — unlocks the rest | next |
 | M5 review, waivers, host disk measurement | not started |
 | M6 macOS app | not started |
 
 ```
-cargo test --workspace                  # 129 tests
+cargo test --workspace                  # 133 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
 ./target/debug/prune-juice --no-tui     # force the one-shot report
 ./target/debug/prune-juice --apply      # reclaims the safe tier only
+./target/debug/prune-juice --container-probe   # force the Docker Desktop path
 
 cargo run -p prune-juice-tui --example preview   # render every screen, no TTY needed
 ```
@@ -41,10 +42,15 @@ cargo run -p prune-juice-tui --example preview   # render every screen, no TTY n
   is never assumed empty: on Docker Desktop the data root is hidden inside a VM,
   and the honest answer there is "cannot be proven safe". Enforced in
   `plan/tier.rs::destabilises`.
-- **The container-based probe is not implemented.** `VolumeAccess::detect`
-  returns unavailable on Docker Desktop, Colima and Podman, so those runtimes
-  currently get no volume reclamation at all. That is correct, not a bug to
-  paper over.
+- **Docker Desktop is a first-class target.** Its data root lives inside a VM,
+  so `VolumeAccess::detect` reports unavailable and the scan falls back to
+  `DockerProbe` — a throwaway container with the volumes bound read-only, no
+  network, and a read-only root filesystem. Both paths share `probe::classify`,
+  so a volume is judged identically however its bytes were read. Verified: on
+  the reference machine both paths independently return the same 50 volumes.
+- **The probe never pulls an image.** It picks one already present locally. If
+  there is none it says so and reclaims no volumes, rather than making an
+  outbound request on someone's metered or air-gapped machine.
 - **No image can reach the safe tier.** Image layer stacks are not fetched, so
   base-image relationships are unproven. Recorded honestly as
   `Opacity::ImageLayersUnknown` rather than assumed away.
@@ -110,7 +116,13 @@ All have regression tests — if you break one, a test will tell you.
 15. **A database signature beats every other signature.** Misreading a data
     directory as a cache is the failure that loses data, so engine detection
     runs before cache detection in `probe::classify`.
-16. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
+16. **Probe mounts are always `:ro`, network `none`, rootfs read-only.** The
+    `:ro` suffix on every bind is the boundary that stops an inspection from
+    changing what it inspects. There is a test asserting it.
+17. **The probe container is removed whatever happens.** The result is captured
+    before cleanup rather than propagated early, so a failure cannot leak a
+    container. Verified by container count before and after a real run.
+18. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
     fields and no public constructor; `Fresh` comes only from `revalidate()` and
     is consumed by the executor. Do not add a public constructor or a `Clone`.
 

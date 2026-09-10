@@ -90,6 +90,42 @@ pub trait DockerClient: Send + Sync {
     fn data_usage(&self) -> Result<DataUsage>;
 }
 
+/// What a probe container reports back about one volume.
+///
+/// Deliberately raw: classification happens in `crate::probe`, so the same
+/// rules apply whether the bytes were read natively or through a container.
+#[derive(Clone, Debug, Default)]
+pub struct RawProbe {
+    /// Top-level entries, capped.
+    pub entries: Vec<String>,
+    /// Files found, capped — a floor, not a total.
+    pub file_count: u64,
+    /// Newest mtime seen. Sampled rather than exhaustive on large volumes;
+    /// [`Self::mtime_sampled`] says which.
+    pub newest_mtime: Option<i64>,
+    pub mtime_sampled: bool,
+}
+
+/// Reading volume contents by mounting them into a throwaway container.
+///
+/// Needed on every VM-backed runtime — Docker Desktop, Colima, Podman machine —
+/// where the data root exists only inside the guest and cannot be read from the
+/// host. Without it those runtimes get no volume reclamation at all.
+///
+/// A third trait rather than part of [`DockerClient`] because it *does* create
+/// state, and separate from [`DockerMutate`] because it destroys nothing: the
+/// volume is mounted read-only, the container has no network and a read-only
+/// root, and it is removed afterwards.
+pub trait DockerProbe: Send + Sync {
+    /// A locally-present image with a shell, if there is one. `None` means the
+    /// probe cannot run, which is reported rather than worked around.
+    fn probe_image(&self) -> Option<String>;
+
+    /// Read several volumes in one container. Batching matters: a container per
+    /// volume would mean hundreds of spawns per scan.
+    fn probe_volumes(&self, volumes: &[String]) -> Result<BTreeMap<String, RawProbe>>;
+}
+
 /// Destructive operations, quarantined behind their own trait.
 ///
 /// Deliberately unimplemented in M1 — the binary shipped at that milestone has

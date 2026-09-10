@@ -36,6 +36,9 @@ OPTIONS:
     --no-tui            Force the one-shot report even on a terminal
     --no-probe          Skip reading volume contents. No volume can then be
                         proven safe, so this only ever shrinks what is offered.
+    --container-probe   Always read volume contents through a container, even
+                        where the host could read them directly. This is the
+                        only path available on Docker Desktop.
     -h, --help          Show this help
 
 With no arguments on a terminal, `prune-juice` opens an interactive
@@ -65,6 +68,7 @@ struct Args {
     only_context: Option<String>,
     no_tui: bool,
     no_probe: bool,
+    force_container_probe: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -78,6 +82,7 @@ fn parse_args() -> Result<Args, String> {
         only_context: None,
         no_tui: false,
         no_probe: false,
+        force_container_probe: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -86,6 +91,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-sizes" => a.with_sizes = false,
             "--no-tui" => a.no_tui = true,
             "--no-probe" => a.no_probe = true,
+            "--container-probe" => a.force_container_probe = true,
             "--apply" => a.apply = true,
             "--tiers" => {
                 let v = it.next().ok_or("--tiers needs a value")?;
@@ -204,6 +210,7 @@ fn run(args: &Args) -> Result<i32, Error> {
         project_roots: args.roots.clone(),
         with_sizes: args.with_sizes,
         probe_volumes: !args.no_probe,
+        force_container_probe: args.force_container_probe,
     };
 
     if wants_tui(args) {
@@ -257,7 +264,8 @@ fn run(args: &Args) -> Result<i32, Error> {
             eprint!("scanning {}… ", ctx.name);
             io::stderr().flush().ok();
         }
-        let report = Scanner::new(&client).scan(&ctx.name, &opts, sink.clone(), &cancel)?;
+        let report =
+            Scanner::with_probe(&client, &client).scan(&ctx.name, &opts, sink.clone(), &cancel)?;
         if !args.json {
             eprintln!("{} ms", report.duration_ms);
         }
@@ -289,7 +297,8 @@ fn run(args: &Args) -> Result<i32, Error> {
             io::stderr().flush().ok();
         }
         // Re-scan so witnesses are revalidated against a freshly taken world.
-        let fresh = Scanner::new(&client).scan(&ctx.name, &opts, sink.clone(), &cancel)?;
+        let fresh =
+            Scanner::with_probe(&client, &client).scan(&ctx.name, &opts, sink.clone(), &cancel)?;
         if args.apply && !args.json {
             eprintln!("ok");
         }

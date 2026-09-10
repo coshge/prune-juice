@@ -30,7 +30,12 @@ $ prune-juice
 **Status: M4a.** `prune-juice` on a terminal opens an interactive interface;
 piped or under CI it prints a one-shot report. Dry-run by default. The content
 probe now lets *empty* and *derivative* volumes be reclaimed; everything else
-stays irreversible until the vault lands. `--apply` reclaims the safe tier and nothing else.
+stays irreversible until the vault lands.
+
+Works on Docker Desktop as well as OrbStack and native Linux. Where the data
+root can be read from the host it is; where it cannot — every VM-backed runtime
+— the volumes are bound read-only into a throwaway container instead. Both paths
+share the same classifier and return the same answers. `--apply` reclaims the safe tier and nothing else.
 
 ## The problem
 

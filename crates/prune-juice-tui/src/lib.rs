@@ -232,7 +232,7 @@ fn spawn_scan(opts: &TuiOptions, tx: Sender<Msg>, cancel: Cancel) {
             }
         };
         let sink = Arc::new(ChannelSink(etx));
-        match Scanner::new(&client).scan(&context, &scan_opts, sink, &cancel) {
+        match Scanner::with_probe(&client, &client).scan(&context, &scan_opts, sink, &cancel) {
             Ok(report) => {
                 let plan = Planner::plan(&report, now_unix());
                 let _ = tx.send(Msg::Ready(Box::new((report, plan))));
@@ -262,7 +262,12 @@ fn spawn_apply(opts: &TuiOptions, plan: Plan, tx: Sender<Msg>, cancel: Cancel) {
         // item by item, immediately before its own delete.
         let (etx, _erx) = mpsc::channel::<Event>();
         let sink = Arc::new(ChannelSink(etx));
-        let fresh = match Scanner::new(&client).scan(&context, &scan_opts, sink.clone(), &cancel) {
+        let fresh = match Scanner::with_probe(&client, &client).scan(
+            &context,
+            &scan_opts,
+            sink.clone(),
+            &cancel,
+        ) {
             Ok(r) => r,
             Err(e) => {
                 let _ = tx.send(Msg::Failed(e.to_string()));

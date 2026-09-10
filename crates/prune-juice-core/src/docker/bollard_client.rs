@@ -19,7 +19,9 @@ use bollard::Docker;
 use crate::error::{Error, Result};
 use crate::model::{Bytes, ContainerState, DaemonId, ResourceId, ResourceKind, ResourceSummary};
 
-use super::{detect_runtime, DaemonIdentity, DataUsage, DockerClient, DockerMutate};
+use super::{
+    detect_runtime, DaemonIdentity, DataUsage, DockerClient, DockerMutate, DockerProbe, RawProbe,
+};
 
 pub struct BollardClient {
     docker: Docker,
@@ -402,9 +404,322 @@ impl DockerMutate for BollardClient {
     }
 }
 
+/// The script run inside the probe container.
+///
+/// Constraints it has to satisfy: POSIX-ish so it works under busybox as well
+/// as coreutils; bounded so a volume with a million files cannot hang a scan;
+/// and strictly read-only.
+const PROBE_SCRIPT: &str = r#"
+for d in /p/*; do
+  [ -d "$d" ] || continue
+  echo "@@@V $d"
+  ls -A "$d" 2>/dev/null | head -256
+  echo "@@@C"
+  find "$d" -type f 2>/dev/null | head -20000 | wc -l
+  echo "@@@M"
+  find "$d" -type f 2>/dev/null | head -200 | tr '\n' '\0' | xargs -0 stat -c %Y 2>/dev/null | sort -rn | head -1
+done
+echo "@@@END"
+"#;
+
+/// Images we know carry a shell and the handful of utilities the script needs.
+/// Ordered smallest-first so a probe costs as little as possible.
+const PREFERRED_PROBE_IMAGES: [&str; 6] =
+    ["busybox", "alpine", "debian", "ubuntu", "mariadb", "mysql"];
+
+impl BollardClient {
+    /// Pick a locally-present image to probe with.
+    ///
+    /// Never pulls. A probe that reaches the network turns a read-only
+    /// inspection into an outbound request, and on a metered or air-gapped
+    /// machine that is not ours to decide.
+    fn find_probe_image(&self) -> Option<String> {
+        let images = self.list_images().ok()?;
+        let tags: Vec<String> = images
+            .iter()
+            .flat_map(|i| i.repo_tags.iter().cloned())
+            .collect();
+
+        for want in PREFERRED_PROBE_IMAGES {
+            if let Some(t) = tags.iter().find(|t| {
+                let base = t.split(':').next().unwrap_or(t);
+                base == want || base.ends_with(&format!("/{want}"))
+            }) {
+                return Some(t.clone());
+            }
+        }
+        // Anything at all is better than nothing; the script degrades to an
+        // empty listing if the image has no shell, which reads as "not probed".
+        tags.into_iter().next()
+    }
+}
+
+impl DockerProbe for BollardClient {
+    fn probe_image(&self) -> Option<String> {
+        self.find_probe_image()
+    }
+
+    fn probe_volumes(&self, volumes: &[String]) -> Result<BTreeMap<String, RawProbe>> {
+        let mut out = BTreeMap::new();
+        if volumes.is_empty() {
+            return Ok(out);
+        }
+        let Some(image) = self.find_probe_image() else {
+            return Err(Error::Config(
+                "no local image is available to read volume contents; try `docker pull alpine`"
+                    .into(),
+            ));
+        };
+
+        // Mount each volume read-only at a numbered path. The index, not the
+        // name, is what maps results back — a volume name could contain
+        // characters the shell would treat specially.
+        let binds: Vec<String> = volumes
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("{v}:/p/{i:03}:ro"))
+            .collect();
+
+        let config = bollard::models::ContainerCreateBody {
+            image: Some(image),
+            cmd: Some(vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                PROBE_SCRIPT.to_string(),
+            ]),
+            // Belt and braces: no network, read-only root filesystem, and every
+            // mount read-only. The container cannot change anything it sees.
+            network_disabled: Some(true),
+            host_config: Some(bollard::models::HostConfig {
+                binds: Some(binds),
+                network_mode: Some("none".to_string()),
+                readonly_rootfs: Some(true),
+                auto_remove: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let created = self
+            .block(self.docker.create_container(
+                None::<bollard::query_parameters::CreateContainerOptions>,
+                config,
+            ))
+            .map_err(|e| map_err(e, &self.endpoint))?;
+        let id = created.id;
+
+        // From here on the container must be removed whatever happens, so the
+        // result is captured before the cleanup rather than propagated early.
+        let result = self.run_probe_container(&id);
+        let _ = self.block(self.docker.remove_container(
+            &id,
+            Some(bollard::query_parameters::RemoveContainerOptions {
+                v: false,
+                force: true,
+                link: false,
+            }),
+        ));
+
+        let text = result?;
+        for (idx, raw) in parse_probe_output(&text) {
+            if let Some(name) = volumes.get(idx) {
+                out.insert(name.clone(), raw);
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl BollardClient {
+    fn run_probe_container(&self, id: &str) -> Result<String> {
+        use futures_util::StreamExt;
+
+        self.block(
+            self.docker
+                .start_container(id, None::<bollard::query_parameters::StartContainerOptions>),
+        )
+        .map_err(|e| map_err(e, &self.endpoint))?;
+
+        let opts = bollard::query_parameters::LogsOptionsBuilder::new()
+            .follow(true)
+            .stdout(true)
+            .stderr(false)
+            .build();
+
+        self.block(async {
+            let mut stream = self.docker.logs(id, Some(opts));
+            let mut buf = String::new();
+            // The stream ends when the container exits, so this doubles as the
+            // wait. A cap stops a pathological volume producing unbounded output.
+            while let Some(chunk) = stream.next().await {
+                match chunk {
+                    Ok(out) => buf.push_str(&out.to_string()),
+                    Err(_) => break,
+                }
+                if buf.len() > 4 * 1024 * 1024 {
+                    break;
+                }
+            }
+            Ok(buf)
+        })
+    }
+}
+
+/// Parse the script's output back into per-volume reports.
+fn parse_probe_output(text: &str) -> Vec<(usize, RawProbe)> {
+    let mut out: Vec<(usize, RawProbe)> = Vec::new();
+    let mut current: Option<(usize, RawProbe)> = None;
+    let mut section = Section::Entries;
+
+    for line in text.lines() {
+        let line = line.trim_end_matches(['\r', '\n']);
+        if let Some(path) = line.strip_prefix("@@@V ") {
+            if let Some(c) = current.take() {
+                out.push(c);
+            }
+            let idx = path
+                .rsplit('/')
+                .next()
+                .and_then(|s| s.parse::<usize>().ok());
+            current = idx.map(|i| {
+                (
+                    i,
+                    RawProbe {
+                        mtime_sampled: true,
+                        ..Default::default()
+                    },
+                )
+            });
+            section = Section::Entries;
+            continue;
+        }
+        match line {
+            "@@@C" => {
+                section = Section::Count;
+                continue;
+            }
+            "@@@M" => {
+                section = Section::Mtime;
+                continue;
+            }
+            "@@@END" => break,
+            _ => {}
+        }
+        let Some((_, raw)) = current.as_mut() else {
+            continue;
+        };
+        if line.is_empty() {
+            continue;
+        }
+        match section {
+            Section::Entries => raw.entries.push(line.to_string()),
+            Section::Count => {
+                if let Ok(n) = line.trim().parse::<u64>() {
+                    raw.file_count = n;
+                }
+            }
+            Section::Mtime => {
+                if let Ok(t) = line.trim().parse::<i64>() {
+                    raw.newest_mtime = Some(t);
+                }
+            }
+        }
+    }
+    if let Some(c) = current.take() {
+        out.push(c);
+    }
+    for (_, raw) in out.iter_mut() {
+        raw.entries.sort();
+    }
+    out
+}
+
+enum Section {
+    Entries,
+    Count,
+    Mtime,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn probe_output_is_parsed_back_per_volume() {
+        let text = "\
+@@@V /p/000
+mysql
+ibdata1
+@@@C
+1234
+@@@M
+1700000000
+@@@V /p/001
+@@@C
+0
+@@@M
+@@@V /p/002
+node_modules
+@@@C
+9
+@@@M
+1699999999
+@@@END
+";
+        let got = parse_probe_output(text);
+        assert_eq!(got.len(), 3);
+
+        let (i0, r0) = &got[0];
+        assert_eq!(*i0, 0);
+        assert_eq!(r0.entries, vec!["ibdata1", "mysql"]); // sorted
+        assert_eq!(r0.file_count, 1234);
+        assert_eq!(r0.newest_mtime, Some(1_700_000_000));
+
+        // An empty volume: no entries, no mtime. This must survive, because it
+        // is the class that unlocks deletion.
+        let (i1, r1) = &got[1];
+        assert_eq!(*i1, 1);
+        assert!(r1.entries.is_empty());
+        assert_eq!(r1.file_count, 0);
+        assert_eq!(r1.newest_mtime, None);
+
+        assert_eq!(got[2].1.entries, vec!["node_modules"]);
+    }
+
+    #[test]
+    fn probe_output_survives_truncation_mid_stream() {
+        // The log stream is capped, so the last section can be cut off. A
+        // partial read must not be mistaken for an empty volume by the caller
+        // — it simply yields whatever was seen.
+        let text = "@@@V /p/000\nmysql\nibdata1\n@@@C\n5\n@@@M\n";
+        let got = parse_probe_output(text);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1.file_count, 5);
+        assert_eq!(got[0].1.newest_mtime, None);
+    }
+
+    #[test]
+    fn probe_output_ignores_noise_before_the_first_marker() {
+        let text = "some shell warning\n@@@V /p/007\na\n@@@C\n1\n@@@END\n";
+        let got = parse_probe_output(text);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 7, "the index comes from the mount path");
+        assert_eq!(got[0].1.entries, vec!["a"]);
+    }
+
+    #[test]
+    fn probe_mounts_are_read_only_and_indexed() {
+        // The bind string is the security boundary: `:ro` is what stops a probe
+        // from being able to change what it inspects.
+        let vols = ["a".to_string(), "weird:name".to_string()];
+        let binds: Vec<String> = vols
+            .iter()
+            .enumerate()
+            .map(|(i, v)| format!("{v}:/p/{i:03}:ro"))
+            .collect();
+        assert_eq!(binds[0], "a:/p/000:ro");
+        assert!(binds.iter().all(|b| b.ends_with(":ro")));
+    }
 
     #[test]
     fn parses_rfc3339_with_offset() {

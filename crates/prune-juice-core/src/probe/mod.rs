@@ -215,6 +215,26 @@ impl VolumeAccess {
     }
 }
 
+/// Turn a container probe's raw output into a report.
+///
+/// Deliberately shares `classify` with the native path, so a volume is judged
+/// by the same rules however its bytes were read. The only difference is
+/// honesty about precision: container counts are capped and the mtime is
+/// sampled, so `truncated` is set.
+pub fn from_raw(raw: &crate::docker::RawProbe) -> ContentReport {
+    ContentReport {
+        class: classify(&raw.entries, raw.file_count),
+        method: ProbeMethod::Container,
+        entries: raw.entries.clone(),
+        file_count: raw.file_count,
+        truncated: raw.mtime_sampled,
+        // The daemon already told us the size; a probe container should not
+        // walk 35 GB to recompute it.
+        bytes: Bytes(0),
+        newest_mtime: raw.newest_mtime,
+    }
+}
+
 /// Classify a directory, walking it fully (to the standard depth cap).
 pub fn probe_dir(path: &Path) -> ContentReport {
     probe_dir_to_depth(path, 12)

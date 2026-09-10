@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::docker::{DaemonIdentity, DataUsage, DockerClient};
+use crate::docker::{DaemonIdentity, DataUsage, DockerClient, DockerProbe};
 use crate::error::Result;
 use crate::event::{Cancel, Event, EventSink, Phase};
 use crate::model::{
@@ -35,6 +35,12 @@ pub struct ScanOptions {
     /// where the data root is reachable: 259 volumes in under half a second.
     /// Without it no volume can ever be proven safe to delete.
     pub probe_volumes: bool,
+    /// Ignore host access to the data root and always go through a container.
+    ///
+    /// Exists so the container path — the only one available on Docker Desktop
+    /// — can be exercised and cross-checked on a machine where the native path
+    /// also works. Not something a user needs.
+    pub force_container_probe: bool,
 }
 
 impl Default for ScanOptions {
@@ -43,6 +49,7 @@ impl Default for ScanOptions {
             project_roots: Vec::new(),
             with_sizes: true,
             probe_volumes: true,
+            force_container_probe: false,
         }
     }
 }
@@ -99,11 +106,25 @@ impl ScanReport {
 
 pub struct Scanner<'a> {
     client: &'a dyn DockerClient,
+    /// Used only when the data root cannot be read from the host — which is
+    /// every VM-backed runtime, Docker Desktop included.
+    probe: Option<&'a dyn DockerProbe>,
 }
 
 impl<'a> Scanner<'a> {
     pub fn new(client: &'a dyn DockerClient) -> Self {
-        Self { client }
+        Self {
+            client,
+            probe: None,
+        }
+    }
+
+    /// Supply a container-based probe for runtimes that hide their data root.
+    pub fn with_probe(client: &'a dyn DockerClient, probe: &'a dyn DockerProbe) -> Self {
+        Self {
+            client,
+            probe: Some(probe),
+        }
     }
 
     pub fn scan(
@@ -231,7 +252,9 @@ impl<'a> Scanner<'a> {
         let mut contents: BTreeMap<String, ContentReport> = BTreeMap::new();
         if opts.probe_volumes {
             let access = VolumeAccess::detect(daemon.runtime, daemon.data_root.as_deref());
-            if access.is_available() {
+            if access.is_available() && !opts.force_container_probe {
+                // Fast path: the data root is readable from the host, so no
+                // container is involved at all.
                 for (i, v) in volumes.iter().enumerate() {
                     if let Some(r) = access.probe_shallow(&v.name) {
                         contents.insert(v.name.clone(), r);
@@ -245,14 +268,68 @@ impl<'a> Scanner<'a> {
                         });
                     }
                 }
-                sink.emit(Event::Phase {
-                    phase: Phase::Probing,
-                    done: volumes.len() as u32,
-                    total: Some(volumes.len() as u32),
-                });
+            } else if let Some(prober) = self.probe {
+                // VM-backed runtime — Docker Desktop, Colima, Podman machine.
+                // The bytes exist only inside the guest, so the only way to
+                // read them is to mount them into a container.
+                //
+                // Only volumes with no referrer are worth the trouble: anything
+                // a container holds is Protected regardless of contents, and on
+                // a typical machine that cuts hundreds of candidates to dozens.
+                let candidates: Vec<String> = volumes
+                    .iter()
+                    .filter(|v| !mounted.contains(&v.name) && !v.in_use)
+                    .map(|v| v.name.clone())
+                    .collect();
+
+                if candidates.is_empty() {
+                    // Nothing to look at; not a failure.
+                } else if prober.probe_image().is_none() {
+                    let msg = "no local image is available to read volume contents on this runtime;                                `docker pull alpine` once and re-run"
+                        .to_string();
+                    sink.emit(Event::Warning {
+                        code: "probe_image_missing".into(),
+                        message: msg.clone(),
+                        resource: None,
+                    });
+                    warnings.push(msg);
+                } else {
+                    // Batched: a container per volume would mean hundreds of
+                    // spawns per scan.
+                    const BATCH: usize = 25;
+                    let total = candidates.len() as u32;
+                    let mut done = 0u32;
+                    for chunk in candidates.chunks(BATCH) {
+                        cancel.check()?;
+                        match prober.probe_volumes(chunk) {
+                            Ok(map) => {
+                                for (name, raw) in map {
+                                    contents.insert(name, crate::probe::from_raw(&raw));
+                                }
+                            }
+                            Err(e) => {
+                                let msg = format!("a volume probe failed: {e}");
+                                sink.emit(Event::Warning {
+                                    code: "probe_failed".into(),
+                                    message: msg.clone(),
+                                    resource: None,
+                                });
+                                warnings.push(msg);
+                                break;
+                            }
+                        }
+                        done += chunk.len() as u32;
+                        sink.emit(Event::Phase {
+                            phase: Phase::Probing,
+                            done,
+                            total: Some(total),
+                        });
+                    }
+                }
             } else {
                 let msg = format!(
-                    "volume contents are unreadable on this runtime ({:?}), so no volume can be proven safe to delete",
+                    "volume contents are unreadable on this runtime ({:?}) and no probe was supplied, \
+                     so no volume can be proven safe to delete",
                     daemon.runtime
                 );
                 sink.emit(Event::Warning {
