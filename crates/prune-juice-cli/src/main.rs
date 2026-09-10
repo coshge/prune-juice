@@ -743,11 +743,12 @@ fn render(r: &ScanReport, plan: &Plan) {
         );
         if t == Tier::Rebuildable {
             println!(
-                "                                       an old build with network-install steps"
+                "                                        an old build with network-install steps"
             );
             println!(
-                "                                       may no longer reproduce — see --explain"
+                "                                        may no longer reproduce; run without"
             );
+            println!("                                        --apply first and read the list");
         }
     }
     if Tier::OPT_IN

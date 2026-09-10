@@ -90,9 +90,7 @@ impl Tier {
             Tier::Free => "nothing here can be lost",
             Tier::Orphan => "owning project is gone; volumes are vaulted first",
             Tier::Repullable => "pulled again on next use — costs bandwidth, nothing else",
-            Tier::Rebuildable => {
-                "rebuilt from a context that still exists — costs time, and an old build                  with network-install steps may no longer reproduce"
-            }
+            Tier::Rebuildable => "rebuilt from a context that still exists — costs time",
             Tier::Stale => "dormant, project still exists; volumes are vaulted first",
             Tier::Protected => "not offered",
             Tier::Unattributed => "not offered — ownership unknown",
@@ -817,9 +815,9 @@ mod tests {
         assert_eq!(v.tier, Tier::Rebuildable);
         assert!(matches!(v.reversibility, Reversibility::Rebuildable(_)));
         assert!(v.because.contains("docker compose build"), "{}", v.because);
-        assert!(Tier::Rebuildable
-            .caveat()
-            .contains("may no longer reproduce"));
+        // The caveat names the cost; the reproducibility warning goes in the
+        // report underneath it, where there is room for a sentence.
+        assert!(Tier::Rebuildable.caveat().contains("costs time"));
     }
 
     #[test]

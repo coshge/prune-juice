@@ -23,7 +23,7 @@ could be added without rework.
 | M6 macOS app — window, scan, review; unsigned | done |
 
 ```
-cargo test --workspace                  # 191 tests
+cargo test --workspace                  # 201 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -67,6 +67,10 @@ no terminal, so that file is the only way to see why a scan failed.
   the window still never materialises — so the app launches, shows nothing and
   never scans. `AppDelegate` creates the `NSWindow` itself. Do not "simplify"
   this back to `@main struct App`.
+- **`Protected` is not a dead end any more.** A tagged image used to end there
+  permanently, which parked 111 GB out of reach. Recovery is now computed per
+  image and routes to `repullable` (bandwidth only) or `rebuildable` (time, and
+  an old build may not reproduce). Both are opt-in via `--tiers`.
 - **The app reads only.** It scans, classifies and shows evidence; reclaiming
   is still `prune-juice --apply` in a terminal.
 - **Docker Desktop is a first-class target.** Its data root lives inside a VM,
@@ -193,7 +197,15 @@ All have regression tests — if you break one, a test will tell you.
     fields, records as structs. If the transport is ever swapped for in-process
     FFI, the view models keep compiling and only `SubprocessService` is deleted.
     Rename them and that stops being true.
-30. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
+30. **A RepoDigests entry is not proof of pullability.** BuildKit stamps one on
+    locally built images, so `fen-wordpress@sha256:…` looks pullable and is
+    not. Check for a local build context *first*; fall back to the digest.
+31. **An image is always `Referenced::Unknown`** (layers unfetched), so the
+    live-container check never fires for one. Ask `graph.image_is_live()`
+    directly — otherwise an image serving a running container can be offered.
+32. **Every opt-in tier must state its price.** `Tier::caveat()` is not
+    decoration; a tier a user cannot cost is a tier they cannot consent to.
+33. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
     fields and no public constructor; `Fresh` comes only from `revalidate()` and
     is consumed by the executor. Do not add a public constructor or a `Clone`.
 
