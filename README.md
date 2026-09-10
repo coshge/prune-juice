@@ -496,6 +496,22 @@ prune-juice --deadline 30                   # give up and report what was gather
 prune-juice --context orbstack              # one context only
 ```
 
+**`--no-sizes` is for scanning fast, not for reclaiming.** bollard cannot encode
+`?type=` on `/system/df`, so a single unfiltered call is what supplies volume
+sizes *and* the build cache record list. Skipping it hides both:
+
+```
+$ prune-juice --no-tui              →  97 build cache records (29.5 MB reclaimable)
+                                       SAFE TO RECLAIM — 29.5 MB
+$ prune-juice --no-tui --no-sizes   →   0 build cache records (0 B reclaimable)
+                                       SAFE TO RECLAIM — 0 B
+```
+
+Both figures are honest about what was measured, but the second is easy to
+misread as "nothing to clean". It also changes what `--apply` does: the build
+cache prune is gated on a non-zero reclaimable figure, so `--no-sizes --apply`
+reclaims no build cache at all and reports that it freed nothing.
+
 `--json` emits one envelope per line, flushed as it goes, so a consumer renders
 progressively:
 

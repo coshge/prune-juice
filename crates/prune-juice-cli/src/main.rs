@@ -43,7 +43,11 @@ OPTIONS:
                                        longer reproduce
     --only-label <K=V>  Refuse to touch anything without this label
     --json              NDJSON on stdout, progress on stderr
-    --no-sizes          Skip volume sizing (the expensive call)
+    --no-sizes          Skip volume sizing (the expensive call). One call
+                        reports volume sizes AND build cache, so this also
+                        hides the build cache — the safe tier then reads 0 B
+                        and --apply reclaims none of it. Use it to scan fast,
+                        not before an --apply.
     --roots <PATHS>     Colon-separated dirs to search for projects
     --context <NAME>    Scan only this context
     --no-tui            Force the one-shot report even on a terminal

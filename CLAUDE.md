@@ -299,6 +299,14 @@ checkouts "derivative" because they contained a `vendor` directory.
 - bollard cannot encode `?type=` on `/system/df` (`serde_urlencoded` rejects a
   `Vec`), so the planned filter optimisation is unavailable. One unfiltered call
   returns volumes and build cache together, which is what `data_usage()` does.
+  **This makes `--no-sizes` sharper than it looks:** it hides the build cache
+  as well, so the safe tier reads 0 B and `--apply` prunes none of it (the
+  prune is gated on `plan.build_cache_reclaimable > 0` at `execute/mod.rs:414`).
+  Documented in the help and the tutorial. The available fix is to prune the
+  cache under `--no-sizes` anyway and report what the daemon says it freed —
+  `/build/prune` needs no `df` — but that means deleting without a
+  pre-measured figure, so it was left as a documented limit rather than a
+  silent change of behaviour.
 - `--apply` **has** now run for real, twice, with the author's authorisation:
   once scoped to the `nbk` orphans and once across the whole machine. The
   machine went from 255/259/24 containers/volumes/networks to 153/205/3 and
