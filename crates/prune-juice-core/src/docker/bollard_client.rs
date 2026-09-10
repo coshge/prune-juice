@@ -79,20 +79,91 @@ impl Drop for BollardClient {
     }
 }
 
+/// Classify a bollard error into our own taxonomy.
+///
+/// Matched on bollard's *variants*, and below them on the underlying
+/// `io::ErrorKind`, rather than on message text. The message for a failed
+/// connect is assembled several layers deep inside hyper and reads
+/// "Error in the hyper legacy client: client error (Connect)" — no substring
+/// a reasonable person would grep for. Sniffing for "connection refused"
+/// silently misclassified every unreachable daemon as a generic API error,
+/// which exited 1 instead of the documented 3.
 fn map_err(e: bollard::errors::Error, endpoint: &str) -> Error {
+    use bollard::errors::Error as B;
+    use std::io::ErrorKind as K;
+
     let s = e.to_string();
-    let lower = s.to_ascii_lowercase();
-    if lower.contains("permission denied") {
-        Error::PermissionDenied(s)
-    } else if lower.contains("no such file")
-        || lower.contains("connection refused")
-        || lower.contains("could not connect")
-        || lower.contains("timed out")
-    {
-        Error::DaemonUnreachable(format!("{s} (endpoint: {endpoint})"))
-    } else {
-        Error::Api(s)
+    let unreachable = |s: String| Error::DaemonUnreachable(format!("{s} (endpoint: {endpoint})"));
+
+    match &e {
+        // The socket is not there at all: bollard checks before dialling.
+        B::SocketNotFoundError(_) | B::RequestTimeoutError => unreachable(s),
+
+        // A transport failure. The daemon may be down, the socket may be
+        // root-owned, or it may not be a socket at all — the OS error kind is
+        // the only thing that distinguishes them, so look for it underneath.
+        B::HyperLegacyError { .. }
+        | B::HyperResponseError { .. }
+        | B::HttpClientError { .. }
+        | B::IOError { .. } => match io_kind(&e) {
+            Some(K::PermissionDenied) => Error::PermissionDenied(s),
+            _ => unreachable(s),
+        },
+
+        // A malformed endpoint is the user's configuration, not the daemon's
+        // health, so it exits 2 and does not suggest starting Docker.
+        B::UnsupportedURISchemeError { .. }
+        | B::URLParseError { .. }
+        | B::InvalidURIError { .. }
+        | B::InvalidURIPartsError { .. } => Error::Config(format!("{s} (endpoint: {endpoint})")),
+
+        // The daemon answered, and said no.
+        B::DockerResponseServerError { status_code, .. } if *status_code == 403 => {
+            Error::PermissionDenied(s)
+        }
+
+        _ => Error::Api(s),
     }
+}
+
+/// The `io::ErrorKind` underneath a bollard error, if there is one.
+///
+/// Two layers of indirection have to be unwrapped, and each one has a trap:
+///
+/// * `bollard::errors::Error::IOError` is `#[error(transparent)]`, which makes
+///   `source()` forward *past* the wrapped error to that error's own source.
+///   So the `io::Error` bollard is holding directly is invisible to a chain
+///   walk, and has to be taken from the variant.
+/// * A connect failure instead arrives as `hyper_util` wrapping `hyper`
+///   wrapping the `io::Error` that actually says what went wrong. Those do
+///   implement `source()` conventionally, so a walk finds it.
+fn io_kind(e: &bollard::errors::Error) -> Option<std::io::ErrorKind> {
+    if let bollard::errors::Error::IOError { err } = e {
+        return Some(innermost_kind(err));
+    }
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return Some(innermost_kind(io));
+        }
+        cur = err.source();
+    }
+    None
+}
+
+/// The innermost kind in a stack of nested `io::Error`s.
+///
+/// `ErrorKind::Other` is a wrapper's way of saying "ask the thing inside me";
+/// acting on it directly would discard the only kind worth having.
+fn innermost_kind(err: &std::io::Error) -> std::io::ErrorKind {
+    let kind = err.kind();
+    if kind != std::io::ErrorKind::Other {
+        return kind;
+    }
+    err.get_ref()
+        .and_then(|inner| inner.downcast_ref::<std::io::Error>())
+        .map(innermost_kind)
+        .unwrap_or(kind)
 }
 
 /// Docker hands us RFC3339 strings. We keep the original for display and a unix
@@ -883,5 +954,80 @@ node_modules
         assert_eq!(parse_rfc3339("not-a-date"), None);
         assert_eq!(parse_rfc3339("2026-13-01T00:00:00Z"), None);
         assert_eq!(parse_rfc3339("2026-00-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn an_unreachable_daemon_is_classified_as_unreachable_not_as_an_api_error() {
+        // This was a real bug: the classifier grepped for "connection refused"
+        // and similar, but bollard reports a failed connect as "Socket not
+        // found" or, one layer down, "client error (Connect)". Neither matched,
+        // so a stopped Docker exited 1 (findings) instead of the documented 3.
+        use bollard::errors::Error as B;
+
+        for e in [
+            B::SocketNotFoundError("/var/run/docker.sock".into()),
+            B::RequestTimeoutError,
+            B::IOError {
+                err: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            },
+            B::IOError {
+                err: std::io::Error::from(std::io::ErrorKind::NotFound),
+            },
+        ] {
+            let mapped = map_err(e, "unix:///var/run/docker.sock");
+            assert_eq!(
+                mapped.exit_code(),
+                3,
+                "expected daemon-unreachable, got {mapped:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_root_owned_socket_is_permission_denied_not_unreachable() {
+        // Telling someone to start Docker when Docker is running and they
+        // simply cannot open the socket sends them the wrong way entirely.
+        let e = bollard::errors::Error::IOError {
+            err: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        };
+        let mapped = map_err(e, "unix:///var/run/docker.sock");
+        assert_eq!(mapped.code(), "permission_denied");
+        assert_eq!(mapped.exit_code(), 4);
+    }
+
+    #[test]
+    fn a_malformed_endpoint_is_a_usage_error_not_a_daemon_verdict() {
+        // A typo in DOCKER_HOST says nothing about whether Docker is running.
+        let e = bollard::errors::Error::UnsupportedURISchemeError {
+            uri: "banana://wat".into(),
+        };
+        let mapped = map_err(e, "banana://wat");
+        assert_eq!(mapped.exit_code(), 2, "got {mapped:?}");
+    }
+
+    #[test]
+    fn a_daemon_that_answers_with_an_error_is_still_an_api_error() {
+        // The opposite failure: classifying a live daemon's 500 as
+        // "unreachable" would send the user to restart something that is fine.
+        let e = bollard::errors::Error::DockerResponseServerError {
+            status_code: 500,
+            message: "server error".into(),
+        };
+        let mapped = map_err(e, "unix:///var/run/docker.sock");
+        assert_eq!(mapped.code(), "api_error");
+        assert_eq!(mapped.exit_code(), 1);
+    }
+
+    #[test]
+    fn the_innermost_io_error_wins_over_outer_wrappers() {
+        // io_kind walks the source chain; a shallow check would miss the kind
+        // that hyper buries two layers down.
+        let inner =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "socket owned by root");
+        let wrapped = std::io::Error::other(inner);
+        assert_eq!(
+            io_kind(&bollard::errors::Error::IOError { err: wrapped }),
+            Some(std::io::ErrorKind::PermissionDenied)
+        );
     }
 }

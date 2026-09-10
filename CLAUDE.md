@@ -21,9 +21,10 @@ could be added without rework.
 | M4b vault (dump / verify / restore) | done |
 | M5 review actions, waivers, host disk measurement | done |
 | M6 macOS app — window, scan, review; unsigned | done |
+| README tutorial | done |
 
 ```
-cargo test --workspace                  # 201 tests
+cargo test --workspace                  # 206 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -208,6 +209,14 @@ All have regression tests — if you break one, a test will tell you.
 33. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
     fields and no public constructor; `Fresh` comes only from `revalidate()` and
     is consumed by the executor. Do not add a public constructor or a `Clone`.
+34. **Classify daemon errors by variant, never by message text.** `map_err` in
+    `bollard_client.rs` used to grep for "connection refused" and friends.
+    bollard reports a failed connect as `SocketNotFoundError` or, one layer
+    down, "client error (Connect)" — neither matched, so an unreachable daemon
+    exited 1 (findings) instead of the documented 3. Match the variant, and
+    below it the innermost `io::ErrorKind`. Note that `IOError` is
+    `#[error(transparent)]`, so `source()` forwards *past* the wrapped error
+    and a chain walk alone cannot see it.
 
 ## The acceptance gate
 
@@ -273,6 +282,16 @@ checkouts "derivative" because they contained a `vendor` directory.
   once (82.5 GB reported vs ~80.5 GB actual). Needs exclusive-size accounting.
 - Waivers still live in a JSON file rather than the index. Harmless, but they
   could move now that the index exists.
+- **There is no SIGINT handler.** `Error::Cancelled`/exit 130 is only reachable
+  by quitting the TUI mid-scan; Ctrl-C during a one-shot `--apply` kills the
+  process wherever it happens to be. Harmless for a read-only scan, and the
+  executor is item-at-a-time so it cannot tear one item in half, but the
+  receipt is not written. `Cancel` already exists in core and is threaded
+  through the scan — this is wiring a handler to it, not new machinery.
+- The plan called for refusing non-unix-socket daemons unless `--remote
+  --reason` (F5). Not implemented: `RuntimeFlavor::Remote` is detected but only
+  ever consulted by `disk/mod.rs` to report that the host cannot be measured. A
+  `tcp://` context is scanned like any other.
 - Warm scan is ~3–6 s, over the sub-2 s target. The fix is the size cache: an
   orphaned volume's size is immutable, so its cache entry is valid forever, and
   the expensive `df` is only needed for in-use volumes — exactly the ones that
@@ -280,12 +299,12 @@ checkouts "derivative" because they contained a `vendor` directory.
 - bollard cannot encode `?type=` on `/system/df` (`serde_urlencoded` rejects a
   `Vec`), so the planned filter optimisation is unavailable. One unfiltered call
   returns volumes and build cache together, which is what `data_usage()` does.
-- `--apply` has still never removed anything on a real daemon. The vault's
-  dump/verify/restore path **has** been proven end-to-end against one: a
-  throwaway volume was dumped, deleted, restored, and compared byte-for-byte
-  including labels. What remains unexercised is the delete step itself.
-- Old note, still true: The apply path is covered
-  by unit tests with a spy client, and dry-run exercises the identical code path
-  including per-item revalidation, but a real end-to-end deletion is unverified.
-  **Ask before running it** — it is 89 containers, 20 networks and ~12 GB of
-  build cache on the author's machine.
+- `--apply` **has** now run for real, twice, with the author's authorisation:
+  once scoped to the `nbk` orphans and once across the whole machine. The
+  machine went from 255/259/24 containers/volumes/networks to 153/205/3 and
+  from 109.16 GB to 99.32 GB host-measured — ~11 GB, and the vault holds three
+  verified `nbk` entries (22.9 MB compressed from 390 MB). The dump / verify /
+  restore path was separately proven byte-for-byte including labels. So the
+  delete step is no longer unexercised — but **still ask before running it**,
+  because the opt-in tiers reach a further ~80 GB and a mistake there is not
+  recoverable from anything but the vault.
