@@ -1,11 +1,8 @@
 //! Prune Juice CLI.
 //!
-//! M1 is read-only by construction: nothing here can delete anything, because
-//! the only destructive trait (`DockerMutate`) has no implementation in the
-//! workspace yet.
-//!
 //! House convention: stdout carries the payload, stderr carries human progress,
-//! so `prune-juice --json | jq` composes.
+//! so `prune-juice --json | jq` composes. Dry-run is the default; `--apply` has
+//! to be asked for.
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -14,7 +11,10 @@ use std::sync::Arc;
 use prune_juice_core::docker::bollard_client::BollardClient;
 use prune_juice_core::docker::{context, DockerClient};
 use prune_juice_core::event::{Cancel, JsonlSink, NullSink};
+use prune_juice_core::execute::{ExecuteOptions, Executor, ItemOutcome, Mode, Receipt};
 use prune_juice_core::model::{Bytes, Confidence, Liveness, ResourceKind};
+use prune_juice_core::plan::tier::{Reversibility, Tier};
+use prune_juice_core::plan::{Plan, Planner};
 use prune_juice_core::scan::{ScanOptions, ScanReport, Scanner};
 use prune_juice_core::Error;
 
@@ -25,13 +25,17 @@ USAGE:
     prune-juice [OPTIONS]
 
 OPTIONS:
+    --apply             Actually delete. Without this, nothing is touched.
+    --tiers <LIST>      Comma-separated: free,orphan,stale  (default: free)
+    --only-label <K=V>  Refuse to touch anything without this label
     --json              NDJSON on stdout, progress on stderr
     --no-sizes          Skip volume sizing (the expensive call)
     --roots <PATHS>     Colon-separated dirs to search for projects
     --context <NAME>    Scan only this context
     -h, --help          Show this help
 
-M1 is read-only. No flag in this build can remove anything.
+Tier `free` is the only one safe without review. Asking for `orphan` or
+`stale` on the command line skips a review step that exists for a reason.
 
 EXIT CODES:
     0  nothing needing attention
@@ -39,12 +43,16 @@ EXIT CODES:
     2  usage error
     3  daemon unreachable
     4  permission denied
+    5  partial failure — something was refused or failed
   130  cancelled
 ";
 
 struct Args {
     json: bool,
     with_sizes: bool,
+    apply: bool,
+    tiers: Vec<Tier>,
+    only_label: Option<(String, String)>,
     roots: Vec<PathBuf>,
     only_context: Option<String>,
 }
@@ -53,6 +61,9 @@ fn parse_args() -> Result<Args, String> {
     let mut a = Args {
         json: false,
         with_sizes: true,
+        apply: false,
+        tiers: vec![Tier::Free],
+        only_label: None,
         roots: default_roots(),
         only_context: None,
     };
@@ -61,6 +72,24 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--json" => a.json = true,
             "--no-sizes" => a.with_sizes = false,
+            "--apply" => a.apply = true,
+            "--tiers" => {
+                let v = it.next().ok_or("--tiers needs a value")?;
+                a.tiers = v
+                    .split(',')
+                    .map(|s| match s.trim() {
+                        "free" => Ok(Tier::Free),
+                        "orphan" => Ok(Tier::Orphan),
+                        "stale" => Ok(Tier::Stale),
+                        other => Err(format!("unknown tier: {other}")),
+                    })
+                    .collect::<Result<_, _>>()?;
+            }
+            "--only-label" => {
+                let v = it.next().ok_or("--only-label needs K=V")?;
+                let (k, val) = v.split_once('=').ok_or("--only-label must be K=V")?;
+                a.only_label = Some((k.to_string(), val.to_string()));
+            }
             "--roots" => {
                 let v = it.next().ok_or("--roots needs a value")?;
                 a.roots = v
@@ -69,9 +98,7 @@ fn parse_args() -> Result<Args, String> {
                     .map(PathBuf::from)
                     .collect();
             }
-            "--context" => {
-                a.only_context = Some(it.next().ok_or("--context needs a value")?);
-            }
+            "--context" => a.only_context = Some(it.next().ok_or("--context needs a value")?),
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -82,13 +109,10 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
-/// Where projects usually live. Only directories that exist are kept — a
-/// configured root that is missing is a scan-blocking condition, not a licence
-/// to call everything under it an orphan.
 fn default_roots() -> Vec<PathBuf> {
-    let home = std::env::var("HOME").map(PathBuf::from).ok();
     let mut out = Vec::new();
-    if let Some(h) = home {
+    if let Ok(h) = std::env::var("HOME") {
+        let h = PathBuf::from(h);
         for c in [
             "Documents/Repos",
             "Repos",
@@ -107,6 +131,13 @@ fn default_roots() -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn main() {
@@ -133,22 +164,25 @@ fn main() {
 fn run(args: &Args) -> Result<i32, Error> {
     let cancel = Cancel::new();
 
-    // Contexts are candidate endpoints, not identities. Two of them can be the
-    // same engine — `/var/run/docker.sock` is frequently a symlink — so we
-    // connect, ask each daemon for its own `/info` ID, and drop duplicates.
+    // Contexts are candidate endpoints, not identities. Two can be the same
+    // engine, so we connect, ask each daemon for its own /info ID, and dedupe.
     let contexts: Vec<_> = context::discover()
         .into_iter()
         .filter(|c| args.only_context.as_deref().is_none_or(|n| c.name == n))
         .filter(|c| c.is_local())
         .collect();
-
     if contexts.is_empty() {
         return Err(Error::NoContext);
     }
 
-    let mut seen_daemons: Vec<String> = Vec::new();
-    let mut reports: Vec<ScanReport> = Vec::new();
-    let mut last_err: Option<Error> = None;
+    let opts = ScanOptions {
+        project_roots: args.roots.clone(),
+        with_sizes: args.with_sizes,
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut exit = 0;
+    let mut any = false;
+    let mut last_err = None;
 
     for ctx in &contexts {
         let client = match BollardClient::connect(&ctx.endpoint) {
@@ -165,16 +199,14 @@ fn run(args: &Args) -> Result<i32, Error> {
                 continue;
             }
         };
-        if seen_daemons.iter().any(|d| d == ident.id.as_str()) {
+        if seen.iter().any(|d| d == ident.id.as_str()) {
             if !args.json {
-                eprintln!(
-                    "  context {:<12} is the same engine as one already scanned — skipping",
-                    ctx.name
-                );
+                eprintln!("  {} is the same engine as one already scanned", ctx.name);
             }
             continue;
         }
-        seen_daemons.push(ident.id.0.clone());
+        seen.push(ident.id.0.clone());
+        any = true;
 
         let sink: Arc<dyn prune_juice_core::EventSink> = if args.json {
             Arc::new(JsonlSink::new(io::stdout()))
@@ -182,162 +214,234 @@ fn run(args: &Args) -> Result<i32, Error> {
             Arc::new(NullSink)
         };
 
-        let opts = ScanOptions {
-            project_roots: args.roots.clone(),
-            with_sizes: args.with_sizes,
-        };
-
         if !args.json {
             eprint!("scanning {}… ", ctx.name);
             io::stderr().flush().ok();
         }
-        let report = Scanner::new(&client).scan(&ctx.name, &opts, sink, &cancel)?;
+        let report = Scanner::new(&client).scan(&ctx.name, &opts, sink.clone(), &cancel)?;
         if !args.json {
             eprintln!("{} ms", report.duration_ms);
         }
-        reports.push(report);
-    }
 
-    if reports.is_empty() {
-        return Err(last_err.unwrap_or(Error::NoContext));
-    }
+        let plan = Planner::plan(&report, now_unix());
+        if !args.json {
+            render(&report, &plan);
+        }
 
-    if !args.json {
-        for r in &reports {
-            render(r);
+        // The executor ALWAYS runs. Without --apply it runs in dry-run mode,
+        // which exercises the identical code path — including per-item
+        // revalidation — and reports exactly what would have happened. That is
+        // what makes dry-run an oracle for the apply path rather than a
+        // separate, less-tested branch.
+        if args.apply && !args.json {
+            eprint!("re-checking before applying… ");
+            io::stderr().flush().ok();
+        }
+        // Re-scan so witnesses are revalidated against a freshly taken world.
+        let fresh = Scanner::new(&client).scan(&ctx.name, &opts, sink.clone(), &cancel)?;
+        if args.apply && !args.json {
+            eprintln!("ok");
+        }
+
+        let exec_opts = ExecuteOptions {
+            mode: if args.apply {
+                Mode::Apply
+            } else {
+                Mode::DryRun
+            },
+            tiers: args.tiers.clone(),
+            only_label: args.only_label.clone(),
+        };
+        let receipt = if args.apply {
+            Executor::applying(&client).run(plan, &fresh, now_unix(), &exec_opts, sink, &cancel)?
+        } else {
+            // No mutating client at all: dry-run is unable to delete, not
+            // merely disinclined to.
+            Executor::dry_run().run(plan, &fresh, now_unix(), &exec_opts, sink, &cancel)?
+        };
+
+        if !args.json {
+            render_receipt(&receipt);
+        }
+        if receipt.problems() > 0 {
+            exit = exit.max(5);
+        }
+        if !args.apply && (receipt.docker_reported > Bytes::ZERO || receipt.skipped() > 0) {
+            exit = exit.max(1);
         }
     }
 
-    // Exit 1 when there is something worth a human's attention.
-    let needs_attention = reports.iter().any(|r| {
-        r.totals.build_cache_bytes > Bytes::ZERO
-            || r.orphan_candidates().next().is_some()
-            || r.unattributed().next().is_some()
-    });
-    Ok(if needs_attention { 1 } else { 0 })
+    if !any {
+        return Err(last_err.unwrap_or(Error::NoContext));
+    }
+    Ok(exit)
 }
 
-fn render(r: &ScanReport) {
+fn render(r: &ScanReport, plan: &Plan) {
     let d = &r.daemon;
     println!();
     println!(
         "  {}  ·  {:?}  ·  engine {} (API {})",
         r.context, d.runtime, d.server_version, d.api_version
     );
-    println!("  daemon {}", d.id);
     if d.swarm_active {
-        println!(
-            "  ! swarm is active — resources may be referenced by something not modelled here"
-        );
-    }
-    println!();
-
-    let t = &r.totals;
-    println!(
-        "  {:>5} containers   {:>5} images ({})",
-        t.containers,
-        t.images,
-        t.image_bytes.human()
-    );
-    println!(
-        "  {:>5} volumes ({}) {:>5} networks",
-        t.volumes,
-        t.volume_bytes.human(),
-        t.networks
-    );
-    println!(
-        "  {:>5} build cache records, {} reclaimable",
-        t.build_cache_records,
-        t.build_cache_bytes.human()
-    );
-    println!("  {:>5} projects known", r.projects_known);
-    if r.stale {
-        println!("  ! sizes are incomplete — figures below understate the total");
+        println!("  ! swarm is active — some resources cannot be proven unreferenced");
     }
     for w in &r.warnings {
         println!("  ! {w}");
     }
 
-    // --- orphan candidates -----------------------------------------------
-    let mut orphans: Vec<_> = r.orphan_candidates().collect();
-    orphans.sort_by_key(|a| std::cmp::Reverse(a.resource.size.unwrap_or(Bytes::ZERO).get()));
+    let t = &r.totals;
     println!();
     println!(
-        "  ORPHAN CANDIDATES ({}) — a confident claim on a project that is gone",
-        orphans.len()
+        "  {:>5} containers   {:>5} images ({})   {:>5} volumes ({})",
+        t.containers,
+        t.images,
+        t.image_bytes.human(),
+        t.volumes,
+        t.volume_bytes.human()
     );
-    if orphans.is_empty() {
-        println!("    none");
-    }
-    for a in orphans.iter().take(25) {
-        println!(
-            "    {:<44} {:>9}  {}",
-            truncate(&a.resource.name, 44),
-            a.resource
-                .size
-                .map(|b| b.human())
-                .unwrap_or_else(|| "—".into()),
-            a.owner.as_deref().unwrap_or("?")
-        );
-        for e in a.claims.iter().flat_map(|c| &c.evidence) {
-            println!("        [{}] {}", e.source.tag(), e.detail);
+    println!(
+        "  {:>5} networks     {:>5} build cache records ({} reclaimable)",
+        t.networks,
+        t.build_cache_records,
+        t.build_cache_bytes.human()
+    );
+
+    // The reversibility breakdown is stated at run level, not per item. For
+    // Tier 1 the last line is always true, and the word "irreversible" only
+    // ever appears beside a non-zero number.
+    let free = plan.free_bytes();
+    let irreversible = plan.irreversible_free_bytes();
+    let free_items = plan.of_tier(Tier::Free).count();
+
+    println!();
+    println!("  SAFE TO RECLAIM — {}", free.human());
+    let (mut rebuildable, mut restorable) = (Bytes::ZERO, Bytes::ZERO);
+    for i in plan.of_tier(Tier::Free) {
+        let b = i.size.unwrap_or(Bytes::ZERO);
+        match i.reversibility() {
+            Reversibility::Rebuildable(_) => rebuildable = rebuildable + b,
+            Reversibility::Restorable(_) => restorable = restorable + b,
+            Reversibility::Gone => {}
         }
     }
+    rebuildable = rebuildable + plan.build_cache_reclaimable;
+    println!(
+        "    {:>10}  rebuildable   ({free_items} items + build cache)",
+        rebuildable.human()
+    );
+    if restorable > Bytes::ZERO {
+        println!("    {:>10}  restorable", restorable.human());
+    }
+    println!("    {:>10}  irreversible", irreversible.human());
+    if irreversible == Bytes::ZERO {
+        println!("    Nothing here can be lost.");
+    }
 
-    // --- unattributed ------------------------------------------------------
-    let unattributed: Vec<_> = r
-        .unattributed()
-        .filter(|a| a.resource.kind == ResourceKind::Volume)
-        .collect();
-    let unattributed_bytes: Bytes = unattributed.iter().filter_map(|a| a.resource.size).sum();
-    let anon = unattributed
-        .iter()
-        .filter(|a| a.resource.is_anonymous_volume())
-        .count();
+    let mut orphans: Vec<_> = plan.of_tier(Tier::Orphan).collect();
+    orphans.sort_by_key(|i| std::cmp::Reverse(i.size.unwrap_or(Bytes::ZERO).get()));
 
     println!();
     println!(
-        "  UNATTRIBUTED VOLUMES ({}, {}) — never offered for deletion",
-        unattributed.len(),
-        unattributed_bytes.human()
+        "  NEEDS REVIEW — {} orphaned ({}), {} stale",
+        orphans.len(),
+        plan.bytes_of_tier(Tier::Orphan).human(),
+        plan.of_tier(Tier::Stale).count()
     );
-    println!("    {anon} are anonymous (64-hex). Their owning containers are gone, so the");
-    println!("    mapping is unrecoverable from Docker. Recorded now so it is not lost again.");
+    for i in orphans.iter().take(12) {
+        println!(
+            "    {:<40} {:>9}  {}",
+            truncate(&i.name, 40),
+            i.size.map(|b| b.human()).unwrap_or_else(|| "—".into()),
+            i.verdict.because
+        );
+    }
+    if orphans.len() > 12 {
+        println!("    … and {} more", orphans.len() - 12);
+    }
 
-    // --- attribution quality ------------------------------------------------
-    let vols: Vec<_> = r.of_kind(ResourceKind::Volume).collect();
-    let proven = vols
-        .iter()
-        .filter(|a| a.confidence == Some(Confidence::Proven))
-        .count();
-    let strong = vols
-        .iter()
-        .filter(|a| a.confidence == Some(Confidence::Strong))
-        .count();
-    let weak = vols
-        .iter()
-        .filter(|a| a.confidence == Some(Confidence::Weak))
-        .count();
-    let guess = vols
-        .iter()
-        .filter(|a| a.confidence == Some(Confidence::Guess))
-        .count();
-    let none = vols.iter().filter(|a| a.confidence.is_none()).count();
-
+    let unattributed: Vec<_> = plan
+        .of_tier(Tier::Unattributed)
+        .filter(|i| i.kind == ResourceKind::Volume)
+        .collect();
+    let ub: Bytes = unattributed.iter().filter_map(|i| i.size).sum();
     println!();
-    println!("  VOLUME ATTRIBUTION");
-    println!("    proven {proven}   strong {strong}   weak {weak}   guess {guess}   none {none}");
+    println!(
+        "  UNATTRIBUTED — {} volumes ({}), never offered for deletion",
+        unattributed.len(),
+        ub.human()
+    );
 
+    let vols: Vec<_> = r.of_kind(ResourceKind::Volume).collect();
+    let count = |c: Confidence| vols.iter().filter(|a| a.confidence == Some(c)).count();
+    println!(
+        "  attribution: proven {}  strong {}  weak {}  guess {}  none {}",
+        count(Confidence::Proven),
+        count(Confidence::Strong),
+        count(Confidence::Weak),
+        count(Confidence::Guess),
+        vols.iter().filter(|a| a.confidence.is_none()).count()
+    );
     let unverifiable = vols
         .iter()
         .filter(|a| matches!(a.liveness, Some(Liveness::Unverifiable { .. })))
         .count();
     if unverifiable > 0 {
-        println!(
-            "    {unverifiable} volumes have an unverifiable project — a root may be unmounted."
-        );
-        println!("    These are held back deliberately rather than called orphans.");
+        println!("  {unverifiable} have an unverifiable project — a root may be unmounted, so they are held back");
     }
+
+    println!();
+    println!("  Nothing was changed. Re-run with --apply to reclaim the safe tier.");
+    println!();
+}
+
+fn render_receipt(r: &Receipt) {
+    println!();
+    if r.simulated {
+        println!("  DRY RUN — nothing was touched");
+    }
+    let would = r
+        .items
+        .iter()
+        .filter(|i| i.outcome == ItemOutcome::WouldDelete)
+        .count();
+    if r.simulated {
+        println!(
+            "  would delete {would}   skipped {}   problems {}",
+            r.skipped(),
+            r.problems()
+        );
+        println!(
+            "  would free {} (as Docker counts it)",
+            r.docker_reported.human()
+        );
+    } else {
+        println!(
+            "  deleted {}   skipped {}   problems {}",
+            r.deleted(),
+            r.skipped(),
+            r.problems()
+        );
+        println!("  docker reports {} freed", r.docker_reported.human());
+    }
+    if r.build_cache_reclaimed > Bytes::ZERO {
+        println!(
+            "  build cache: {} reclaimed",
+            r.build_cache_reclaimed.human()
+        );
+    }
+    for i in &r.items {
+        match &i.outcome {
+            ItemOutcome::Skipped(s) => println!("    skipped  {:<36} {s}", truncate(&i.name, 36)),
+            ItemOutcome::Refused(m) => println!("    refused  {:<36} {m}", truncate(&i.name, 36)),
+            ItemOutcome::Failed(m) => println!("    FAILED   {:<36} {m}", truncate(&i.name, 36)),
+            _ => {}
+        }
+    }
+    println!();
+    println!("  Note: Docker's figure is logical. Actual host reclamation can differ,");
+    println!("  especially on a VM-backed runtime. Host measurement is a later milestone.");
     println!();
 }
 
@@ -350,8 +454,8 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// Reserved for M3. Interactive mode is the default only on a TTY; piped or
-/// CI invocations always take the one-shot path above.
+/// Reserved for M3. Interactive mode is the default only on a TTY; piped or CI
+/// invocations always take the one-shot path above.
 #[allow(dead_code)]
 fn is_interactive() -> bool {
     io::stdout().is_terminal() && std::env::var("CI").is_err()

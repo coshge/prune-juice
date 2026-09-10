@@ -19,7 +19,7 @@ use bollard::Docker;
 use crate::error::{Error, Result};
 use crate::model::{Bytes, ContainerState, DaemonId, ResourceId, ResourceKind, ResourceSummary};
 
-use super::{detect_runtime, DaemonIdentity, DataUsage, DockerClient};
+use super::{detect_runtime, DaemonIdentity, DataUsage, DockerClient, DockerMutate};
 
 pub struct BollardClient {
     docker: Docker,
@@ -340,6 +340,65 @@ impl DockerClient for BollardClient {
             build_cache_records: records.len() as u32,
             build_cache_reclaimable: Bytes(reclaimable),
         })
+    }
+}
+
+/// Destructive operations.
+///
+/// Every one of these deliberately passes `force: false`. The daemon's own
+/// in-use check is the last line of defence against a race we could not see,
+/// and a force flag switches it off. A refusal here is the system working, not
+/// a problem to route around.
+impl DockerMutate for BollardClient {
+    fn remove_volume(&self, name: &str) -> Result<()> {
+        let opts = bollard::query_parameters::RemoveVolumeOptions { force: false };
+        self.block(self.docker.remove_volume(name, Some(opts)))
+            .map_err(|e| map_err(e, &self.endpoint))
+    }
+
+    fn remove_image(&self, id: &str) -> Result<()> {
+        // `noprune: false` lets the daemon reclaim now-unreferenced parents;
+        // `force: false` keeps it refusing anything still in use.
+        let opts = bollard::query_parameters::RemoveImageOptions {
+            force: false,
+            noprune: false,
+        };
+        self.block(self.docker.remove_image(id, Some(opts), None))
+            .map(|_| ())
+            .map_err(|e| map_err(e, &self.endpoint))
+    }
+
+    fn remove_container(&self, id: &str) -> Result<()> {
+        // `v: false` is important — we never let a container removal take its
+        // anonymous volumes with it. Volumes are decided on their own evidence,
+        // never as a side effect.
+        let opts = bollard::query_parameters::RemoveContainerOptions {
+            v: false,
+            force: false,
+            link: false,
+        };
+        self.block(self.docker.remove_container(id, Some(opts)))
+            .map_err(|e| map_err(e, &self.endpoint))
+    }
+
+    fn remove_network(&self, id: &str) -> Result<()> {
+        self.block(self.docker.remove_network(id))
+            .map_err(|e| map_err(e, &self.endpoint))
+    }
+
+    fn prune_build_cache(&self, keep_newer_than_secs: u64) -> Result<Bytes> {
+        // The time guard is what survives a build starting between plan and
+        // apply: anything touched inside the window is left alone.
+        let opts = bollard::query_parameters::PruneBuildOptionsBuilder::new()
+            .filters(&std::collections::HashMap::from([(
+                "unused-for",
+                vec![format!("{keep_newer_than_secs}s").as_str()],
+            )]))
+            .build();
+        let resp = self
+            .block(self.docker.prune_build(Some(opts)))
+            .map_err(|e| map_err(e, &self.endpoint))?;
+        Ok(Bytes(resp.space_reclaimed.unwrap_or(0).max(0) as u64))
     }
 }
 

@@ -24,6 +24,7 @@ rusqlite     = { version = "0.32", features = ["bundled"] }
 uuid         = { version = "1", features = ["v4", "serde"] }
 etcetera     = "0.8"
 anyhow       = "1"
+sha2         = "0.10"
 
 [profile.release]
 lto = "thin"
