@@ -20,6 +20,28 @@ use crate::scan::{Attributed, ScanReport};
 
 use super::evidence::ReadSet;
 
+/// The project name and absolute path a container carries, if any.
+///
+/// ddev's `approot` is preferred over compose's `working_dir`, which for a ddev
+/// project points at the `.ddev` subdirectory rather than the project root.
+fn project_path_of(r: &crate::model::ResourceSummary) -> Option<(String, String)> {
+    use crate::providers::{COMPOSE_PROJECT, COMPOSE_WORKING_DIR, DDEV_APPROOT, DDEV_SITE_NAME};
+
+    if let (Some(site), Some(root)) = (
+        r.label_nonempty(DDEV_SITE_NAME),
+        r.label_nonempty(DDEV_APPROOT),
+    ) {
+        return Some((site.to_string(), root.to_string()));
+    }
+    match (
+        r.label_nonempty(COMPOSE_PROJECT),
+        r.label_nonempty(COMPOSE_WORKING_DIR),
+    ) {
+        (Some(p), Some(w)) => Some((p.to_string(), w.to_string())),
+        _ => None,
+    }
+}
+
 /// Something that holds a reference.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Referrer {
@@ -119,6 +141,10 @@ impl Referenced {
 }
 
 pub struct RefGraph {
+    /// How many containers still carry an absolute path for each project.
+    /// Removing the last one loses that project's location permanently, which
+    /// is a provenance change and therefore a tier-stability violation.
+    path_carriers: BTreeMap<String, usize>,
     volume_referrers: BTreeMap<String, Vec<Referrer>>,
     image_referrers: BTreeMap<String, Vec<Referrer>>,
     network_referrers: BTreeMap<String, Vec<Referrer>>,
@@ -130,6 +156,7 @@ pub struct RefGraph {
 impl RefGraph {
     pub fn build(report: &ScanReport) -> Self {
         let mut g = RefGraph {
+            path_carriers: BTreeMap::new(),
             volume_referrers: BTreeMap::new(),
             image_referrers: BTreeMap::new(),
             network_referrers: BTreeMap::new(),
@@ -192,6 +219,10 @@ impl RefGraph {
                     .or_default()
                     .push(referrer.clone());
             }
+
+            if let Some((project, _)) = project_path_of(r) {
+                *g.path_carriers.entry(project).or_default() += 1;
+            }
         }
 
         // A tag is user intent. An image someone named is not garbage.
@@ -251,6 +282,21 @@ impl RefGraph {
 
     pub fn opacity(&self) -> &[Opacity] {
         &self.opacity
+    }
+
+    /// Would removing this container leave its project with no recorded
+    /// location at all?
+    ///
+    /// Container labels are the ONLY place an absolute project path lives.
+    /// Volumes and images carry a project name and nothing more. So the last
+    /// container carrying a path is load-bearing: delete it and the project can
+    /// never again be located, only named.
+    pub fn is_last_path_carrier(&self, r: &crate::model::ResourceSummary) -> Option<String> {
+        let (project, _) = project_path_of(r)?;
+        match self.path_carriers.get(&project) {
+            Some(1) => Some(project),
+            _ => None,
+        }
     }
 
     /// Is this volume held by a container that is running right now?

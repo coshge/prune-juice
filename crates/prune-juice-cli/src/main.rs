@@ -406,9 +406,23 @@ fn render_receipt(r: &Receipt) {
         .iter()
         .filter(|i| i.outcome == ItemOutcome::WouldDelete)
         .count();
+    // Break the count down by kind. "109 items" tells a user nothing about
+    // whether they are comfortable; "20 networks, 89 containers" does.
+    let mut by_kind: std::collections::BTreeMap<&str, usize> = Default::default();
+    for i in &r.items {
+        if matches!(i.outcome, ItemOutcome::WouldDelete | ItemOutcome::Deleted) {
+            *by_kind.entry(i.kind.as_str()).or_default() += 1;
+        }
+    }
+    let breakdown = by_kind
+        .iter()
+        .map(|(k, n)| format!("{n} {k}s"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
     if r.simulated {
         println!(
-            "  would delete {would}   skipped {}   problems {}",
+            "  would delete {would} ({breakdown})   skipped {}   problems {}",
             r.skipped(),
             r.problems()
         );
@@ -418,7 +432,7 @@ fn render_receipt(r: &Receipt) {
         );
     } else {
         println!(
-            "  deleted {}   skipped {}   problems {}",
+            "  deleted {} ({breakdown})   skipped {}   problems {}",
             r.deleted(),
             r.skipped(),
             r.problems()
@@ -431,6 +445,25 @@ fn render_receipt(r: &Receipt) {
             r.build_cache_reclaimed.human()
         );
     }
+    // In a dry run, name what would go. "109 items" is not reviewable; a list is.
+    if r.simulated {
+        let names: Vec<&str> = r
+            .items
+            .iter()
+            .filter(|i| i.outcome == ItemOutcome::WouldDelete)
+            .map(|i| i.name.as_str())
+            .collect();
+        for chunk in names.chunks(3).take(6) {
+            println!("    {}", chunk.join("  ·  "));
+        }
+        if names.len() > 18 {
+            println!(
+                "    … and {} more (--json for the full list)",
+                names.len() - 18
+            );
+        }
+    }
+
     for i in &r.items {
         match &i.outcome {
             ItemOutcome::Skipped(s) => println!("    skipped  {:<36} {s}", truncate(&i.name, 36)),

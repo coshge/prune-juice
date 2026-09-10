@@ -250,6 +250,17 @@ pub fn classify(a: &Attributed, graph: &RefGraph, now_unix: i64, rs: &mut ReadSe
     }
 
     // Property 3: tier-stability.
+    if let Some(project) = graph.is_last_path_carrier(r) {
+        rs.record(&subject, "last_path_carrier_for", &project);
+        return Verdict {
+            tier: Tier::Stale,
+            reversibility,
+            because: format!(
+                "it is the last container recording where \"{project}\" lives on disk"
+            ),
+            referenced,
+        };
+    }
     if let Some(reason) = destabilises(a, rs) {
         return Verdict {
             tier: Tier::Stale,
@@ -474,6 +485,41 @@ mod tests {
             &[],
         ))]);
         assert_eq!(classify_one(&rep, 0).tier, Tier::Free);
+    }
+
+    fn labelled(name: &str, project: &str, workdir: &str) -> ResourceSummary {
+        let mut r = container(name, ContainerState::Exited, &[]);
+        r.labels
+            .insert("com.docker.compose.project".into(), project.into());
+        r.labels.insert(
+            "com.docker.compose.project.working_dir".into(),
+            workdir.into(),
+        );
+        r
+    }
+
+    #[test]
+    fn the_last_container_recording_a_project_path_is_not_free() {
+        // Container labels are the only place an absolute project path lives;
+        // volumes and images carry a name and nothing more. Removing the last
+        // carrier means the project can never be located again, only named —
+        // a provenance loss, which tier-stability forbids.
+        let rep = report(vec![attributed(labelled("only-one", "solo", "/r/solo"))]);
+        let v = classify_one(&rep, 0);
+        assert_eq!(v.tier, Tier::Stale);
+        assert!(v.because.contains("last container"), "{}", v.because);
+    }
+
+    #[test]
+    fn one_of_several_path_carriers_is_still_free() {
+        // With a sibling still carrying the path, removing this one loses
+        // nothing, so the safe tier is not needlessly narrowed.
+        let rep = report(vec![
+            attributed(labelled("a", "duo", "/r/duo")),
+            attributed(labelled("b", "duo", "/r/duo")),
+        ]);
+        assert_eq!(classify_one(&rep, 0).tier, Tier::Free);
+        assert_eq!(classify_one(&rep, 1).tier, Tier::Free);
     }
 
     #[test]
