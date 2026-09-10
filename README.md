@@ -69,6 +69,26 @@ The bundle includes the CLI helper, so the app does not need a separate CLI
 installation. The default build is signed for local use, not notarized for
 redistribution. You can move the completed `PruneJuice.app` to Applications.
 
+### Updating a local build
+
+A build from source has no update mechanism — there is no release key in a
+checkout, so the CLI's `--update` and the app's Sparkle integration are both
+disabled deliberately. Rebuild from the working tree instead:
+
+```sh
+./scripts/install-local.sh          # CLI and app, from one build
+./scripts/install-local.sh --cli    # just the CLI
+./scripts/install-local.sh --app --open
+```
+
+It builds the app bundle and installs *that* bundle's helper as your CLI, so
+the command on your `PATH` and the one inside the app are the same bytes rather
+than two builds that happen to agree. The CLI replaces whatever `prune-juice`
+is already on your `PATH`, or goes to `~/.local/bin`; `PREFIX=~/bin` chooses
+somewhere else. A binary owned by Homebrew is refused rather than overwritten,
+for the reason the updater refuses it: the manager would go on serving a
+version it never installed.
+
 ## Use the Mac app
 
 The app starts with a scan. Use **Scan again** or **Command-R** to refresh it.

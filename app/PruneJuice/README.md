@@ -15,6 +15,11 @@ With Rust and a Swift 6 toolchain installed, run from this directory:
 open dist/PruneJuice.app
 ```
 
+To rebuild the app *and* update the `prune-juice` on your `PATH` from the same
+build, use `./scripts/install-local.sh --open` from the repository root. A
+build from source never updates itself, so that script is how a local install
+keeps up with the tree.
+
 The app includes its command-line helper. The default build is signed for local
 use, not notarized for redistribution. Move the complete `PruneJuice.app` bundle
 to Applications if you want to keep it there.

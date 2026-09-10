@@ -52,6 +52,9 @@ cargo run -p prune-juice-tui --example preview   # render every screen, no TTY n
 cargo run -p xtask -- manifest                  # the document the CLI reads
 cargo run -p xtask -- appcast                   # the document Sparkle reads
 
+./scripts/install-local.sh                      # rebuild CLI + app from this tree
+./scripts/install-local.sh --cli               # just the CLI, onto the PATH
+
 cd app/PruneJuice && ./scripts/bundle.sh        # assemble PruneJuice.app (ad-hoc signed)
 SPARKLE_PUBLIC_KEY=… ./scripts/bundle.sh        # …with updates enabled
 SIGN_ID="Developer ID Application: …" ./scripts/bundle.sh --notarize
