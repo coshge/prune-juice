@@ -36,6 +36,13 @@ pub struct ScanOptions {
     /// where the data root is reachable: 259 volumes in under half a second.
     /// Without it no volume can ever be proven safe to delete.
     pub probe_volumes: bool,
+    /// Give up after this long and report what has been gathered.
+    ///
+    /// Mandatory in spirit even though it is optional in type: a scan touches a
+    /// filesystem it does not control, and `system df` is reported at minutes
+    /// on some setups. Without a deadline "slow" and "hung" are the same thing
+    /// to a user, and a GUI has no way to tell them apart either.
+    pub deadline: Option<std::time::Duration>,
     /// Ignore host access to the data root and always go through a container.
     ///
     /// Exists so the container path — the only one available on Docker Desktop
@@ -50,6 +57,7 @@ impl Default for ScanOptions {
             project_roots: Vec::new(),
             with_sizes: true,
             probe_volumes: true,
+            deadline: Some(std::time::Duration::from_secs(120)),
             force_container_probe: false,
         }
     }
@@ -174,6 +182,10 @@ impl<'a> Scanner<'a> {
         cancel: &Cancel,
     ) -> Result<ScanReport> {
         let started = Instant::now();
+        // Closure rather than a flag, so every caller checks the live clock.
+        let out_of_time = |elapsed: std::time::Duration| -> bool {
+            opts.deadline.map(|d| elapsed >= d).unwrap_or(false)
+        };
 
         let daemon = self.client.identity()?;
         sink.emit(Event::ScanStarted {
@@ -295,6 +307,20 @@ impl<'a> Scanner<'a> {
                 // Fast path: the data root is readable from the host, so no
                 // container is involved at all.
                 for (i, v) in volumes.iter().enumerate() {
+                    if out_of_time(started.elapsed()) {
+                        warnings_once(
+                            &mut warnings,
+                            format!(
+                                "gave up reading volume contents after {}s — {} of {} were read, \
+                                 so fewer volumes can be proven safe",
+                                started.elapsed().as_secs(),
+                                i,
+                                volumes.len()
+                            ),
+                        );
+                        stale = true;
+                        break;
+                    }
                     if let Some(r) = access.probe_shallow(&v.name) {
                         contents.insert(v.name.clone(), r);
                     }
@@ -340,6 +366,17 @@ impl<'a> Scanner<'a> {
                     let mut done = 0u32;
                     for chunk in candidates.chunks(BATCH) {
                         cancel.check()?;
+                        if out_of_time(started.elapsed()) {
+                            warnings_once(
+                                &mut warnings,
+                                format!(
+                                    "gave up probing volumes after {}s; fewer can be proven safe",
+                                    started.elapsed().as_secs()
+                                ),
+                            );
+                            stale = true;
+                            break;
+                        }
                         match prober.probe_volumes(chunk) {
                             Ok(map) => {
                                 for (name, raw) in map {
@@ -950,6 +987,58 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].0, "orbstack", "the first context seen wins");
         assert_eq!(out[1].0, "other");
+    }
+
+    #[test]
+    fn a_deadline_degrades_the_scan_rather_than_hanging() {
+        // "Slow" and "hung" look identical to a user, and a GUI cannot tell
+        // them apart either. A deadline turns an unbounded wait into a partial
+        // answer that says it is partial.
+        let client = FakeDocker {
+            containers: vec![],
+            volumes: vec![volume("v", &[])],
+        };
+        let report = Scanner::new(&client)
+            .scan(
+                "test",
+                &ScanOptions {
+                    deadline: Some(std::time::Duration::ZERO),
+                    ..Default::default()
+                },
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        assert!(report.stale, "a curtailed scan must admit it is incomplete");
+        assert!(
+            report.warnings.iter().any(|w| w.contains("gave up")),
+            "and say so in words: {:?}",
+            report.warnings
+        );
+        // And nothing it could not read may be treated as provably safe.
+        let v = report.of_kind(ResourceKind::Volume).next().unwrap();
+        assert!(v.content.is_none());
+    }
+
+    #[test]
+    fn no_deadline_means_no_deadline() {
+        let client = FakeDocker {
+            containers: vec![],
+            volumes: vec![volume("v", &[])],
+        };
+        let report = Scanner::new(&client)
+            .scan(
+                "test",
+                &ScanOptions {
+                    deadline: None,
+                    ..Default::default()
+                },
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+        assert!(!report.warnings.iter().any(|w| w.contains("gave up")));
     }
 
     #[test]

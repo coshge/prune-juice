@@ -3,3 +3,5 @@ target/
 *.db-wal
 *.db-shm
 .DS_Store
+app/PruneJuice/.build/
+app/PruneJuice/dist/

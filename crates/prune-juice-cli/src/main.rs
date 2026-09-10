@@ -38,6 +38,8 @@ OPTIONS:
     --roots <PATHS>     Colon-separated dirs to search for projects
     --context <NAME>    Scan only this context
     --no-tui            Force the one-shot report even on a terminal
+    --deadline SECS     Give up after this long and report what was gathered
+                        (default 120, 0 to wait indefinitely)
     --no-probe          Skip reading volume contents. No volume can then be
                         proven safe, so this only ever shrinks what is offered.
     --container-probe   Always read volume contents through a container, even
@@ -86,6 +88,7 @@ struct Args {
     no_tui: bool,
     no_probe: bool,
     force_container_probe: bool,
+    deadline: Option<std::time::Duration>,
     no_vault: bool,
     vault_cmd: Option<VaultCmd>,
     waiver_cmd: Option<WaiverCmd>,
@@ -119,6 +122,7 @@ fn parse_args() -> Result<Args, String> {
         no_tui: false,
         no_probe: false,
         force_container_probe: false,
+        deadline: Some(std::time::Duration::from_secs(120)),
         no_vault: false,
         vault_cmd: None,
         waiver_cmd: None,
@@ -130,6 +134,13 @@ fn parse_args() -> Result<Args, String> {
             "--json" => a.json = true,
             "--no-sizes" => a.with_sizes = false,
             "--no-tui" => a.no_tui = true,
+            "--deadline" => {
+                let v = it.next().ok_or("--deadline needs seconds (0 to disable)")?;
+                let secs: u64 = v
+                    .parse()
+                    .map_err(|_| "--deadline needs a number of seconds")?;
+                a.deadline = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+            }
             "--no-probe" => a.no_probe = true,
             "--container-probe" => a.force_container_probe = true,
             "--no-vault" => a.no_vault = true,
@@ -432,6 +443,10 @@ fn run(args: &Args) -> Result<i32, Error> {
         project_roots: args.roots.clone(),
         with_sizes: args.with_sizes,
         probe_volumes: !args.no_probe,
+        // Two minutes is generous for a healthy machine and short enough that
+        // a wedged filesystem read degrades the report instead of looking like
+        // a hang. `--deadline 0` disables it.
+        deadline: args.deadline,
         force_container_probe: args.force_container_probe,
     };
 

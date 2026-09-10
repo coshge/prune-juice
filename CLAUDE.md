@@ -10,7 +10,7 @@ model strong enough that the headline action needs no confirmation. Free MIT
 Rust CLI; a free macOS app comes later, architected so a one-time paid tier
 could be added without rework.
 
-## Status: M5 complete + provenance index
+## Status: M6 — macOS app builds and runs
 
 | milestone | state |
 |---|---|
@@ -20,10 +20,10 @@ could be added without rework.
 | M4a content probe — native **and** container path | done |
 | M4b vault (dump / verify / restore) | done |
 | M5 review actions, waivers, host disk measurement | done |
-| M6 macOS app | next |
+| M6 macOS app — window, scan, review; unsigned | done |
 
 ```
-cargo test --workspace                  # 189 tests
+cargo test --workspace                  # 191 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -38,7 +38,14 @@ cargo build -p prune-juice-cli
 ./target/debug/prune-juice --waive SEL --reason "..."   # hold something back
 
 cargo run -p prune-juice-tui --example preview   # render every screen, no TTY needed
+
+cd app/PruneJuice && ./scripts/bundle.sh        # assemble PruneJuice.app (ad-hoc signed)
+SIGN_ID="Developer ID Application: …" ./scripts/bundle.sh --notarize
+open app/PruneJuice/dist/PruneJuice.app
 ```
+
+App diagnostics land in `~/Library/Logs/prune-juice-app.log`. A GUI launch has
+no terminal, so that file is the only way to see why a scan failed.
 
 ## Deliberately not implemented — do not "fix" these
 
@@ -54,6 +61,14 @@ cargo run -p prune-juice-tui --example preview   # render every screen, no TTY n
   is never assumed empty: on Docker Desktop the data root is hidden inside a VM,
   and the honest answer there is "cannot be proven safe". Enforced in
   `plan/tier.rs::destabilises`.
+- **The app is an AppKit shell, not a SwiftUI `App` scene.** A bundle
+  assembled by hand does not get the LaunchServices registration SwiftUI's
+  scene lifecycle needs: the delegate runs, the activation policy is set, and
+  the window still never materialises — so the app launches, shows nothing and
+  never scans. `AppDelegate` creates the `NSWindow` itself. Do not "simplify"
+  this back to `@main struct App`.
+- **The app reads only.** It scans, classifies and shows evidence; reclaiming
+  is still `prune-juice --apply` in a terminal.
 - **Docker Desktop is a first-class target.** Its data root lives inside a VM,
   so `VolumeAccess::detect` reports unavailable and the scan falls back to
   `DockerProbe` — a throwaway container with the volumes bound read-only, no
@@ -166,7 +181,19 @@ All have regression tests — if you break one, a test will tell you.
 26. **Evidence never leaks between daemons.** Every table is keyed by the
     daemon's `/info` ID. Attributing one engine's volume from another's history
     would be worse than knowing nothing. There is a test.
-27. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
+27. **Drain a subprocess pipe concurrently, always.** A pipe nobody reads
+    fills at 64 KB and the writer blocks for ever, so reading stderr only after
+    the process exits can deadlock the process being waited on. Both pipes are
+    drained while the helper runs.
+28. **A scan has a deadline.** "Slow" and "hung" are indistinguishable to a
+    user, and a GUI cannot tell them apart either. Two minutes by default; on
+    expiry the report is marked stale and says what it gave up on, and nothing
+    unread is ever treated as provably safe.
+29. **Swift type names mirror UniFFI codegen.** `PJEvent`, lowerCamelCase
+    fields, records as structs. If the transport is ever swapped for in-process
+    FFI, the view models keep compiling and only `SubprocessService` is deleted.
+    Rename them and that stops being true.
+30. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
     fields and no public constructor; `Fresh` comes only from `revalidate()` and
     is consumed by the executor. Do not add a public constructor or a `Clone`.
 
