@@ -26,7 +26,7 @@ could be added without rework.
 | M8 known-gap cleanup — exclusive image sizes, measured writable layers, SIGINT, remote gate, size cache | done |
 
 ```
-cargo test --workspace                  # 285 tests
+cargo test --workspace                  # 286 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -368,6 +368,17 @@ All have regression tests — if you break one, a test will tell you.
     answer. Default no-op on the trait, so a client that cannot overlap is
     unaffected and the call sequence is identical either way — still exactly
     one `df`, still degrading to a warning on failure.
+47. **Liveness comes from the filesystem; the index only counts.**
+    `project_absences` carries a row for every project with any history, and a
+    project that is present reads `absent_scans = 0`. The path-recall branch
+    read that stored number as the verdict, so every project whose path was
+    remembered rather than labelled came out absent — including the ones
+    plainly still there. ddev's global services warned "missing across 0
+    scan(s) — run again to confirm" on every run, an instruction no number of
+    runs could satisfy, and the `Present` claim that exists to veto another
+    claim's orphan verdict was thrown away with it (invariant 7's failure mode,
+    reached from the other direction). So: `liveness_of` first, and the stored
+    count refines the answer only once the directory is actually missing.
 
 ## The acceptance gate
 

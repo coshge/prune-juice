@@ -785,12 +785,24 @@ impl<'a> Scanner<'a> {
                 let Some(path) = recalled else { continue };
 
                 let root = std::path::PathBuf::from(&path);
-                c.liveness = match project_absences.get(&path) {
-                    Some(n) => crate::model::Liveness::Absent {
-                        since_unix: None,
-                        scans: *n,
-                    },
-                    None => crate::providers::liveness_of(Some(&root)),
+                // The filesystem decides whether this is an absence; the index
+                // only counts how many scans it has lasted. Reading a stored
+                // count as the verdict made every recalled project absent,
+                // including the ones that are plainly there: `project_absences`
+                // carries a row for every project with any history, and a
+                // present one has `absent_scans = 0`. That produced "missing
+                // across 0 scan(s) — run again to confirm" on every run, an
+                // instruction no number of runs could satisfy, and it dropped
+                // the `Present` claim whose whole job is to veto another
+                // claim's orphan verdict.
+                c.liveness = match crate::providers::liveness_of(Some(&root)) {
+                    crate::model::Liveness::Absent { since_unix, scans } => {
+                        crate::model::Liveness::Absent {
+                            since_unix,
+                            scans: project_absences.get(&path).copied().unwrap_or(scans),
+                        }
+                    }
+                    settled => settled,
                 };
                 c.evidence.push(crate::model::Evidence::new(
                     crate::model::EvidenceSource::Index,
@@ -1394,6 +1406,72 @@ mod tests {
             v.orphan_candidate,
             "and the verdict should now be reachable"
         );
+    }
+
+    #[test]
+    fn a_recalled_path_that_still_exists_is_present_not_absent_across_zero_scans() {
+        // `project_absences` holds a row for every project with any history,
+        // and a present one reads `absent_scans = 0`. Taking that as the
+        // verdict marked a recalled project absent while its directory sat
+        // right there: on the reference machine ddev's global services warned
+        // "missing across 0 scan(s) — run again to confirm" on every single
+        // run, which no number of runs could ever satisfy. Worse, it threw
+        // away the `Present` claim whose only job is to veto another claim's
+        // orphan verdict.
+        let index = crate::index::Index::in_memory().unwrap();
+        // A directory that exists — the analogue of `~/.ddev`.
+        let present = std::env::temp_dir().join("pj-recalled-present");
+        std::fs::create_dir_all(&present).unwrap();
+        let path = present.to_string_lossy().into_owned();
+
+        let with_container = FakeDocker {
+            containers: vec![container(
+                "svc-1",
+                &[(COMPOSE_PROJECT, "svc"), (COMPOSE_WORKING_DIR, &path)],
+                &["svc_data"],
+            )],
+            volumes: vec![volume("svc_data", &[(COMPOSE_PROJECT, "svc")])],
+        };
+        Scanner::with_index_only(&with_container, &index)
+            .scan(
+                "t",
+                &ScanOptions::default(),
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        // The container goes, so the path can only come from the index — but
+        // the directory it names is still there.
+        let container_gone = FakeDocker {
+            containers: vec![],
+            volumes: vec![volume("svc_data", &[(COMPOSE_PROJECT, "svc")])],
+        };
+        let after = Scanner::with_index_only(&container_gone, &index)
+            .scan(
+                "t",
+                &ScanOptions::default(),
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        let v = after.of_kind(ResourceKind::Volume).next().unwrap();
+        assert!(
+            v.claims
+                .iter()
+                .any(|c| c.liveness == crate::model::Liveness::Present),
+            "a directory that exists is Present: {:?}",
+            v.claims.iter().map(|c| &c.liveness).collect::<Vec<_>>()
+        );
+        assert!(!v.orphan_candidate);
+        assert!(
+            !after.warnings.iter().any(|w| w.contains("run again")),
+            "nothing to confirm, so nothing to nag about: {:?}",
+            after.warnings
+        );
+
+        std::fs::remove_dir_all(&present).ok();
     }
 
     /// A prober that reports an image and then is never asked for anything.
