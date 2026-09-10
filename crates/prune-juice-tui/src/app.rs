@@ -439,6 +439,7 @@ mod tests {
             orphan_candidate: orphan,
             unattributed: false,
             content: None,
+            recovery: None,
         }
     }
 

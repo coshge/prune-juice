@@ -7,7 +7,7 @@
 //! [`DockerMutate`]: crate::docker::DockerMutate
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -80,6 +80,9 @@ pub struct Attributed {
     /// What the volume actually contains. `None` means not probed — which is
     /// never treated as "empty".
     pub content: Option<ContentReport>,
+    /// How this could be got back if it were removed. Drives the opt-in tiers:
+    /// a thing with a stated price can be offered; a thing with none cannot.
+    pub recovery: Option<crate::model::Recovery>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -111,6 +114,108 @@ impl ScanReport {
     pub fn unattributed(&self) -> impl Iterator<Item = &Attributed> {
         self.resources.iter().filter(|a| a.unattributed)
     }
+}
+
+/// How an image could be got back.
+///
+/// Only images, for now: a volume's contents are not reproducible from a
+/// checkout, and a container is recreated by compose as a matter of course.
+///
+/// A registry digest beats a build context, because a digest either resolves
+/// or it does not, whereas a rebuild can fail in a dozen ways that only show
+/// up when someone urgently needs it to work.
+fn recovery_for(
+    r: &ResourceSummary,
+    catalog: &Catalog,
+    roots: &[PathBuf],
+) -> Option<crate::model::Recovery> {
+    use crate::model::Recovery;
+    if r.kind != ResourceKind::Image {
+        return None;
+    }
+
+    // A local build first, and a registry digest only as a fallback.
+    //
+    // The obvious order is wrong: BuildKit stamps a RepoDigests entry on
+    // locally built images too, so `fen-wordpress@sha256:…` looks exactly like
+    // a pullable reference and is not — `docker pull` on it fails. Treating a
+    // digest as proof of pullability marked all 89 project images as
+    // "re-pullable, costs bandwidth" when in truth each needs a rebuild.
+    //
+    // Matching `<project>-<service>` back to a project directory is decisive:
+    // `fen-wordpress` resolves to `fen`, `alpine` resolves to nothing.
+    let tag = r.repo_tags.first().map(|t| t.as_str()).unwrap_or(&r.name);
+    let repo = tag.split(':').next().unwrap_or(tag);
+    // Only a bare `name-service` can be one of ours; anything with a registry
+    // host in it came from a registry.
+    let local_shaped = !repo.contains('/');
+
+    if local_shaped {
+        if let Some((candidate, service)) = repo.rsplit_once('-') {
+            let dir = catalog
+                .get(candidate)
+                .and_then(|p| p.root.clone())
+                .or_else(|| roots.iter().map(|r| r.join(candidate)).find(|p| p.is_dir()));
+
+            if let Some(dir) = dir {
+                return Some(if has_build_context(&dir) {
+                    Recovery::Build {
+                        command: format!("docker compose build {service}"),
+                        dir,
+                    }
+                } else {
+                    Recovery::Impossible {
+                        why: format!("no Dockerfile found under {}", dir.display()),
+                    }
+                });
+            }
+            // Looks like one of ours, but the project is gone. This is nbk:
+            // tagged, a gigabyte, and nothing will ever rebuild it.
+            return Some(Recovery::Impossible {
+                why: format!(
+                    "no project directory for \"{candidate}\" — nothing left to build from"
+                ),
+            });
+        }
+    }
+
+    match r.repo_digests.first() {
+        Some(d) => Some(Recovery::Pull(d.clone())),
+        None => Some(Recovery::Impossible {
+            why: "no registry reference and no local build context".into(),
+        }),
+    }
+}
+
+/// Is there something here that could rebuild an image?
+fn has_build_context(dir: &Path) -> bool {
+    for rel in [
+        "Dockerfile",
+        "docker/Dockerfile",
+        "docker/wordpress/Dockerfile",
+        "Dockerfile.nginx",
+    ] {
+        if dir.join(rel).is_file() {
+            return true;
+        }
+    }
+    // A shallow walk, since these stacks nest their Dockerfiles a level or two
+    // down and a full walk would cost more than the answer is worth.
+    for depth1 in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = depth1.path();
+        if !p.is_dir() {
+            continue;
+        }
+        if p.join("Dockerfile").is_file() {
+            return true;
+        }
+        for depth2 in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+            if depth2.path().join("Dockerfile").is_file() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Wall-clock seconds. The scan already performs IO, so reading a clock here
@@ -435,6 +540,7 @@ impl<'a> Scanner<'a> {
         let now_unix = now_unix();
         let mut project_absences: BTreeMap<String, u32> = BTreeMap::new();
         let mut remembered: BTreeMap<String, crate::index::RememberedOwner> = BTreeMap::new();
+        let mut recalled_paths: BTreeMap<String, String> = BTreeMap::new();
         if let Some(index) = self.index {
             let all: Vec<ResourceSummary> = containers
                 .iter()
@@ -467,6 +573,15 @@ impl<'a> Scanner<'a> {
                 }
             }
             remembered = index.all_historical_owners(&daemon.id).unwrap_or_default();
+
+            // Project name to path, derived from the same edges. Volumes are
+            // keyed by their own name; an image only ever knows its project's
+            // name, so it needs this second view to have a path recalled too.
+            for (name, path) in remembered.values() {
+                if let (Some(name), Some(path)) = (name, path) {
+                    recalled_paths.entry(name.clone()).or_insert(path.clone());
+                }
+            }
 
             // Also pull absences for paths only the index remembers.
             //
@@ -547,40 +662,44 @@ impl<'a> Scanner<'a> {
 
             // A claim can name its project and still not know where it lived.
             // That happens the moment the last container carrying the path is
-            // removed: the volume's own label says `project=nbk`, but no label
-            // anywhere says where `nbk` is, so the claim cannot be checked
-            // against a directory and falls to Weak.
+            // removed: the resource's own label says `project=nbk`, but no
+            // label anywhere says where `nbk` is, so the claim cannot be
+            // checked against a directory and falls to Weak.
             //
-            // The index remembers. Supplying the path from memory is precisely
-            // what it is for, and the orphan threshold still applies — a
-            // remembered path only matters once the index has also counted the
-            // directory missing across several scans.
-            if r.kind == ResourceKind::Volume {
-                if let Some((_, Some(path))) = remembered.get(&r.name) {
-                    for c in claims.iter_mut() {
-                        if c.root.is_none() {
-                            let root = std::path::PathBuf::from(path);
-                            c.liveness = match project_absences.get(path) {
-                                Some(n) => crate::model::Liveness::Absent {
-                                    since_unix: None,
-                                    scans: *n,
-                                },
-                                None => crate::providers::liveness_of(Some(&root)),
-                            };
-                            c.evidence.push(crate::model::Evidence::new(
-                                crate::model::EvidenceSource::Index,
-                                format!(
-                                    "project path {path} recalled from a container that has since been removed"
-                                ),
-                            ));
-                            c.root = Some(root);
-                            // Ownership was already authoritative from the
-                            // label; only the location was missing.
-                            if c.confidence < Confidence::Strong {
-                                c.confidence = Confidence::Strong;
-                            }
-                        }
+            // The index remembers. This applies to every kind, not just
+            // volumes — nbk's two tagged images sat in Protected for exactly
+            // this reason, a gigabyte that nothing will ever rebuild or want.
+            for c in claims.iter_mut() {
+                if c.root.is_some() {
+                    continue;
+                }
+                let recalled = recalled_paths.get(&c.project_name).cloned().or_else(|| {
+                    match remembered.get(&r.name) {
+                        Some((_, Some(p))) => Some(p.clone()),
+                        _ => None,
                     }
+                });
+                let Some(path) = recalled else { continue };
+
+                let root = std::path::PathBuf::from(&path);
+                c.liveness = match project_absences.get(&path) {
+                    Some(n) => crate::model::Liveness::Absent {
+                        since_unix: None,
+                        scans: *n,
+                    },
+                    None => crate::providers::liveness_of(Some(&root)),
+                };
+                c.evidence.push(crate::model::Evidence::new(
+                    crate::model::EvidenceSource::Index,
+                    format!(
+                        "project path {path} recalled from a container that has since been removed"
+                    ),
+                ));
+                c.root = Some(root);
+                // Ownership was already authoritative from the label; only the
+                // location was missing.
+                if c.confidence < Confidence::Strong {
+                    c.confidence = Confidence::Strong;
                 }
             }
 
@@ -656,7 +775,10 @@ impl<'a> Scanner<'a> {
                 None
             };
 
+            let recovery = recovery_for(&r, &catalog, &opts.project_roots);
+
             resources.push(Attributed {
+                recovery,
                 content,
                 resource: r,
                 owner: best.as_ref().map(|c| c.project_name.clone()),

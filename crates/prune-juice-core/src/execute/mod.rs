@@ -602,6 +602,7 @@ mod tests {
             orphan_candidate: false,
             unattributed: false,
             content: None,
+            recovery: None,
         }
     }
 

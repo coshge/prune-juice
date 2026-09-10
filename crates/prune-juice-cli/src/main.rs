@@ -31,7 +31,16 @@ USAGE:
 
 OPTIONS:
     --apply             Actually delete. Without this, nothing is touched.
-    --tiers <LIST>      Comma-separated: free,orphan,stale  (default: free)
+    --tiers <LIST>      What to act on. Default `free`, which needs no
+                        review. In rising order of what it costs to be wrong:
+                          free         nothing here can be lost
+                          orphan       owning project is gone; volumes vaulted
+                          repullable   pulled again on next use (bandwidth)
+                          stale        dormant, project still exists; vaulted
+                          rebuildable  rebuilt from a context that still
+                                       exists — costs time, and an old build
+                                       with network-install steps may no
+                                       longer reproduce
     --only-label <K=V>  Refuse to touch anything without this label
     --json              NDJSON on stdout, progress on stderr
     --no-sizes          Skip volume sizing (the expensive call)
@@ -66,8 +75,9 @@ With no arguments on a terminal, `prune-juice` opens an interactive
 interface. Piped, redirected, or under CI it prints a one-shot report
 instead, so it composes in a script without special-casing.
 
-Tier `free` is the only one safe without review. Asking for `orphan` or
-`stale` on the command line skips a review step that exists for a reason.
+Tier `free` is the only one safe without review. Every other tier is an
+explicit choice about a cost you are accepting — run without --apply first
+and read what it says it would do.
 
 EXIT CODES:
     0  nothing needing attention
@@ -185,6 +195,8 @@ fn parse_args() -> Result<Args, String> {
                     .map(|s| match s.trim() {
                         "free" => Ok(Tier::Free),
                         "orphan" => Ok(Tier::Orphan),
+                        "repullable" => Ok(Tier::Repullable),
+                        "rebuildable" => Ok(Tier::Rebuildable),
                         "stale" => Ok(Tier::Stale),
                         other => Err(format!("unknown tier: {other}")),
                     })
@@ -706,6 +718,43 @@ fn render(r: &ScanReport, plan: &Plan) {
     println!("    {:>10}  irreversible", irreversible.human());
     if irreversible == Bytes::ZERO {
         println!("    Nothing here can be lost.");
+    }
+
+    // The ladder. Everything above `free` costs something to be wrong about,
+    // so each rung states its price and none of it happens without --tiers.
+    println!();
+    println!(
+        "  IF YOU KNOW YOU CAN REBUILD — opt in with --tiers <name>
+    (image sizes are summed, so shared layers count twice — the real figure is
+     lower, and a run reports what it actually freed)"
+    );
+    for t in Tier::OPT_IN {
+        let items: Vec<_> = plan.of_tier(t).collect();
+        if items.is_empty() {
+            continue;
+        }
+        let bytes: Bytes = items.iter().filter_map(|i| i.size).sum();
+        println!(
+            "    {:<12} {:>4} items {:>9}   {}",
+            t.as_str(),
+            items.len(),
+            bytes.human(),
+            t.caveat()
+        );
+        if t == Tier::Rebuildable {
+            println!(
+                "                                       an old build with network-install steps"
+            );
+            println!(
+                "                                       may no longer reproduce — see --explain"
+            );
+        }
+    }
+    if Tier::OPT_IN
+        .iter()
+        .all(|t| plan.of_tier(*t).next().is_none())
+    {
+        println!("    nothing — every remaining resource is either in use or unrecoverable");
     }
 
     let mut orphans: Vec<_> = plan.of_tier(Tier::Orphan).collect();

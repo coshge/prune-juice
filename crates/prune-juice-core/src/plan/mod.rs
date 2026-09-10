@@ -296,15 +296,17 @@ impl Planner {
             // A witness exists only for tiers that may be acted on, and only
             // the planner can mint one.
             let witness = match verdict.tier {
-                Tier::Free | Tier::Orphan | Tier::Stale => Some(SafeToDelete {
-                    resource: a.resource.id.clone(),
-                    kind: a.resource.kind,
-                    name: a.resource.name.clone(),
-                    tier: verdict.tier,
-                    evidence_hash: rs.hash_hex(),
-                    daemon: report.daemon.id.clone(),
-                    proven_at: now_unix,
-                }),
+                Tier::Free | Tier::Orphan | Tier::Stale | Tier::Repullable | Tier::Rebuildable => {
+                    Some(SafeToDelete {
+                        resource: a.resource.id.clone(),
+                        kind: a.resource.kind,
+                        name: a.resource.name.clone(),
+                        tier: verdict.tier,
+                        evidence_hash: rs.hash_hex(),
+                        daemon: report.daemon.id.clone(),
+                        proven_at: now_unix,
+                    })
+                }
                 Tier::Protected | Tier::Unattributed => None,
             };
 
@@ -356,6 +358,7 @@ mod tests {
             orphan_candidate: false,
             unattributed: false,
             content: None,
+            recovery: None,
         }
     }
 

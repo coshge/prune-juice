@@ -45,6 +45,13 @@ pub enum Tier {
     Free,
     /// A confident claim on a project that is gone. Per-item confirm.
     Orphan,
+    /// Recoverable by pulling it again. Costs bandwidth and nothing else, so
+    /// this is the mildest of the opt-in tiers.
+    Repullable,
+    /// Recoverable by rebuilding from a context that still exists. Costs time,
+    /// and carries the risk that a build with network-install steps no longer
+    /// reproduces — so it is offered with the command, never assumed.
+    Rebuildable,
     /// A referrer exists but looks dormant. Strong confirm, preserve first.
     Stale,
     /// We do not know who owns this. Never offered for deletion.
@@ -57,6 +64,8 @@ impl Tier {
             Tier::Protected => "protected",
             Tier::Free => "free",
             Tier::Orphan => "orphan",
+            Tier::Repullable => "repullable",
+            Tier::Rebuildable => "rebuildable",
             Tier::Stale => "stale",
             Tier::Unattributed => "unattributed",
         }
@@ -65,6 +74,29 @@ impl Tier {
     /// Only Tier 1 may act without asking.
     pub fn needs_confirmation(self) -> bool {
         self != Tier::Free
+    }
+
+    /// Tiers a user can ask for, in rising order of what it costs to be wrong.
+    pub const OPT_IN: [Tier; 4] = [
+        Tier::Orphan,
+        Tier::Repullable,
+        Tier::Rebuildable,
+        Tier::Stale,
+    ];
+
+    /// One line on what agreeing to this tier actually means.
+    pub fn caveat(self) -> &'static str {
+        match self {
+            Tier::Free => "nothing here can be lost",
+            Tier::Orphan => "owning project is gone; volumes are vaulted first",
+            Tier::Repullable => "pulled again on next use — costs bandwidth, nothing else",
+            Tier::Rebuildable => {
+                "rebuilt from a context that still exists — costs time, and an old build                  with network-install steps may no longer reproduce"
+            }
+            Tier::Stale => "dormant, project still exists; volumes are vaulted first",
+            Tier::Protected => "not offered",
+            Tier::Unattributed => "not offered — ownership unknown",
+        }
     }
 }
 
@@ -123,15 +155,73 @@ pub fn classify(a: &Attributed, graph: &RefGraph, now_unix: i64, rs: &mut ReadSe
         }
     }
 
-    // A tagged image is a statement of intent, not garbage.
-    if r.kind == ResourceKind::Image && !r.repo_tags.is_empty() {
-        rs.record(&subject, "repo_tags", r.repo_tags.join(","));
-        return Verdict {
-            tier: Tier::Protected,
-            reversibility,
-            because: format!("tagged {}", r.repo_tags.join(", ")),
-            referenced,
-        };
+    // A tagged image used to end here, which made `Protected` a dead end and
+    // put 82 GB permanently out of reach. A tag is a statement of intent, but
+    // intent is not the same as irreplaceability: what actually matters is
+    // whether anything is *running* on it, and what it would cost to get back.
+    if r.kind == ResourceKind::Image {
+        // An image is always `Referenced::Unknown` because its layer stack is
+        // not fetched, so the live-container check above never fires for one.
+        // Ask the graph the simple question instead — otherwise a cheap-to-
+        // replace image serving a running container would be offered up.
+        let live = graph.image_is_live(r.id.as_str());
+        rs.record(&subject, "held_by_live_container", live.to_string());
+        if live {
+            return Verdict {
+                tier: Tier::Protected,
+                reversibility,
+                because: "held by a running container".into(),
+                referenced,
+            };
+        }
+        match a.recovery.as_ref() {
+            Some(crate::model::Recovery::Pull(reference)) => {
+                rs.record(&subject, "recovery", "pull");
+                return Verdict {
+                    tier: Tier::Repullable,
+                    reversibility: Reversibility::Restorable(format!("docker pull {reference}")),
+                    because: format!("re-pullable: docker pull {reference}"),
+                    referenced,
+                };
+            }
+            Some(crate::model::Recovery::Build { command, dir }) => {
+                rs.record(&subject, "recovery", "build");
+                return Verdict {
+                    tier: Tier::Rebuildable,
+                    reversibility: Reversibility::Rebuildable(format!(
+                        "{command} in {}",
+                        dir.display()
+                    )),
+                    because: format!("rebuildable: {command} (in {})", dir.display()),
+                    referenced,
+                };
+            }
+            Some(crate::model::Recovery::Impossible { why }) => {
+                rs.record(&subject, "recovery", "impossible");
+                // Nothing left to rebuild from. If its project is also gone
+                // then nothing will ever want it again and it belongs in the
+                // review queue; otherwise leave it alone, because being unable
+                // to explain something is not a reason to delete it.
+                if a.orphan_candidate {
+                    return Verdict {
+                        tier: Tier::Orphan,
+                        reversibility: Reversibility::Gone,
+                        because: format!(
+                            "belongs to \"{}\", whose directory is gone, and {why}",
+                            a.owner.as_deref().unwrap_or("?")
+                        ),
+                        referenced,
+                    };
+                }
+                return Verdict {
+                    tier: Tier::Protected,
+                    reversibility: Reversibility::Gone,
+                    because: why.clone(),
+                    referenced,
+                };
+            }
+            None => {}
+        }
     }
 
     // Docker's own networks are not ours to remove.
@@ -419,6 +509,7 @@ mod tests {
             orphan_candidate: false,
             unattributed: false,
             content: None,
+            recovery: None,
         }
     }
 
@@ -688,13 +779,107 @@ mod tests {
         assert_ne!(classify_one(&rep, 0).tier, Tier::Free);
     }
 
+    fn image(name: &str, recovery: Option<crate::model::Recovery>) -> Attributed {
+        let mut r = ResourceSummary::new(ResourceKind::Image, format!("sha256:{name}"), name);
+        r.created_unix = Some(OLD);
+        r.repo_tags = vec![format!("{name}:latest")];
+        r.size = Some(Bytes(1_000_000_000));
+        let mut a = attributed(r);
+        a.recovery = recovery;
+        a
+    }
+
     #[test]
-    fn a_tagged_image_is_protected() {
-        let mut i = ResourceSummary::new(ResourceKind::Image, "sha256:y", "app:latest");
-        i.created_unix = Some(OLD);
-        i.repo_tags = vec!["app:latest".into()];
-        let rep = report(vec![attributed(i)]);
+    fn a_repullable_image_is_offered_as_repullable_not_protected() {
+        // Tagged used to mean Protected, full stop, which put 82 GB of images
+        // permanently out of reach. What matters is whether anything is running
+        // on it and what getting it back would cost.
+        let rep = report(vec![image(
+            "postgres",
+            Some(crate::model::Recovery::Pull("postgres@sha256:abc".into())),
+        )]);
+        let v = classify_one(&rep, 0);
+        assert_eq!(v.tier, Tier::Repullable);
+        assert!(matches!(v.reversibility, Reversibility::Restorable(_)));
+        assert!(v.because.contains("docker pull"), "{}", v.because);
+    }
+
+    #[test]
+    fn a_rebuildable_image_states_the_command_and_the_risk() {
+        let rep = report(vec![image(
+            "fen-wordpress",
+            Some(crate::model::Recovery::Build {
+                command: "docker compose build wordpress".into(),
+                dir: std::path::PathBuf::from("/r/fen"),
+            }),
+        )]);
+        let v = classify_one(&rep, 0);
+        assert_eq!(v.tier, Tier::Rebuildable);
+        assert!(matches!(v.reversibility, Reversibility::Rebuildable(_)));
+        assert!(v.because.contains("docker compose build"), "{}", v.because);
+        assert!(Tier::Rebuildable
+            .caveat()
+            .contains("may no longer reproduce"));
+    }
+
+    #[test]
+    fn an_unrecoverable_image_of_a_dead_project_goes_to_review() {
+        // nbk's images: tagged, 1 GB, and the project directory is gone, so
+        // nothing will ever rebuild them and nothing will ever want them.
+        let mut a = image(
+            "nbk-wordpress",
+            Some(crate::model::Recovery::Impossible {
+                why: "no project directory for \"nbk\"".into(),
+            }),
+        );
+        a.orphan_candidate = true;
+        a.owner = Some("nbk".into());
+        let rep = report(vec![a]);
+        let v = classify_one(&rep, 0);
+        assert_eq!(v.tier, Tier::Orphan);
+        assert_eq!(v.reversibility, Reversibility::Gone);
+    }
+
+    #[test]
+    fn an_unrecoverable_image_of_a_live_project_stays_protected() {
+        // Being unable to work out how to rebuild something is not a reason to
+        // delete it.
+        let rep = report(vec![image(
+            "mystery",
+            Some(crate::model::Recovery::Impossible {
+                why: "no Dockerfile found".into(),
+            }),
+        )]);
         assert_eq!(classify_one(&rep, 0).tier, Tier::Protected);
+    }
+
+    #[test]
+    fn an_image_a_running_container_holds_is_protected_however_cheap_to_replace() {
+        let img = image(
+            "busy",
+            Some(crate::model::Recovery::Pull("busy@sha256:def".into())),
+        );
+        let img_id = img.resource.id.clone();
+        let mut c = ResourceSummary::new(ResourceKind::Container, "live", "live");
+        c.state = Some(ContainerState::Running);
+        c.created_unix = Some(OLD);
+        c.image_id = Some(img_id);
+        let rep = report(vec![img, attributed(c)]);
+        assert_eq!(
+            classify_one(&rep, 0).tier,
+            Tier::Protected,
+            "a running container outranks any recovery route"
+        );
+    }
+
+    #[test]
+    fn none_of_the_opt_in_tiers_are_free() {
+        // The safe tier must never quietly acquire something with a price.
+        for t in Tier::OPT_IN {
+            assert_ne!(t, Tier::Free);
+            assert!(t.needs_confirmation(), "{t:?}");
+            assert!(!t.caveat().is_empty(), "{t:?} needs a stated cost");
+        }
     }
 
     #[test]

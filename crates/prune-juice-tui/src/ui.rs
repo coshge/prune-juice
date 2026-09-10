@@ -543,6 +543,7 @@ mod tests {
                     orphan_candidate: false,
                     unattributed: false,
                     content: None,
+                    recovery: None,
                 },
                 Attributed {
                     resource: orphan,
@@ -553,6 +554,7 @@ mod tests {
                     orphan_candidate: true,
                     unattributed: false,
                     content: None,
+                    recovery: None,
                 },
             ],
             projects_known: 88,

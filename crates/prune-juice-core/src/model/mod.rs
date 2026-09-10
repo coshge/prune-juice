@@ -367,6 +367,48 @@ impl EvidenceSource {
     }
 }
 
+// -------------------------------------------------------------- recovery ----
+
+/// How a resource could be got back after deletion.
+///
+/// The tool's safe tier only ever offers things that cost nothing to lose.
+/// This is the next rung: things that *can* be got back, but at a price, so
+/// the price has to be stated before anyone agrees to pay it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "how", content = "detail")]
+pub enum Recovery {
+    /// Re-pullable from a registry by digest. Costs bandwidth and nothing else.
+    Pull(String),
+    /// Rebuildable from a build context that still exists. Costs time, and
+    /// carries the risk that a build with network-install steps no longer
+    /// reproduces.
+    Build { command: String, dir: PathBuf },
+    /// Nothing to rebuild from. Deleting is final.
+    Impossible { why: String },
+}
+
+impl Recovery {
+    pub fn is_possible(&self) -> bool {
+        !matches!(self, Recovery::Impossible { .. })
+    }
+
+    /// Re-pulling is materially safer than rebuilding: a registry either has
+    /// the digest or it does not, whereas a rebuild can fail in a dozen ways.
+    pub fn is_pull(&self) -> bool {
+        matches!(self, Recovery::Pull(_))
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Recovery::Pull(r) => format!("re-pullable: docker pull {r}"),
+            Recovery::Build { command, dir } => {
+                format!("rebuildable: {command}  (in {})", dir.display())
+            }
+            Recovery::Impossible { why } => format!("cannot be recovered — {why}"),
+        }
+    }
+}
+
 // --------------------------------------------------------------- runtime ----
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -304,6 +304,20 @@ impl RefGraph {
         self.live_volumes.contains(name)
     }
 
+    /// Is this image held by a container that is running right now?
+    ///
+    /// Asked directly rather than inferred from [`Referenced`], because an
+    /// image is always `Unknown` — its layer stack is not fetched, so a
+    /// base-image relationship cannot be ruled out. That opacity is about
+    /// *other images*, and must not be allowed to obscure the much simpler
+    /// question of whether something is running on this one.
+    pub fn image_is_live(&self, id: &str) -> bool {
+        self.image_referrers
+            .get(id)
+            .map(|rs| rs.iter().any(|r| r.kind == ReferrerKind::LiveContainer))
+            .unwrap_or(false)
+    }
+
     /// Answer the reference question, recording every fact consulted.
     ///
     /// The `ReadSet` that comes back is exactly what the decision rested on, and
@@ -392,6 +406,7 @@ mod tests {
             orphan_candidate: false,
             unattributed: true,
             content: None,
+            recovery: None,
         }
     }
 
