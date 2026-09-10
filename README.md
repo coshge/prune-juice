@@ -4,35 +4,33 @@ Reclaim Docker disk without unknown risk of deletion.
 
 ```
 $ prune-juice
-scanning orbstack… 3305 ms
-  context default      is the same engine as one already scanned — skipping
 
   orbstack  ·  OrbStack  ·  engine 29.4.0 (API 1.54)
-  daemon aeb90dba-23d8-412b-8730-1bd999853f68
 
-    255 containers     144 images (82.5 GB)
-    259 volumes (35.8 GB)    24 networks
-    329 build cache records, 16.3 GB reclaimable
-     88 projects known
+    255 containers     144 images (82.5 GB)     259 volumes (35.8 GB)
+     24 networks       274 build cache records (12.1 GB reclaimable)
 
-  ORPHAN CANDIDATES (11) — a confident claim on a project that is gone
-    nbk-wordpress:latest                            984 MB  nbk
-        [label] com.docker.compose.project = nbk
-        [fs] /Users/x/Documents/Repos/nbk is not present
-    nbk_mysql                                       379 MB  nbk
-        [label] com.docker.compose.project = nbk
-        [fs] /Users/x/Documents/Repos/nbk is not present
+  SAFE TO RECLAIM — 12.1 GB
+       12.1 GB  rebuildable   (109 items + build cache)
+           0 B  irreversible
+    Nothing here can be lost.
 
-  UNATTRIBUTED VOLUMES (112, 5.4 GB) — never offered for deletion
-    97 are anonymous (64-hex). Their owning containers are gone, so the
-    mapping is unrecoverable from Docker.
-
-  VOLUME ATTRIBUTION
-    proven 50   strong 100   weak 0   guess 10   none 99
+  NEEDS REVIEW — 9 orphaned (390 MB), 151 stale
+    nbk_mysql                                   379 MB  belongs to "nbk", whose directory is gone
+    nbk_tmp                                    10.5 MB  belongs to "nbk", whose directory is gone
+    nbk_s3                                     20.8 kB  belongs to "nbk", whose directory is gone
+    nbk-wordpress-1                                  —  belongs to "nbk", whose directory is gone
+    nbk-s3-init-1                                    —  belongs to "nbk", whose directory is gone
+    nbk-mysql-1                                      —  belongs to "nbk", whose directory is gone
+    nbk-nginx-1                                      —  belongs to "nbk", whose directory is gone
+    nbk-s3-1                                         —  belongs to "nbk", whose directory is gone
+    nbk_default                                      —  belongs to "nbk", whose directory is gone
 ```
 
-**Status: M1.** This build is read-only. It cannot delete anything, because the
-only destructive trait has no implementation in the workspace yet.
+**Status: M2.** Dry-run by default. `--apply` reclaims the safe tier and nothing
+else. Volumes cannot reach the safe tier in this build at all — without a content
+probe there is no way to tell an empty scratch volume from a Postgres data
+directory.
 
 ## The problem
 
@@ -93,9 +91,44 @@ Matching forward against known project names, longest first, is correct.
 is referenced whether or not anything is running. Without that edge, a project
 you simply have not started today looks abandoned.
 
-**The build-cache figure is the conservative one.** `docker buildx du` reports
-20.52 GB reclaimable; only 16.3 GB is neither in use nor shared. Over-promising
-reclaim is a trust bug, so the smaller number is what gets shown.
+**The build-cache figure is the conservative one.** `docker buildx du` reports a
+"reclaimable" total that includes records shared between builders; only the
+subset that is neither in use nor shared is counted here, which on this machine
+runs about 25% lower. Over-promising reclaim is a trust bug, so the tool
+under-promises and over-delivers rather than the reverse.
+
+## Tier 1 is a conjunction, not a synonym for "unused"
+
+> **Tier 1 Theorem.** Deleting a Tier 1 item destroys no information that cannot
+> be recovered from something that still exists afterwards.
+
+Three independent properties, all required:
+
+1. **Unreferenced** — with a proof. Every container is a referrer in every
+   state, and `Unknown` blocks: swarm, a remote daemon, or an unreadable
+   project root all mean something could hold a reference we cannot see.
+2. **Reconstructible** — the bytes come back, or were worthless.
+3. **Tier-stable** — removing it degrades nothing else. This is the one that
+   gets forgotten: deleting an exited container is safe by the first two and
+   destroys the only link between its anonymous volumes and their project, so a
+   container that mounts anything is excluded.
+
+The run-level summary states the third property as a number rather than a
+promise, and the word "irreversible" only ever appears beside a non-zero one.
+
+## Two bugs worth knowing about
+
+Both were found by running the tool against a real machine, and both now have
+regression tests.
+
+**Opacity must be scoped.** Three unreadable project roots were making all 259
+volumes `Unknown` — one unplugged disk darkened everything. An unreadable root
+now only conceals the volumes that could plausibly belong to it.
+
+**A read-set must contain stable facts.** Recording raw elapsed seconds meant
+every witness went stale during the pre-apply re-scan, so nothing could ever be
+applied. It now records the fixed creation timestamp and whether the age gate
+passed — the facts the verdict actually rested on.
 
 ## Confidence gates deletion
 
@@ -113,23 +146,36 @@ one that does not.
 ## Usage
 
 ```
-prune-juice                 # human report
-prune-juice --json          # NDJSON on stdout, progress on stderr
-prune-juice --no-sizes      # skip the expensive `system df`
-prune-juice --roots a:b     # where to look for projects
-prune-juice --context NAME  # one context only
+prune-juice                    # report + dry run. Nothing is touched.
+prune-juice --apply            # reclaim the safe tier
+prune-juice --tiers free       # which tiers to act on (default: free)
+prune-juice --only-label K=V   # hard fence: nothing else is reachable
+prune-juice --json             # NDJSON on stdout, progress on stderr
+prune-juice --no-sizes         # skip the expensive `system df`
+prune-juice --roots a:b        # where to look for projects
+prune-juice --context NAME     # one context only
 ```
+
+The executor always runs; without `--apply` it runs in dry-run mode, which
+exercises the identical path including per-item revalidation. Dry-run is an
+oracle for the apply path, not a separate and less-tested branch.
 
 Exit codes: `0` nothing to report, `1` reclaimable space or unattributed
 resources found, `2` usage, `3` daemon unreachable, `4` permission denied,
-`130` cancelled. Suitable for `set -e` gates.
+`5` partial failure, `130` cancelled. Suitable for `set -e` gates.
 
 ## Design
 
 Two traits, deliberately separate. `DockerClient` is read-only; `DockerMutate`
-is destructive and has no implementation yet. That split is the **deletion
-firewall** — the replay client used by tests implements only the first, so no
-test can delete anything even by accident.
+is destructive. That split is the **deletion firewall** — a read-only client
+cannot delete even by accident, and every mutating call passes `force: false` so
+the daemon's own in-use check stays armed. A refusal from the daemon is the
+system working.
+
+Permission to delete is a value, not a flag. `SafeToDelete` has private fields
+and no public constructor, so only the planner can mint one. `Fresh` is produced
+solely by `revalidate()` and consumed by the executor, so a witness cannot
+outlive its own check.
 
 `bollard` types never escape `crate::docker`. If bollard ever becomes a problem,
 replacing it is roughly 600 lines over `hyperlocal` and named pipes, and touches
@@ -146,8 +192,8 @@ Rust 1.85+. No system libraries — SQLite is bundled. `cargo build --workspace`
 
 ## Roadmap
 
-M1 read-only scan (done) · M2 planner and one-click safe tier · M3 interactive
-TUI · M4 content probe and vault · M5 review, waivers, host disk measurement ·
-M6 macOS app.
+M1 read-only scan (done) · M2 planner and safe tier (done) · M3 interactive TUI ·
+M4 content probe and vault, which is what unlocks volumes · M5 review, waivers,
+host disk measurement · M6 macOS app.
 
 MIT.
