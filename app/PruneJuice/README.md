@@ -1,54 +1,64 @@
 # Prune Juice for Mac
 
-A native AppKit window hosting SwiftUI, with system typography, translucent sidebar,
-plum accents, and automatic light and dark appearance. Requires macOS 14 or later.
+Inspect Docker resources, review cleanup costs, and reclaim space from a native
+Mac app. Requires macOS 14 or later and a running local Docker runtime.
 
-Build the runnable app from this directory:
+For installation, classification rules, vault behavior, and troubleshooting, see
+the [main user guide](../../README.md).
+
+## Build and open
+
+With Rust and a Swift 6 toolchain installed, run from this directory:
 
 ```sh
 ./scripts/bundle.sh
 open dist/PruneJuice.app
 ```
 
+The app includes its command-line helper. The default build is signed for local
+use, not notarized for redistribution. Move the complete `PruneJuice.app` bundle
+to Applications if you want to keep it there.
+
+## Scan and review
+
+The app scans on launch. Use **Scan again** or **Command-R** to refresh.
+
+| Screen | What you can do |
+| --- | --- |
+| Resources | Search resources, filter classifications, and select a row to read its reason and ownership evidence. |
+| Reclaim | Select cleanup tiers, see the combined estimate, preview cleanup, and review costs before confirming. |
+| Vault | List, verify, preserve, restore, or permanently delete volume copies. |
+| Waivers | List, add, or remove exclusions that protect matching resources. |
+| Activity | Follow progress, read results and notices, and copy output. |
+| Settings | Set the Docker context, project folders, label filter, deadline, inspection options, vault preservation, and menu bar icon. |
+
 See [resource labels and their exact criteria](../../README.md#resource-labels-and-their-exact-criteria)
 for the rules behind Protected, Safe, Pull again, Build again, Orphaned, Dormant,
 and Unattributed.
 
-The app uses only its bundled CLI helper. It opens with a scan. Cleanup is an
-explicit action from the Reclaim screen, with the selected tier costs and context
-scope shown before confirmation. Selections return to the safe tier on a new scan.
+## Reclaim space
 
-| Screen | CLI functionality |
-| --- | --- |
-| Resources | Scan all classifications, search by name/project/kind/context, inspect reasons and provenance |
-| Reclaim | Preview selected tiers without mutation, apply all five offered tiers, show preservation and recovery costs |
-| Vault | List, verify, preserve a volume, restore an entry, delete a preserved copy with a reason |
-| Waivers | List, add with a reason, remove a selector |
-| Activity | Streaming progress, warnings, copyable command output, separate logical and physical reclamation |
-| Settings | Context, project roots, label fence, deadline, sizes, content inspection, container inspection, vault toggle, CLI help |
+Select the tiers you want on **Reclaim**. The estimate updates with your selection;
+eligible build cache is included only when Safe is checked. **Preview cleanup**
+does not delete resources. **Review cleanup** shows the costs and scope before
+you confirm removal.
 
-Vault and waiver listings use the CLI's text output in Activity. Entry IDs and
-selectors can be copied into their action forms. Vault preserve and restore use
-the first discovered local context, matching the current CLI. Cleanup applies to
-whole tiers, including newly eligible resources found in its fresh scan. The
-resource browser does not imply individual deletion selection.
+Cleanup applies to whole selected tiers, including newly eligible resources found
+during its fresh scan. Selecting a row in Resources only opens its details.
+Changing settings requires another scan before cleanup. A new scan resets the
+selection to Safe. Scan again after cleanup to refresh the resource list.
 
-Every subprocess drains stdout and stderr concurrently. App actions are serialized,
-cleanup requires a successful scan with matching settings, and operations that
-change resources invalidate the displayed scan. Quit waits for an operation to
-finish. The engine retains all deletion, revalidation, and verified-backup rules.
-A disabled vault refuses irreversible items. App copy and displayed CLI messages
-are normalized to avoid em dashes.
+## Preserve and protect resources
 
-Verification:
+Vault and waiver listings appear in **Activity**. Copy an entry ID or selector
+into its action form. Deleting a preserved copy and adding a waiver both require
+a reason of at least 12 characters.
 
-```sh
-swift test
-PJ_SCREENSHOTS=/tmp/prune-juice-ui swift test
-```
+Vault preserve and restore use the first discovered local Docker context,
+independently of the scan context setting. Restore keeps the archive and refuses
+to overwrite an existing volume. Disabling vault preservation causes cleanup to
+refuse irreversible volumes rather than remove them without a copy.
 
-Tests exercise argument boundaries, duplicate-action prevention, scan invalidation,
-context identity, repeated scan totals, label cache fencing, incomplete results,
-protocol compatibility, and native rendering. The screenshot test uses fixture
-resources and invokes no Docker operations. Screenshots are written outside the
-repository. Live destructive workflows must be tested on disposable resources.
+Allow active operations to finish before quitting. If the app reports a helper
+error, rebuild or replace the complete app bundle. Diagnostics are written to
+`~/Library/Logs/prune-juice-app.log`.
