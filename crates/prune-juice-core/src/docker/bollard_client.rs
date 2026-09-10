@@ -460,14 +460,21 @@ impl DockerMutate for BollardClient {
         result
     }
 
-    fn prune_build_cache(&self, keep_newer_than_secs: u64) -> Result<Bytes> {
-        // The time guard is what survives a build starting between plan and
-        // apply: anything touched inside the window is left alone.
+    fn prune_build_cache(&self, _keep_newer_than_secs: u64) -> Result<Bytes> {
+        // No `unused-for` filter, and no `all`.
+        //
+        // The time guard the plan called for does not work on this engine:
+        // `unused-for` matches nothing even at 2000h against records the API
+        // itself reports as last used months ago, and neither does buildx's own
+        // equivalent. A guard that silently matches nothing is worse than no
+        // guard, because it makes a no-op look like a safety feature.
+        //
+        // So the guard is the daemon's instead: `/build/prune` without `all`
+        // removes only cache not required for current builds, which is the same
+        // bet already taken on `force: false` for volumes — trust the engine's
+        // own in-use check rather than reimplementing it badly.
         let opts = bollard::query_parameters::PruneBuildOptionsBuilder::new()
-            .filters(&std::collections::HashMap::from([(
-                "unused-for",
-                vec![format!("{keep_newer_than_secs}s").as_str()],
-            )]))
+            .all(false)
             .build();
         let resp = self
             .block(self.docker.prune_build(Some(opts)))

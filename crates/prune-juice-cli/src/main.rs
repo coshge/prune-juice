@@ -836,6 +836,13 @@ fn render_receipt(r: &Receipt) {
         }
     }
 
+    if let Some((want, got)) = r.shortfall() {
+        println!(
+            "  ! expected about {} but freed {} — something in that chain is not working",
+            want.human(),
+            got.human()
+        );
+    }
     for i in &r.items {
         match &i.outcome {
             ItemOutcome::Skipped(s) => println!("    skipped  {:<36} {s}", truncate(&i.name, 36)),

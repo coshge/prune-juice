@@ -122,6 +122,14 @@ pub struct Receipt {
     /// What the daemon told us we freed. Host-measured reclamation is a
     /// separate, and different, number.
     pub docker_reported: Bytes,
+    /// What the plan said it would free, before anything was attempted.
+    ///
+    /// Kept so the run can check itself. A mechanism that silently reclaims
+    /// nothing looks identical to a clean run unless the two figures are
+    /// compared — which is how a build-cache filter that matched nothing went
+    /// unnoticed: dry-run happily reported the prediction without ever asking
+    /// the daemon.
+    pub predicted: Bytes,
     /// What the host actually gave back, where that could be measured.
     /// `None` means unmeasurable — never quietly filled in with the Docker
     /// figure, because conflating the two is the whole mistake.
@@ -151,6 +159,23 @@ impl Receipt {
     }
     pub fn problems(&self) -> usize {
         self.items.iter().filter(|i| i.outcome.is_problem()).count()
+    }
+
+    /// Did the run deliver materially less than it promised?
+    ///
+    /// Under-delivering is a trust bug even when nothing is lost: a user who
+    /// is told 12 GB and gets nothing has no reason to believe the next
+    /// number either. Reported rather than smoothed over.
+    pub fn shortfall(&self) -> Option<(Bytes, Bytes)> {
+        if self.simulated || self.predicted == Bytes::ZERO {
+            return None;
+        }
+        let got = self.docker_reported.get();
+        let want = self.predicted.get();
+        // Half or less of what was promised, and at least 1 MB adrift, so a
+        // rounding difference on a tiny run does not cry wolf.
+        (got * 2 <= want && want.saturating_sub(got) > 1_000_000)
+            .then_some((self.predicted, self.docker_reported))
     }
 }
 
@@ -427,8 +452,36 @@ impl<'a> Executor<'a> {
             _ => None,
         };
 
+        // Compare what was promised against what happened, and say so.
+        let predicted = {
+            let items: Bytes = items
+                .iter()
+                .filter(|i| i.outcome.removed() || i.outcome == ItemOutcome::WouldDelete)
+                .filter_map(|i| i.size)
+                .sum();
+            items + plan.build_cache_reclaimable
+        };
+        if !simulated {
+            let got = freed + cache_freed;
+            if got.get() * 2 <= predicted.get()
+                && predicted.get().saturating_sub(got.get()) > 1_000_000
+            {
+                sink.emit(Event::Warning {
+                    code: "reclaim_shortfall".into(),
+                    message: format!(
+                        "expected to free about {} but freed {} — the mechanism for the \
+                         difference may not be doing anything",
+                        predicted.human(),
+                        got.human()
+                    ),
+                    resource: None,
+                });
+            }
+        }
+
         sink.flush();
         Ok(Receipt {
+            predicted,
             reclamation,
             daemon: plan.daemon.clone(),
             started_unix: now_unix,
@@ -716,6 +769,97 @@ mod tests {
             !spy.calls().iter().any(|c| c.starts_with("network:")),
             "a stale witness must never reach the daemon"
         );
+    }
+
+    /// A mutating client whose build-cache prune quietly does nothing — the
+    /// exact shape of the bug this guard exists for.
+    #[derive(Default)]
+    struct NoOpCachePrune {
+        calls: Mutex<Vec<String>>,
+    }
+    impl DockerMutate for NoOpCachePrune {
+        fn remove_volume(&self, _n: &str) -> Result<()> {
+            Ok(())
+        }
+        fn remove_image(&self, _n: &str) -> Result<()> {
+            Ok(())
+        }
+        fn remove_container(&self, _n: &str) -> Result<()> {
+            Ok(())
+        }
+        fn remove_network(&self, _n: &str) -> Result<()> {
+            Ok(())
+        }
+        fn restore_volume(
+            &self,
+            _n: &str,
+            _l: &std::collections::BTreeMap<String, String>,
+            _t: Vec<u8>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn prune_build_cache(&self, _keep: u64) -> Result<Bytes> {
+            self.calls.lock().unwrap().push("build_cache".into());
+            // Reports success, reclaims nothing.
+            Ok(Bytes::ZERO)
+        }
+    }
+
+    #[test]
+    fn a_run_that_reclaims_nothing_it_promised_says_so() {
+        // The build-cache filter silently matched nothing, so apply freed 0 B
+        // where the plan said 16 GB — and dry-run had reported the prediction
+        // without ever asking the daemon. Comparing the two is the only thing
+        // that catches it.
+        let rep = report(vec![]); // no items; the cache is the whole promise
+        let plan = Planner::plan(&rep, NOW);
+        assert!(plan.build_cache_reclaimable > Bytes::ZERO);
+
+        let m = NoOpCachePrune::default();
+        let receipt = Executor::applying(&m)
+            .run(
+                plan,
+                &rep,
+                NOW,
+                &ExecuteOptions {
+                    mode: Mode::Apply,
+                    ..Default::default()
+                },
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        assert!(
+            m.calls.lock().unwrap().contains(&"build_cache".to_string()),
+            "the daemon must actually have been asked"
+        );
+        let (want, got) = receipt
+            .shortfall()
+            .expect("a run that promised 16 GB and freed nothing must report a shortfall");
+        assert!(want > got);
+        assert_eq!(got, Bytes::ZERO);
+    }
+
+    #[test]
+    fn a_run_that_delivers_reports_no_shortfall() {
+        let rep = report(vec![attributed(network("proj_default"))]);
+        let plan = Planner::plan(&rep, NOW);
+        let spy = SpyMutate::default();
+        let receipt = Executor::applying(&spy)
+            .run(
+                plan,
+                &rep,
+                NOW,
+                &ExecuteOptions {
+                    mode: Mode::Apply,
+                    ..Default::default()
+                },
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+        assert!(receipt.shortfall().is_none(), "{:?}", receipt.predicted);
     }
 
     #[test]
