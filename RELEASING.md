@@ -209,6 +209,23 @@ it. Deleting the release is not enough on its own: copies that have already
 cached the answer will keep offering it for up to a day, though they will fail
 to download and leave the working binary alone.
 
+## While the repository is private
+
+Release assets on a private repository are not anonymously downloadable: an
+unauthenticated request for one returns **404**, not 403. The updater fetches
+through `curl` with no credentials by design, so while the repository is
+private:
+
+- every `--check-update` and every background check resolves to "no news",
+  and exits 5 rather than 0 or 1;
+- `release.yml`'s final step — "an installed copy can see this release" —
+  fails, and correctly: it asserts the one property a private repository
+  denies. The release itself is still built, signed and published; only that
+  assertion fails.
+
+Nothing in the code needs to change. Making the repository public is the fix,
+and the release already published becomes reachable the moment it happens.
+
 ## The Developer ID gap
 
 There is no Apple Developer ID for this project yet, which has two

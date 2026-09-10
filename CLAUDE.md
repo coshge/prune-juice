@@ -26,7 +26,7 @@ could be added without rework.
 | M8 known-gap cleanup — exclusive image sizes, measured writable layers, SIGINT, remote gate, size cache | done |
 
 ```
-cargo test --workspace                  # 286 tests
+cargo test --workspace                  # 287 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -459,14 +459,28 @@ checkouts "derivative" because they contained a `vendor` directory.
 
 - Waivers still live in a JSON file rather than the index. Harmless, but they
   could move now that the index exists.
-- **No release has been cut yet, so one link is unexercised.** Every piece of
-  the update chain is tested — the signature format against a real minisign
-  fixture, the whole checker against a signed manifest, the install against a
-  tampered archive and a binary that will not run, and the `curl` transport
-  against a live 404 — but nothing has yet fetched a *published* manifest over
-  HTTPS and verified it, because there is nothing published. The last step of
-  `release.yml` does exactly that against the release it just made, which is
-  why it is the step to watch on the first tag.
+- **`v0.1.0` is released, and unreachable, because the repository is
+  private.** A private repo's release assets require authentication that the
+  updater deliberately does not have — no HTTP client, no tokens, just `curl`
+  — so every unauthenticated request for
+  `/releases/latest/download/update-manifest.json` returns 404. Every update
+  check therefore resolves to "no news", which is the designed failure mode
+  and harms nothing, and `release.yml`'s last step fails on exactly that,
+  which is the step doing its job. **Making the repository public is the whole
+  fix**; nothing in the code changes.
+
+  What the first tag *did* prove, and what is therefore no longer worth
+  re-testing: the release is built, signed and published (8 assets, manifest
+  plus `.minisig`), and the published manifest verifies against the key
+  compiled into the CLI — fetched with an authenticated request and checked
+  with `minisign -V -P` by hand. That pairing between `RELEASE_KEY` in
+  `verify.rs` and `MINISIGN_SECRET_KEY` in the repository secrets was the one
+  thing no test could cover.
+
+  Still unexercised: the notice, the download, and the atomic replace. All
+  three need a published release *newer* than the binary asking, so they need
+  a public repo and a version bump — `is_newer` is `>`, and a 0.1.0 binary
+  offered 0.1.0 is correctly told it is current.
 - **There is no Homebrew formula.** `Origin::Homebrew` detection and the
   `brew upgrade prune-juice` hint are correct and tested, but nothing is in a
   tap yet, so that branch is currently unreachable in practice. It costs
