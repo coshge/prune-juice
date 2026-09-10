@@ -16,6 +16,7 @@ pub mod execute;
 pub mod json;
 pub mod model;
 pub mod plan;
+pub mod probe;
 pub mod providers;
 pub mod scan;
 

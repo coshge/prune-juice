@@ -27,11 +27,10 @@ $ prune-juice
     nbk_default                                      —  belongs to "nbk", whose directory is gone
 ```
 
-**Status: M3.** `prune-juice` on a terminal opens an interactive interface;
-piped or under CI it prints a one-shot report. Dry-run by default. `--apply` reclaims the safe tier and nothing
-else. Volumes cannot reach the safe tier in this build at all — without a content
-probe there is no way to tell an empty scratch volume from a Postgres data
-directory.
+**Status: M4a.** `prune-juice` on a terminal opens an interactive interface;
+piped or under CI it prints a one-shot report. Dry-run by default. The content
+probe now lets *empty* and *derivative* volumes be reclaimed; everything else
+stays irreversible until the vault lands. `--apply` reclaims the safe tier and nothing else.
 
 ## The problem
 

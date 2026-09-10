@@ -33,6 +33,7 @@ fn attr(r: ResourceSummary, orphan: bool, owner: Option<&str>) -> Attributed {
         liveness: None,
         orphan_candidate: orphan,
         unattributed: false,
+        content: None,
     }
 }
 

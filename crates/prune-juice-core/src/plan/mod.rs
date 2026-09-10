@@ -319,6 +319,7 @@ mod tests {
             liveness: None,
             orphan_candidate: false,
             unattributed: false,
+            content: None,
         }
     }
 

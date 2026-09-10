@@ -195,6 +195,32 @@ pub fn classify(a: &Attributed, graph: &RefGraph, now_unix: i64, rs: &mut ReadSe
         };
     }
 
+    // Property 3: tier-stability. Checked before the generic irreversibility
+    // message so the reason a user reads is the specific one.
+    if let Some(project) = graph.is_last_path_carrier(r) {
+        rs.record(&subject, "last_path_carrier_for", &project);
+        return Verdict {
+            tier: Tier::Stale,
+            reversibility,
+            because: format!(
+                "it is the last container recording where \"{project}\" lives on disk"
+            ),
+            referenced,
+        };
+    }
+    if let Some(reason) = destabilises(a, now_unix, rs) {
+        return Verdict {
+            tier: if a.unattributed {
+                Tier::Unattributed
+            } else {
+                Tier::Stale
+            },
+            reversibility,
+            because: reason,
+            referenced,
+        };
+    }
+
     // Property 2: irreversible loss can never be a no-confirmation action.
     if reversibility.is_gone() {
         rs.record(&subject, "reversibility", "gone");
@@ -249,27 +275,6 @@ pub fn classify(a: &Attributed, graph: &RefGraph, now_unix: i64, rs: &mut ReadSe
         };
     }
 
-    // Property 3: tier-stability.
-    if let Some(project) = graph.is_last_path_carrier(r) {
-        rs.record(&subject, "last_path_carrier_for", &project);
-        return Verdict {
-            tier: Tier::Stale,
-            reversibility,
-            because: format!(
-                "it is the last container recording where \"{project}\" lives on disk"
-            ),
-            referenced,
-        };
-    }
-    if let Some(reason) = destabilises(a, rs) {
-        return Verdict {
-            tier: Tier::Stale,
-            reversibility,
-            because: reason,
-            referenced,
-        };
-    }
-
     Verdict {
         tier: Tier::Free,
         reversibility,
@@ -281,7 +286,7 @@ pub fn classify(a: &Attributed, graph: &RefGraph, now_unix: i64, rs: &mut ReadSe
 /// Would removing this resource degrade what we know about another?
 ///
 /// Returns the reason it must not be Tier 1, or `None` if it is inert.
-fn destabilises(a: &Attributed, rs: &mut ReadSet) -> Option<String> {
+fn destabilises(a: &Attributed, now_unix: i64, rs: &mut ReadSet) -> Option<String> {
     let r = &a.resource;
     let subject = format!("{}:{}", r.kind.as_str(), r.name);
 
@@ -315,9 +320,36 @@ fn destabilises(a: &Attributed, rs: &mut ReadSet) -> Option<String> {
     // cannot tell an empty scratch volume from a Postgres data directory, and
     // `docker run postgres` with no -v produces exactly the unreferenced,
     // unlabelled shape that would otherwise sail through.
+    // A volume may only be reclaimed when its contents have actually been read
+    // and found reconstructible. `docker run postgres` with no -v produces an
+    // unreferenced, unlabelled volume full of data, so an unprobed volume is
+    // unprovable — never assumed empty.
     if r.kind == ResourceKind::Volume {
-        rs.record(&subject, "probe", "not-implemented");
-        return Some("volume contents have not been inspected, so it cannot be proven safe".into());
+        let Some(c) = a.content.as_ref() else {
+            rs.record(&subject, "probed", "false");
+            return Some("contents could not be read, so it cannot be proven safe".into());
+        };
+        rs.record(&subject, "content_class", format!("{:?}", c.class));
+        if !c.class.is_reconstructible() {
+            return Some(format!("it holds {}", c.class.describe()));
+        }
+        // Bytes written in the last day mean something is using this, whatever
+        // the reference graph believes. An invisible referrer is still a
+        // referrer.
+        if let Some(m) = c.newest_mtime {
+            let idle = now_unix - m;
+            rs.record(
+                &subject,
+                "written_recently",
+                (idle < RECENT_WRITE_SECS).to_string(),
+            );
+            if idle < RECENT_WRITE_SECS {
+                return Some(format!(
+                    "written {} hours ago — something is still using it",
+                    idle.max(0) / 3600
+                ));
+            }
+        }
     }
 
     None
@@ -351,10 +383,18 @@ fn reversibility_of(a: &Attributed, rs: &mut ReadSet) -> Reversibility {
                 Reversibility::Rebuildable("recreated on next compose up".into())
             }
         }
-        // Until a verified vault copy exists, deleting a volume is final. There
-        // is no trash can for volumes: Docker has no rename, and on macOS the
-        // data lives inside a VM the host cannot reach.
-        ResourceKind::Volume => Reversibility::Gone,
+        ResourceKind::Volume => match a.content.as_ref() {
+            // An empty volume has nothing to lose; a dependency tree or cache
+            // is regenerated by the next build. Everything else is final:
+            // there is no trash can for volumes — Docker has no rename, and on
+            // macOS the bytes live inside a VM the host cannot reach — so
+            // until a verified vault copy exists, deletion is irreversible.
+            Some(c) if c.class.is_reconstructible() => {
+                rs.record(&subject, "content_class", format!("{:?}", c.class));
+                Reversibility::Rebuildable(c.class.describe())
+            }
+            _ => Reversibility::Gone,
+        },
     }
 }
 
@@ -363,6 +403,7 @@ mod tests {
     use super::*;
     use crate::docker::DaemonIdentity;
     use crate::model::{Bytes, ContainerState, DaemonId, ResourceSummary, RuntimeFlavor, Totals};
+    use crate::probe::{ContentClass, ContentReport, Engine};
     use crate::scan::ScanReport;
 
     const NOW: i64 = 1_800_000_000;
@@ -377,6 +418,7 @@ mod tests {
             liveness: None,
             orphan_candidate: false,
             unattributed: false,
+            content: None,
         }
     }
 
@@ -461,6 +503,103 @@ mod tests {
         let got = classify_one(&rep, 0);
         assert_ne!(got.tier, Tier::Free);
         assert_eq!(got.reversibility, Reversibility::Gone);
+    }
+
+    fn volume(name: &str, class: Option<ContentClass>, mtime: Option<i64>) -> Attributed {
+        let mut r = ResourceSummary::new(ResourceKind::Volume, name, name);
+        r.created_unix = Some(OLD);
+        let mut a = attributed(r);
+        a.content = class.map(|class| ContentReport {
+            class,
+            method: crate::probe::ProbeMethod::Native,
+            entries: vec![],
+            file_count: 0,
+            truncated: false,
+            bytes: Bytes(0),
+            newest_mtime: mtime,
+        });
+        a
+    }
+
+    #[test]
+    fn an_unprobed_volume_is_never_free() {
+        // Docker Desktop hides its data root. Not being able to look inside is
+        // a reason to leave a volume alone, never a reason to delete it.
+        let rep = report(vec![volume("mystery", None, None)]);
+        let v = classify_one(&rep, 0);
+        assert_ne!(v.tier, Tier::Free);
+        assert_eq!(v.reversibility, Reversibility::Gone);
+        assert!(v.because.contains("could not be read"), "{}", v.because);
+    }
+
+    #[test]
+    fn an_empty_volume_is_free() {
+        // 100 of the 259 volumes on the reference machine are exactly this.
+        let rep = report(vec![volume(
+            "scratch",
+            Some(ContentClass::Empty),
+            Some(OLD),
+        )]);
+        let v = classify_one(&rep, 0);
+        assert_eq!(v.tier, Tier::Free);
+        assert!(matches!(v.reversibility, Reversibility::Rebuildable(_)));
+    }
+
+    #[test]
+    fn a_database_volume_is_never_free_however_unreferenced() {
+        // The whole reason the probe exists. `docker run postgres` with no -v
+        // leaves precisely this: no labels, no referrer, real data.
+        for engine in [
+            Engine::Postgres,
+            Engine::MySql,
+            Engine::MariaDb,
+            Engine::Mongo,
+        ] {
+            let rep = report(vec![volume(
+                "anon",
+                Some(ContentClass::Database(engine)),
+                Some(OLD),
+            )]);
+            let v = classify_one(&rep, 0);
+            assert_ne!(v.tier, Tier::Free, "{engine:?}");
+            assert_eq!(v.reversibility, Reversibility::Gone, "{engine:?}");
+        }
+    }
+
+    #[test]
+    fn a_dependency_cache_is_free() {
+        let rep = report(vec![volume(
+            "deps",
+            Some(ContentClass::Derivative("node_modules".into())),
+            Some(OLD),
+        )]);
+        assert_eq!(classify_one(&rep, 0).tier, Tier::Free);
+    }
+
+    #[test]
+    fn unrecognised_contents_are_not_free() {
+        // Failing to recognise something is not evidence that it is worthless.
+        let rep = report(vec![volume(
+            "odd",
+            Some(ContentClass::Unrecognised),
+            Some(OLD),
+        )]);
+        assert_ne!(classify_one(&rep, 0).tier, Tier::Free);
+    }
+
+    #[test]
+    fn a_recently_written_volume_is_held_back_even_when_reconstructible() {
+        // Bytes changed in the last day mean something is using it, whatever
+        // the reference graph believes. An invisible referrer is still a
+        // referrer.
+        let rep = report(vec![volume(
+            "busy",
+            Some(ContentClass::Derivative("cache".into())),
+            Some(NOW - 3600),
+        )]);
+        let v = classify_one(&rep, 0);
+        assert_ne!(v.tier, Tier::Free);
+        assert!(v.because.contains("still using it"), "{}", v.because);
     }
 
     #[test]

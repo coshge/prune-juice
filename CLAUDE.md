@@ -10,19 +10,20 @@ model strong enough that the headline action needs no confirmation. Free MIT
 Rust CLI; a free macOS app comes later, architected so a one-time paid tier
 could be added without rework.
 
-## Status: M3 complete
+## Status: M4a complete (content probe)
 
 | milestone | state |
 |---|---|
 | M1 read-only scan with provenance attribution | done |
 | M2 planner, tier classification, apply path | done |
 | M3 interactive ratatui TUI | done |
-| M4 content probe + vault — **unlocks volumes** | next |
+| M4a content probe — **unlocks empty and derivative volumes** | done |
+| M4b vault (dump / verify / restore) — unlocks the rest | next |
 | M5 review, waivers, host disk measurement | not started |
 | M6 macOS app | not started |
 
 ```
-cargo test --workspace                  # 108 tests
+cargo test --workspace                  # 129 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -34,11 +35,16 @@ cargo run -p prune-juice-tui --example preview   # render every screen, no TTY n
 
 ## Deliberately not implemented — do not "fix" these
 
-- **No volume can reach the safe tier.** Without a content probe there is no way
-  to tell an empty scratch volume from a Postgres data directory, and
-  `docker run postgres` with no `-v` produces exactly the unreferenced,
-  unlabelled shape that would otherwise sail through. This is enforced in
-  `plan/tier.rs::destabilises`. It is lifted in M4, not before.
+- **Only *empty* and *derivative* volumes can reach the safe tier.** A volume
+  holding anything else — a database, user data, or contents we do not
+  recognise — stays irreversible until the vault exists. An **unprobed** volume
+  is never assumed empty: on Docker Desktop the data root is hidden inside a VM,
+  and the honest answer there is "cannot be proven safe". Enforced in
+  `plan/tier.rs::destabilises`.
+- **The container-based probe is not implemented.** `VolumeAccess::detect`
+  returns unavailable on Docker Desktop, Colima and Podman, so those runtimes
+  currently get no volume reclamation at all. That is correct, not a bug to
+  paper over.
 - **No image can reach the safe tier.** Image layer stacks are not fetched, so
   base-image relationships are unproven. Recorded honestly as
   `Opacity::ImageLayersUnknown` rather than assumed away.
@@ -96,24 +102,63 @@ All have regression tests — if you break one, a test will tell you.
     actual area, never a constant. There is a test at widths down to 20.
 13. **`core` never prints.** `#![deny(clippy::print_stdout, clippy::print_stderr)]`
     in `lib.rs` makes UI-agnosticism a compile error.
-14. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
+14. **A derivative marker must dominate the volume.** `node_modules` as the
+    sole top-level entry is a dependency cache; `vendor` *alongside*
+    `composer.json` and `html/` is an application checkout. Matching the marker
+    anywhere in the listing marked five 1.2 GB WordPress installs as safe to
+    delete. Noise (`lost+found`, `.DS_Store`) is ignored; nothing else is.
+15. **A database signature beats every other signature.** Misreading a data
+    directory as a cache is the failure that loses data, so engine detection
+    runs before cache detection in `probe::classify`.
+16. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
     fields and no public constructor; `Fresh` comes only from `revalidate()` and
     is consumed by the executor. Do not add a public constructor or a `Clone`.
 
 ## The acceptance gate
 
-Run `./target/debug/prune-juice` against the author's machine. These must **not**
-appear as orphans:
+Run `./target/debug/prune-juice --json` against the author's machine and read
+the `classified` events. Two distinct properties, easy to conflate:
+
+**Must never be `orphan`** — the project exists, so an orphan verdict would be a
+false positive:
 
 ```
 cedar-wordpress_mysql · lantern_postgres_data
 time-tracking-app_mysql · helpdesk-ticketing-system_mysql_data
-saffronfields-mariadb · ivy-mariadb
 ```
 
-Only `nbk` should be flagged — that project was renamed to `northbank`.
-`plan.irreversible_free_bytes()` must be zero: that is the Tier 1 Theorem
-checked on real data rather than asserted.
+Only `nbk` should ever be flagged as orphaned; that project was renamed to
+`northbank`.
+
+**Must never be `free`** — these hold real data:
+
+```
+saffronfields-mariadb   (24 entries, a live MariaDB datadir)
+oak_mysql · redkite_mysql · any *_mysql with contents
+```
+
+Note `ivy-mariadb` **is** correctly `free`: ddev created it and never populated
+it, so it is genuinely empty (0 entries, 0 B, unreferenced) and ddev recreates
+it on `ddev start`. Emptiness is a property of contents, not of the name — do
+not add a name-based exception for it.
+
+`plan.irreversible_free_bytes()` must be zero: the Tier 1 Theorem checked on
+real data rather than asserted.
+
+A stronger check, worth running after any change to the probe or tier logic —
+every volume the tool calls `free` must be both empty and unreferenced:
+
+```sh
+./target/debug/prune-juice --json | jq -r 'select(.event=="classified"
+  and .tier=="free" and .kind=="volume") | .name' \
+| while read -r v; do
+    n=$(ls -A ~/OrbStack/docker/volumes/"$v" 2>/dev/null | wc -l)
+    [ "$n" -gt 0 ] && echo "NOT EMPTY: $v"
+  done
+```
+
+That check is what caught the classifier calling five 1.2 GB WordPress
+checkouts "derivative" because they contained a `vendor` directory.
 
 ## House conventions
 

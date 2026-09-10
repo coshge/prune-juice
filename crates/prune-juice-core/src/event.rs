@@ -58,6 +58,17 @@ pub enum Event {
         duration_ms: u64,
         stale: bool,
     },
+    /// One resource's verdict. Emitted after planning so a machine consumer —
+    /// or an audit — can see exactly what was decided and why.
+    Classified {
+        kind: String,
+        name: String,
+        tier: String,
+        because: String,
+        size: Option<Bytes>,
+        owner: Option<String>,
+        provenance: Vec<String>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +78,7 @@ pub enum Phase {
     Listing,
     Inspecting,
     Sizing,
+    Probing,
     Attributing,
 }
 

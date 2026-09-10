@@ -456,6 +456,7 @@ mod tests {
                     liveness: None,
                     orphan_candidate: false,
                     unattributed: false,
+                    content: None,
                 },
                 Attributed {
                     resource: orphan,
@@ -465,6 +466,7 @@ mod tests {
                     liveness: None,
                     orphan_candidate: true,
                     unattributed: false,
+                    content: None,
                 },
             ],
             projects_known: 88,

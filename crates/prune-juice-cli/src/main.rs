@@ -34,6 +34,8 @@ OPTIONS:
     --roots <PATHS>     Colon-separated dirs to search for projects
     --context <NAME>    Scan only this context
     --no-tui            Force the one-shot report even on a terminal
+    --no-probe          Skip reading volume contents. No volume can then be
+                        proven safe, so this only ever shrinks what is offered.
     -h, --help          Show this help
 
 With no arguments on a terminal, `prune-juice` opens an interactive
@@ -62,6 +64,7 @@ struct Args {
     roots: Vec<PathBuf>,
     only_context: Option<String>,
     no_tui: bool,
+    no_probe: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -74,6 +77,7 @@ fn parse_args() -> Result<Args, String> {
         roots: default_roots(),
         only_context: None,
         no_tui: false,
+        no_probe: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -81,6 +85,7 @@ fn parse_args() -> Result<Args, String> {
             "--json" => a.json = true,
             "--no-sizes" => a.with_sizes = false,
             "--no-tui" => a.no_tui = true,
+            "--no-probe" => a.no_probe = true,
             "--apply" => a.apply = true,
             "--tiers" => {
                 let v = it.next().ok_or("--tiers needs a value")?;
@@ -198,6 +203,7 @@ fn run(args: &Args) -> Result<i32, Error> {
     let opts = ScanOptions {
         project_roots: args.roots.clone(),
         with_sizes: args.with_sizes,
+        probe_volumes: !args.no_probe,
     };
 
     if wants_tui(args) {
@@ -257,7 +263,19 @@ fn run(args: &Args) -> Result<i32, Error> {
         }
 
         let plan = Planner::plan(&report, now_unix());
-        if !args.json {
+        if args.json {
+            for i in &plan.items {
+                sink.emit(prune_juice_core::Event::Classified {
+                    kind: i.kind.as_str().to_string(),
+                    name: i.name.clone(),
+                    tier: i.verdict.tier.as_str().to_string(),
+                    because: i.verdict.because.clone(),
+                    size: i.size,
+                    owner: i.owner.clone(),
+                    provenance: i.provenance.clone(),
+                });
+            }
+        } else {
             render(&report, &plan);
         }
 
