@@ -195,7 +195,7 @@ impl DockerClient for BollardClient {
                 let state = c
                     .state
                     .as_ref()
-                    .map(|s| ContainerState::parse(&s.to_string()))
+                    .map(|s| ContainerState::parse(s.as_ref()))
                     .unwrap_or(ContainerState::Unknown);
 
                 let mut r = ResourceSummary::new(ResourceKind::Container, id, name);

@@ -703,7 +703,7 @@ mod tests {
             ..absent.clone()
         };
 
-        assert!(is_orphan_candidate(&[absent.clone()]));
+        assert!(is_orphan_candidate(std::slice::from_ref(&absent)));
         assert!(
             !is_orphan_candidate(&[absent, present]),
             "any live claim, however weak, must veto an orphan verdict"

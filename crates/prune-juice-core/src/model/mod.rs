@@ -438,7 +438,7 @@ mod tests {
         assert!(!named.is_anonymous_volume());
 
         // 64 chars but not hex.
-        let notquite = ResourceSummary::new(ResourceKind::Volume, "z", &"g".repeat(64));
+        let notquite = ResourceSummary::new(ResourceKind::Volume, "z", "g".repeat(64));
         assert!(!notquite.is_anonymous_volume());
     }
 
