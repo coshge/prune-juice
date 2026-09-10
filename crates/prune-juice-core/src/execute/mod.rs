@@ -633,6 +633,7 @@ mod tests {
             resources,
             projects_known: 0,
             duration_ms: 0,
+            provenance_checkpointed: false,
             stale: false,
             warnings: vec![],
         }

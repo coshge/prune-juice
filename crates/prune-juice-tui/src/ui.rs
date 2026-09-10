@@ -221,7 +221,11 @@ fn totals(f: &mut Frame, area: Rect, app: &App) {
 
 fn review(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default().borders(Borders::TOP).title(Span::styled(
-        format!(" needs review — {} items ", app.review_rows.len()),
+        format!(
+            " {} — {} items ",
+            app.review_group.title(),
+            app.review_rows.len()
+        ),
         Style::default().fg(DIM),
     ));
     let inner = block.inner(area);
@@ -239,7 +243,7 @@ fn review(f: &mut Frame, area: Rect, app: &App) {
     // row does not silently clip in a split pane. Name and reason share
     // whatever is left after the fixed-width size and tier columns.
     let total = inner.width.max(30) as usize;
-    let fixed = 2 + 11 + 9; // marker + size + tier
+    let fixed = 2 + 11 + 13; // marker + size + tier
     let flexible = total.saturating_sub(fixed).max(12);
     let name_w = (flexible * 45 / 100).clamp(10, 44);
     let why_w = flexible.saturating_sub(name_w).max(8);
@@ -260,6 +264,8 @@ fn review(f: &mut Frame, area: Rect, app: &App) {
         };
         let tier_style = match row.tier {
             Tier::Orphan => Style::default().fg(WARN),
+            Tier::Repullable => Style::default().fg(GOOD),
+            Tier::Rebuildable | Tier::Stale => Style::default().fg(WARN),
             _ => Style::default().fg(DIM),
         };
         let name_style = if selected {
@@ -278,7 +284,7 @@ fn review(f: &mut Frame, area: Rect, app: &App) {
                 ),
                 Style::default().fg(DIM),
             ),
-            Span::styled(format!("{:<9}", row.tier.as_str()), tier_style),
+            Span::styled(format!("{:<13}", row.tier.as_str()), tier_style),
             Span::styled(clip(&row.because, why_w), Style::default().fg(DIM)),
         ]));
 
@@ -312,7 +318,7 @@ fn review(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The last look before anything irreversible.
+/// The last look before accepting any non-free cost.
 ///
 /// States, in full: how many rows, how much, how many will be copied to the
 /// vault first, and — if any cannot be preserved — that acting would lose them.
@@ -340,6 +346,10 @@ fn confirm(f: &mut Frame, area: Rect, app: &App) {
             Span::styled("  copied to the vault first", Style::default().fg(GOOD))
         } else if r.reversibility.is_gone() {
             Span::styled("  CANNOT be preserved", Style::default().fg(BAD))
+        } else if r.tier == Tier::Repullable {
+            Span::styled("  must be pulled again", Style::default().fg(GOOD))
+        } else if r.tier == Tier::Rebuildable {
+            Span::styled("  must be rebuilt", Style::default().fg(WARN))
         } else {
             Span::styled("  recreated on next up", Style::default().fg(DIM))
         };
@@ -378,6 +388,18 @@ fn confirm(f: &mut Frame, area: Rect, app: &App) {
                 unpreservable.len()
             ),
             Style::default().fg(BAD),
+        )));
+    }
+    if rows.iter().any(|r| r.tier == Tier::Repullable) {
+        lines.push(Line::from(Span::styled(
+            "  Re-pulling costs bandwidth and time on the next use.",
+            Style::default().fg(DIM),
+        )));
+    }
+    if rows.iter().any(|r| r.tier == Tier::Rebuildable) {
+        lines.push(Line::from(Span::styled(
+            "  Rebuilding costs time; an old network-based build may no longer reproduce.",
+            Style::default().fg(WARN),
         )));
     }
 
@@ -499,7 +521,9 @@ mod tests {
     use super::*;
     use crate::app::{Key, Screen};
     use prune_juice_core::docker::DaemonIdentity;
-    use prune_juice_core::model::{DaemonId, ResourceKind, ResourceSummary, RuntimeFlavor, Totals};
+    use prune_juice_core::model::{
+        DaemonId, Recovery, ResourceKind, ResourceSummary, RuntimeFlavor, Totals,
+    };
     use prune_juice_core::plan::Planner;
     use prune_juice_core::scan::{Attributed, ScanReport};
     use ratatui::backend::TestBackend;
@@ -515,6 +539,10 @@ mod tests {
         let mut orphan = ResourceSummary::new(ResourceKind::Volume, "v1", "nbk_mysql");
         orphan.created_unix = Some(NOW - 400 * 24 * 3600);
         orphan.size = Some(Bytes(379_000_000));
+
+        let mut image = ResourceSummary::new(ResourceKind::Image, "sha256:i1", "wordpress:latest");
+        image.created_unix = Some(NOW - 90 * 24 * 3600);
+        image.size = Some(Bytes(2_000_000_000));
 
         let report = ScanReport {
             daemon: DaemonIdentity {
@@ -556,9 +584,21 @@ mod tests {
                     content: None,
                     recovery: None,
                 },
+                Attributed {
+                    resource: image,
+                    claims: vec![],
+                    owner: None,
+                    confidence: None,
+                    liveness: None,
+                    orphan_candidate: false,
+                    unattributed: false,
+                    content: None,
+                    recovery: Some(Recovery::Pull("wordpress@sha256:digest".into())),
+                },
             ],
             projects_known: 88,
             duration_ms: 3300,
+            provenance_checkpointed: false,
             stale: false,
             warnings: vec![],
         };
@@ -621,6 +661,27 @@ mod tests {
             out.contains("Nothing here can be lost"),
             "the Tier 1 claim must be stated when it holds:\n{out}"
         );
+    }
+
+    #[test]
+    fn the_main_screen_exposes_recoverable_cleanup_without_flags() {
+        let app = demo_app();
+        let out = render_at(&app, 110, 30);
+        assert!(out.contains("Review pullable / rebuildable"), "{out}");
+        assert!(out.contains("up to 2.0 GB"), "{out}");
+    }
+
+    #[test]
+    fn recoverable_confirmation_states_the_repull_cost() {
+        let mut app = demo_app();
+        app.menu_index = 1;
+        app.on_key(Key::Enter);
+        app.on_key(Key::Char('a'));
+        app.on_key(Key::Char('d'));
+        let out = render_at(&app, 110, 24);
+        assert!(out.contains("must be pulled again"), "{out}");
+        assert!(out.contains("costs bandwidth"), "{out}");
+        assert!(out.contains("press y"), "{out}");
     }
 
     #[test]

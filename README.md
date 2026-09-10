@@ -127,8 +127,11 @@ Three independent properties, all required:
 2. **Reconstructible** — the bytes come back, or were worthless.
 3. **Tier-stable** — removing it degrades nothing else. This is the one that
    gets forgotten: deleting an exited container is safe by the first two and
-   destroys the only link between its anonymous volumes and their project, so a
-   container that mounts anything is excluded.
+   can destroy the only link between its anonymous volumes and their project.
+   Prune Juice therefore checkpoints those links before classification. A
+   mounted container is excluded if that durable checkpoint is unavailable or
+   fails; once it succeeds, the recorded provenance no longer blocks an
+   otherwise-safe container removal.
 
 The run-level summary states the third property as a number rather than a
 promise, and the word "irreversible" only ever appears beside a non-zero one.
@@ -207,7 +210,8 @@ forget that turns a look into a deletion.
      Nothing here can be lost.
 
    ❱ Reclaim 12.1 GB
-     Review 3 items
+     Review pullable / rebuildable — 141 items, up to 80.7 GB
+     Review stale / orphaned — 3 items, 630 MB
      Scan again
      Quit
 
@@ -221,10 +225,14 @@ forget that turns a look into a deletion.
 deliberate: the number beside `irreversible` is `0 B`, so there is nothing to
 confirm. If that line were not zero it would not be in this bucket.
 
-**`Review`** opens the items that need a decision:
+**`Review pullable / rebuildable`** exposes the large image cleanup that used
+to require `--tiers`. Every row states whether it will be pulled again or built
+again, can be expanded with `e`, and must be ticked before it can be acted on.
+
+**`Review stale / orphaned`** opens the data-bearing items that need a decision:
 
 ```
- needs review — 3 items ───────────────────────────────────────────────────
+ stale / orphaned — 3 items ───────────────────────────────────────────────
 ❱ nbk_mysql                    379 MB  orphan   belongs to "nbk", whose directory is gone
   nbk_tmp                     10.5 MB  orphan   belongs to "nbk", whose directory is gone
   saffronfields-mariadb        240 MB  stale    contents could not be read, so it cannot …
@@ -313,11 +321,8 @@ gives you a clean file and still shows you the spinner.
 
 ### 3. Reclaim the safe tier
 
-```sh
-prune-juice --apply
-```
-
-That reclaims tier `free` and nothing else. On this machine it is build cache,
+Select **Reclaim** on the main screen. That reclaims tier `free` and nothing
+else. On this machine it is stopped reconstructible containers, build cache,
 empty volumes and unused networks — items where deleting destroys no
 information that cannot be re-derived from something that still exists
 afterwards. There is no prompt because there is nothing to weigh up.
@@ -326,15 +331,17 @@ Two things happen that are easy to miss:
 
 - The provenance index is written **before** anything is judged. A container's
   labels are the only place an anonymous volume's origin lives, so removing
-  containers is what makes volumes unidentifiable — the record is committed
-  first, on purpose.
+  containers would normally make volumes unidentifiable. Once the record is
+  committed, stopped containers with no unique writable data can enter the safe
+  tier; if the checkpoint fails, they remain `stale`.
 - Host disk is measured before and after, then polled until it settles. That
   number is reported separately from Docker's own figure and never added to it.
 
 ### 4. Go further, deliberately
 
-Everything past `free` is opt-in with `--tiers`, and each tier states its price
-because a cost you cannot see is a cost you cannot consent to:
+Everything past `free` is available from the two **Review** rows on the main
+screen. Each tier states its price because a cost you cannot see is a cost you
+cannot consent to:
 
 | Tier | What it is | What being wrong costs you |
 |---|---|---|
@@ -344,26 +351,14 @@ because a cost you cannot see is a cost you cannot consent to:
 | `orphan` | the owning project's directory is gone | the project really being gone. Volumes are vaulted first |
 | `stale` | dormant, but the project still exists | a slow first start next time. Volumes are vaulted first |
 
-**`--tiers` replaces the set, it does not add to it.** `--tiers orphan` acts on
-orphans only — build cache is left alone. To do both, list both:
+Enter a review group, use `space` to tick individual rows or `a` to tick the
+group, `e` to inspect the evidence, and `d` to continue. The confirmation screen
+then spells out every selected cost before `y` can proceed. After the receipt,
+press `r` to scan again and expose volumes that were previously referenced by
+the stopped containers just removed.
 
-```sh
-prune-juice --tiers free,repullable --apply
-```
-
-Always dry-run first. Without `--apply` the executor still runs, through the
-identical code path including per-item revalidation, and tells you exactly what
-it would touch:
-
-```sh
-$ prune-juice --no-tui --tiers orphan
-  DRY RUN — nothing was touched
-  would delete 2 (2 images)   skipped 0   problems 0
-  would free 1.0 GB (as Docker counts it)
-    nbk-wordpress:latest  ·  nbk-nginx:latest
-```
-
-Dry-run is an oracle for the apply path, not a cheaper and less-tested branch.
+`--tiers` remains available for non-interactive automation, but is not required
+to reach any reclaimable tier.
 
 One deliberate limit on the figures: image sizes are summed naively, so a
 shared base layer is counted once per image that uses it. The `repullable` and

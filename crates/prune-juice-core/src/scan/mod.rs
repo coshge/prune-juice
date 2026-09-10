@@ -93,6 +93,11 @@ pub struct ScanReport {
     pub resources: Vec<Attributed>,
     pub projects_known: usize,
     pub duration_ms: u64,
+    /// The current container -> volume edges were durably committed before
+    /// classification. Only then may an otherwise disposable container stop
+    /// being treated as the sole copy of that provenance.
+    #[serde(default)]
+    pub provenance_checkpointed: bool,
     /// True when sizes were skipped or a deadline cut the scan short.
     pub stale: bool,
     /// Non-fatal problems. Kept on the report as well as emitted, so a caller
@@ -541,6 +546,7 @@ impl<'a> Scanner<'a> {
         let mut project_absences: BTreeMap<String, u32> = BTreeMap::new();
         let mut remembered: BTreeMap<String, crate::index::RememberedOwner> = BTreeMap::new();
         let mut recalled_paths: BTreeMap<String, String> = BTreeMap::new();
+        let mut provenance_checkpointed = false;
         if let Some(index) = self.index {
             let all: Vec<ResourceSummary> = containers
                 .iter()
@@ -549,11 +555,12 @@ impl<'a> Scanner<'a> {
                 .chain(networks.iter())
                 .cloned()
                 .collect();
-            if let Err(e) = index
+            match index
                 .begin_scan(&daemon.id, now_unix)
                 .and_then(|_| index.record_scan(&daemon.id, &all, now_unix))
             {
-                warnings.push(format!("the index could not be updated: {e}"));
+                Ok(()) => provenance_checkpointed = true,
+                Err(e) => warnings.push(format!("the index could not be updated: {e}")),
             }
 
             let observed: Vec<(String, String, bool)> = catalog
@@ -805,6 +812,7 @@ impl<'a> Scanner<'a> {
             resources,
             projects_known: catalog.len(),
             duration_ms,
+            provenance_checkpointed,
             stale,
             warnings,
         })
@@ -1008,6 +1016,10 @@ mod tests {
                 &Cancel::new(),
             )
             .unwrap();
+        assert!(
+            first.provenance_checkpointed,
+            "a successful index write must be visible to the planner"
+        );
         assert!(
             !first
                 .of_kind(ResourceKind::Volume)

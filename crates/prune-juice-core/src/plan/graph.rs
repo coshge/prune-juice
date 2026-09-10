@@ -141,6 +141,9 @@ impl Referenced {
 }
 
 pub struct RefGraph {
+    /// True only when this scan's container -> volume edges have been durably
+    /// written to the provenance index.
+    provenance_checkpointed: bool,
     /// How many containers still carry an absolute path for each project.
     /// Removing the last one loses that project's location permanently, which
     /// is a provenance change and therefore a tier-stability violation.
@@ -156,6 +159,7 @@ pub struct RefGraph {
 impl RefGraph {
     pub fn build(report: &ScanReport) -> Self {
         let mut g = RefGraph {
+            provenance_checkpointed: report.provenance_checkpointed,
             path_carriers: BTreeMap::new(),
             volume_referrers: BTreeMap::new(),
             image_referrers: BTreeMap::new(),
@@ -282,6 +286,10 @@ impl RefGraph {
 
     pub fn opacity(&self) -> &[Opacity] {
         &self.opacity
+    }
+
+    pub fn provenance_checkpointed(&self) -> bool {
+        self.provenance_checkpointed
     }
 
     /// Would removing this container leave its project with no recorded
@@ -418,6 +426,7 @@ mod tests {
             resources,
             projects_known: 0,
             duration_ms: 0,
+            provenance_checkpointed: false,
             stale: false,
             warnings: vec![],
         }

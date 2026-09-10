@@ -7,7 +7,7 @@
 
 use prune_juice_core::docker::DaemonIdentity;
 use prune_juice_core::model::{
-    Bytes, DaemonId, ResourceKind, ResourceSummary, RuntimeFlavor, Totals,
+    Bytes, DaemonId, Recovery, ResourceKind, ResourceSummary, RuntimeFlavor, Totals,
 };
 use prune_juice_core::plan::Planner;
 use prune_juice_core::scan::{Attributed, ScanReport};
@@ -38,6 +38,12 @@ fn attr(r: ResourceSummary, orphan: bool, owner: Option<&str>) -> Attributed {
     }
 }
 
+fn recoverable(name: &str, size: u64, recovery: Recovery) -> Attributed {
+    let mut a = attr(res(ResourceKind::Image, name, size, 90), false, None);
+    a.recovery = Some(recovery);
+    a
+}
+
 fn main() {
     let report = ScanReport {
         daemon: DaemonIdentity {
@@ -61,6 +67,19 @@ fn main() {
             build_cache_bytes: Bytes(12_100_000_000),
         },
         resources: vec![
+            recoverable(
+                "wordpress:latest",
+                31_500_000_000,
+                Recovery::Pull("wordpress@sha256:example".into()),
+            ),
+            recoverable(
+                "local-project:latest",
+                49_200_000_000,
+                Recovery::Build {
+                    command: "docker compose build app".into(),
+                    dir: "/Users/example/project".into(),
+                },
+            ),
             attr(
                 res(ResourceKind::Network, "redkite_default", 0, 90),
                 false,
@@ -94,6 +113,7 @@ fn main() {
         ],
         projects_known: 88,
         duration_ms: 3300,
+        provenance_checkpointed: false,
         stale: false,
         warnings: vec![],
     };
@@ -108,8 +128,21 @@ fn main() {
     println!("\n=== MAIN ===");
     print!("{}", render(&app, w, h));
 
-    app.screen = Screen::Review;
-    println!("\n=== REVIEW ===");
+    app.menu_index = 1;
+    app.on_key(Key::Enter);
+    println!("\n=== REVIEW (pullable / rebuildable) ===");
+    print!("{}", render(&app, w, 12));
+
+    app.on_key(Key::Char('a'));
+    app.on_key(Key::Char('d'));
+    println!("\n=== CONFIRM (pullable / rebuildable) ===");
+    print!("{}", render(&app, w, 18));
+
+    app.on_key(Key::Esc);
+    app.on_key(Key::Esc);
+    app.menu_index = 2;
+    app.on_key(Key::Enter);
+    println!("\n=== REVIEW (stale / orphaned) ===");
     print!("{}", render(&app, w, 12));
 
     app.on_key(Key::Char('e'));

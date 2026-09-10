@@ -3,25 +3,43 @@ name: prune-juice
 description: Inspect Docker disk usage and work out which project owns which container, image, volume or network. Use whenever the task mentions Docker disk space, reclaiming space, a full disk with Docker installed, orphaned or dangling volumes, "what is using all my disk", stale project containers, docker system prune, or which project a Docker volume belongs to.
 ---
 
-Thin wrapper skill over the `prune-juice` CLI. The tool does the analysis; this
-file tells you how to call it and what its answers mean.
+Thin wrapper skill over the `prune-juice` CLI. The tool does the analysis and,
+on a terminal, provides the complete review and reclaim workflow; this file
+tells you what its answers mean.
 
-## Read-only commands
+## Default interactive workflow
 
-Everything in the current build is read-only. `prune-juice` cannot delete
-anything — the destructive trait has no implementation — so these are all safe
-to run without asking.
+Run `prune-juice` with no arguments on a terminal. The initial scan is
+read-only. All offered cleanup is reachable inside the interface:
+
+- **Reclaim** acts on the safe tier only. These items are proven
+  reconstructible and need no second confirmation.
+- **Review pullable / rebuildable** exposes images that cost bandwidth or build
+  time to restore. Tick with `space` (or `a` for the group), inspect with `e`,
+  press `d`, then read the cost summary. Only `y` proceeds.
+- **Review stale / orphaned** exposes dormant or abandoned resources. The same
+  review flow applies; irreversible volumes are copied to the vault and
+  verified before removal.
+- After a receipt, press `r` to scan again. Removing stopped containers can
+  expose volumes that were previously referenced.
+
+No tier requires the user to leave the interface and rerun the program with a
+flag. Flags remain available for scripting and CI.
+
+## Read-only and automation commands
 
 ```
-prune-juice                 # human report
+prune-juice                 # interactive on a terminal; initial scan is read-only
 prune-juice --json          # NDJSON, one Envelope per line, on stdout
+prune-juice --no-tui        # human dry-run report without opening the interface
 prune-juice --no-sizes      # skip `system df`; seconds faster, sizes omitted
 prune-juice --roots a:b     # colon-separated dirs to search for projects
 prune-juice --context NAME  # one context only
 ```
 
-Progress goes to stderr and the payload to stdout, so `prune-juice --json | jq`
-composes. If the command is not on `PATH`, call it by path from the checkout.
+Progress goes to stderr and the payload to stdout in non-interactive mode, so
+`prune-juice --json | jq` composes. If the command is not on `PATH`, call it by
+path from the checkout.
 
 ## Reading the output
 

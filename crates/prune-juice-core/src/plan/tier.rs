@@ -286,17 +286,28 @@ pub fn classify(a: &Attributed, graph: &RefGraph, now_unix: i64, rs: &mut ReadSe
     // Property 3: tier-stability. Checked before the generic irreversibility
     // message so the reason a user reads is the specific one.
     if let Some(project) = graph.is_last_path_carrier(r) {
-        rs.record(&subject, "last_path_carrier_for", &project);
-        return Verdict {
-            tier: Tier::Stale,
-            reversibility,
-            because: format!(
-                "it is the last container recording where \"{project}\" lives on disk"
-            ),
-            referenced,
-        };
+        // A mounted, labelled container's project path was stored with each
+        // edge by the successful checkpoint. A mountless last carrier has no
+        // such edge and must still be retained.
+        let path_checkpointed = graph.provenance_checkpointed() && !r.mounts.is_empty();
+        rs.record(
+            &subject,
+            "path_provenance_checkpointed",
+            path_checkpointed.to_string(),
+        );
+        if !path_checkpointed {
+            rs.record(&subject, "last_path_carrier_for", &project);
+            return Verdict {
+                tier: Tier::Stale,
+                reversibility,
+                because: format!(
+                    "it is the last container recording where \"{project}\" lives on disk"
+                ),
+                referenced,
+            };
+        }
     }
-    if let Some(reason) = destabilises(a, now_unix, rs) {
+    if let Some(reason) = destabilises(a, graph, now_unix, rs) {
         return Verdict {
             tier: if a.unattributed {
                 Tier::Unattributed
@@ -374,7 +385,12 @@ pub fn classify(a: &Attributed, graph: &RefGraph, now_unix: i64, rs: &mut ReadSe
 /// Would removing this resource degrade what we know about another?
 ///
 /// Returns the reason it must not be Tier 1, or `None` if it is inert.
-fn destabilises(a: &Attributed, now_unix: i64, rs: &mut ReadSet) -> Option<String> {
+fn destabilises(
+    a: &Attributed,
+    graph: &RefGraph,
+    now_unix: i64,
+    rs: &mut ReadSet,
+) -> Option<String> {
     let r = &a.resource;
     let subject = format!("{}:{}", r.kind.as_str(), r.name);
 
@@ -386,10 +402,18 @@ fn destabilises(a: &Attributed, now_unix: i64, rs: &mut ReadSet) -> Option<Strin
         // not housekeeping.
         rs.record(&subject, "mount_count", r.mounts.len().to_string());
         if !r.mounts.is_empty() {
-            return Some(format!(
-                "removing it would orphan {} volume(s) whose provenance it carries",
-                r.mounts.len()
-            ));
+            let checkpointed = graph.provenance_checkpointed();
+            rs.record(
+                &subject,
+                "provenance_checkpointed",
+                checkpointed.to_string(),
+            );
+            if !checkpointed {
+                return Some(format!(
+                    "removing it would orphan {} volume(s) whose provenance it carries",
+                    r.mounts.len()
+                ));
+            }
         }
 
         // A non-empty writable layer holds data that lives in no volume.
@@ -527,6 +551,7 @@ mod tests {
             resources,
             projects_known: 0,
             duration_ms: 0,
+            provenance_checkpointed: false,
             stale: false,
             warnings: vec![],
         }
@@ -692,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn a_container_carrying_volume_provenance_is_not_free() {
+    fn a_container_carrying_uncheckpointed_volume_provenance_is_not_free() {
         // Deleting this container destroys the only link between the anonymous
         // volume and its project. Safe by "unreferenced", unsafe by
         // tier-stability.
@@ -703,6 +728,23 @@ mod tests {
         let v = classify_one(&rep, 0);
         assert_eq!(v.tier, Tier::Stale);
         assert!(v.because.contains("orphan"), "{}", v.because);
+    }
+
+    #[test]
+    fn a_container_is_free_once_its_volume_provenance_is_checkpointed() {
+        let mut rep = report(vec![
+            attributed(container("old", ContainerState::Exited, &["anon123"])),
+            attributed(ResourceSummary::new(ResourceKind::Volume, "v", "anon123")),
+        ]);
+        rep.provenance_checkpointed = true;
+
+        let v = classify_one(&rep, 0);
+        assert_eq!(v.tier, Tier::Free);
+        assert!(
+            v.because.contains("nothing else depends on it"),
+            "{}",
+            v.because
+        );
     }
 
     #[test]
@@ -736,6 +778,23 @@ mod tests {
         let v = classify_one(&rep, 0);
         assert_eq!(v.tier, Tier::Stale);
         assert!(v.because.contains("last container"), "{}", v.because);
+    }
+
+    #[test]
+    fn a_mounted_last_path_carrier_is_free_after_the_checkpoint() {
+        let mut carrier = labelled("only-one", "solo", "/r/solo");
+        carrier.mounts.push("solo_data".into());
+        let mut rep = report(vec![
+            attributed(carrier),
+            attributed(ResourceSummary::new(
+                ResourceKind::Volume,
+                "solo_data",
+                "solo_data",
+            )),
+        ]);
+        rep.provenance_checkpointed = true;
+
+        assert_eq!(classify_one(&rep, 0).tier, Tier::Free);
     }
 
     #[test]

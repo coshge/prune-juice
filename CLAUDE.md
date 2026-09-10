@@ -71,7 +71,8 @@ no terminal, so that file is the only way to see why a scan failed.
 - **`Protected` is not a dead end any more.** A tagged image used to end there
   permanently, which parked 111 GB out of reach. Recovery is now computed per
   image and routes to `repullable` (bandwidth only) or `rebuildable` (time, and
-  an old build may not reproduce). Both are opt-in via `--tiers`.
+  an old build may not reproduce). Both are opt-in through the interactive
+  review flow; `--tiers` is the non-interactive equivalent.
 - **The app reads only.** It scans, classifies and shows evidence; reclaiming
   is still `prune-juice --apply` in a terminal.
 - **Docker Desktop is a first-class target.** Its data root lives inside a VM,
@@ -95,10 +96,11 @@ no terminal, so that file is the only way to see why a scan failed.
   run again to confirm" and offers nothing. That is not a bug: one observation
   cannot distinguish a deleted project from an unplugged disk. `MIN_ABSENT_SCANS`
   in `providers/mod.rs`.
-- **The TUI can now act on reviewed rows**, because the vault makes them
-  recoverable. Tick with space, `d` to act, and it goes via a confirm screen
-  that states how many will be copied to the vault first. Only `y` proceeds;
-  every other key backs out. Never straight from a list keypress to a deletion.
+- **The TUI can act on every offered tier.** Pullable/rebuildable resources and
+  stale/orphaned resources have separate review groups on the main screen. Tick
+  with space, `d` to act, and it goes via a confirm screen that states the
+  re-pull, rebuild, vault or permanent-loss cost. Only `y` proceeds; every other
+  key backs out. Never straight from a list keypress to a deletion.
 - **`--only-label` skips the build cache entirely.** Build cache records carry
   no labels, so the fence cannot be honoured for them; pruning it anyway would
   break the promise the flag makes.
@@ -132,10 +134,12 @@ All have regression tests — if you break one, a test will tell you.
    on the reference machine have no VCS.
 9. **Longest-prefix matching, never regex suffix-stripping.** Stripping suffixes
    from `cedar-wordpress_mysql` yields `cedar` and a false orphan.
-10. **A container carrying provenance is not free.** If it mounts named volumes,
-    or is the last container recording its project's absolute path, removing it
-    is a provenance loss. Container labels are the only place a project path
-    lives.
+10. **A container carrying uncheckpointed provenance is not free.** If the
+    current container-to-volume edges were not durably committed, removing a
+    mounted container is a provenance loss. After a successful checkpoint the
+    saved edge can satisfy tier-stability. A mountless last container recording
+    its project's absolute path remains protected because there is no edge on
+    which to preserve that path.
 11. **The TUI state machine has no terminal dependency.** `app.rs` must not
     import `ratatui` or `crossterm`; it returns an `Action` and the event loop
     performs the effect. That is what keeps it testable.

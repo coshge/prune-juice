@@ -59,6 +59,20 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Build every TUI scanner through the same provenance-aware path. Planning
+/// and pre-delete revalidation must not disagree merely because one forgot the
+/// index.
+fn scanner<'a>(
+    client: &'a BollardClient,
+    index: Option<&'a prune_juice_core::index::Index>,
+) -> Scanner<'a> {
+    let scanner = Scanner::with_probe(client, client);
+    match index {
+        Some(index) => scanner.with_index(index),
+        None => scanner,
+    }
+}
+
 /// Run the interface. Returns a process exit code.
 pub fn run(opts: TuiOptions) -> Result<i32, Error> {
     let mut terminal = setup_terminal()?;
@@ -140,13 +154,15 @@ fn event_loop(terminal: &mut Term, opts: TuiOptions) -> Result<i32, Error> {
                         Action::ApplySelected => {
                             let names: std::collections::BTreeSet<String> =
                                 app.selected_names().into_iter().collect();
+                            let tiers = app.selected_tiers();
                             if let Some(plan) = app.plan.take() {
                                 app.screen = Screen::Applying;
-                                app.status = "preserving and removing the items you ticked…".into();
+                                app.status =
+                                    "re-checking and removing the items you ticked…".into();
                                 spawn_apply(
                                     &opts,
                                     plan,
-                                    vec![Tier::Orphan, Tier::Stale],
+                                    tiers,
                                     Some(names),
                                     tx.clone(),
                                     cancel.clone(),
@@ -256,11 +272,7 @@ fn spawn_scan(opts: &TuiOptions, tx: Sender<Msg>, cancel: Cancel) {
         };
         let sink = Arc::new(ChannelSink(etx));
         let index = prune_juice_core::index::Index::open().ok();
-        let scanner = match index.as_ref() {
-            Some(i) => Scanner::with_probe(&client, &client).with_index(i),
-            None => Scanner::with_probe(&client, &client),
-        };
-        match scanner.scan(&context, &scan_opts, sink, &cancel) {
+        match scanner(&client, index.as_ref()).scan(&context, &scan_opts, sink, &cancel) {
             Ok(report) => {
                 let plan = Planner::plan(&report, now_unix());
                 let _ = tx.send(Msg::Ready(Box::new((report, plan))));
@@ -297,7 +309,11 @@ fn spawn_apply(
         // item by item, immediately before its own delete.
         let (etx, _erx) = mpsc::channel::<Event>();
         let sink = Arc::new(ChannelSink(etx));
-        let fresh = match Scanner::with_probe(&client, &client).scan(
+        // The planning scan may have admitted stopped containers only because
+        // their volume provenance was durably checkpointed. Revalidation must
+        // use the same index or every such witness changes tier and is skipped.
+        let index = prune_juice_core::index::Index::open().ok();
+        let fresh = match scanner(&client, index.as_ref()).scan(
             &context,
             &scan_opts,
             sink.clone(),

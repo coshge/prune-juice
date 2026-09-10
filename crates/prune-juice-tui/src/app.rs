@@ -18,8 +18,8 @@ pub enum Screen {
     Scanning,
     Main,
     Review,
-    /// Shown before acting on reviewed rows. The last chance to look at what
-    /// is about to happen, stated in full.
+    /// Shown before acting on reviewed rows. The last chance to look at the
+    /// rebuild, re-pull, vault or permanent-loss cost, stated in full.
     Confirm,
     Applying,
     Finished,
@@ -36,25 +36,49 @@ pub enum Action {
     /// row that says "nothing here can be lost" *is* the confirmation.
     ReclaimFree,
     /// Act on the rows the user ticked. Only reachable from the confirm screen,
-    /// because these are irreversible without the vault.
+    /// because every non-free tier has a cost the user must see first.
     ApplySelected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuItem {
     Reclaim,
-    Review,
+    ReviewRecoverable,
+    ReviewDormant,
     Rescan,
     Quit,
 }
 
 impl MenuItem {
-    pub const ALL: [MenuItem; 4] = [
+    pub const ALL: [MenuItem; 5] = [
         MenuItem::Reclaim,
-        MenuItem::Review,
+        MenuItem::ReviewRecoverable,
+        MenuItem::ReviewDormant,
         MenuItem::Rescan,
         MenuItem::Quit,
     ];
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewGroup {
+    Recoverable,
+    Dormant,
+}
+
+impl ReviewGroup {
+    fn includes(self, tier: Tier) -> bool {
+        match self {
+            Self::Recoverable => matches!(tier, Tier::Repullable | Tier::Rebuildable),
+            Self::Dormant => matches!(tier, Tier::Orphan | Tier::Stale),
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Recoverable => "pullable / rebuildable",
+            Self::Dormant => "stale / orphaned",
+        }
+    }
 }
 
 /// One row in the review table.
@@ -85,6 +109,7 @@ pub struct App {
 
     pub menu_index: usize,
     pub review_index: usize,
+    pub review_group: ReviewGroup,
     pub review_rows: Vec<ReviewRow>,
     /// Rows whose evidence is expanded inline.
     pub expanded: BTreeSet<usize>,
@@ -116,6 +141,7 @@ impl App {
             receipt: None,
             menu_index: 0,
             review_index: 0,
+            review_group: ReviewGroup::Dormant,
             review_rows: Vec::new(),
             expanded: BTreeSet::new(),
             selected: BTreeSet::new(),
@@ -139,7 +165,8 @@ impl App {
 
     /// Hand the app a finished scan and plan.
     pub fn ready(&mut self, report: ScanReport, plan: Plan) {
-        self.review_rows = build_review_rows(&plan);
+        self.review_group = ReviewGroup::Dormant;
+        self.review_rows = build_review_rows(&plan, self.review_group);
         self.report = Some(report);
         self.plan = Some(plan);
         self.screen = Screen::Main;
@@ -190,7 +217,12 @@ impl App {
                     format!("Reclaim {}", self.free_bytes().human())
                 }
             }
-            MenuItem::Review => format!("Review {} items", self.review_rows.len()),
+            MenuItem::ReviewRecoverable => {
+                self.review_menu_label("Review pullable / rebuildable", ReviewGroup::Recoverable)
+            }
+            MenuItem::ReviewDormant => {
+                self.review_menu_label("Review stale / orphaned", ReviewGroup::Dormant)
+            }
             MenuItem::Rescan => "Scan again".into(),
             MenuItem::Quit => "Quit".into(),
         }
@@ -199,9 +231,64 @@ impl App {
     pub fn menu_enabled(&self, item: MenuItem) -> bool {
         match item {
             MenuItem::Reclaim => self.free_count() > 0 || self.free_bytes() > Bytes::ZERO,
-            MenuItem::Review => !self.review_rows.is_empty(),
+            MenuItem::ReviewRecoverable => self.review_count(ReviewGroup::Recoverable) > 0,
+            MenuItem::ReviewDormant => self.review_count(ReviewGroup::Dormant) > 0,
             _ => true,
         }
+    }
+
+    fn review_menu_label(&self, label: &str, group: ReviewGroup) -> String {
+        let count = self.review_count(group);
+        let bytes = self.review_bytes(group);
+        if count == 0 {
+            format!("{label} — none")
+        } else {
+            let noun = if count == 1 { "item" } else { "items" };
+            if group == ReviewGroup::Recoverable {
+                format!("{label} — {count} {noun}, up to {}", bytes.human())
+            } else {
+                format!("{label} — {count} {noun}, {}", bytes.human())
+            }
+        }
+    }
+
+    pub fn review_count(&self, group: ReviewGroup) -> usize {
+        self.plan
+            .as_ref()
+            .map(|p| {
+                p.items
+                    .iter()
+                    .filter(|i| group.includes(i.verdict.tier))
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn review_bytes(&self, group: ReviewGroup) -> Bytes {
+        self.plan
+            .as_ref()
+            .map(|p| {
+                p.items
+                    .iter()
+                    .filter(|i| group.includes(i.verdict.tier))
+                    .filter_map(|i| i.size)
+                    .sum()
+            })
+            .unwrap_or(Bytes::ZERO)
+    }
+
+    fn open_review(&mut self, group: ReviewGroup) {
+        self.review_group = group;
+        self.review_rows = self
+            .plan
+            .as_ref()
+            .map(|p| build_review_rows(p, group))
+            .unwrap_or_default();
+        self.review_index = 0;
+        self.expanded.clear();
+        self.selected.clear();
+        self.status.clear();
+        self.screen = Screen::Review;
     }
 
     /// Handle one key. Returns what the event loop should do.
@@ -259,8 +346,12 @@ impl App {
                 }
                 match item {
                     MenuItem::Reclaim => Action::ReclaimFree,
-                    MenuItem::Review => {
-                        self.screen = Screen::Review;
+                    MenuItem::ReviewRecoverable => {
+                        self.open_review(ReviewGroup::Recoverable);
+                        Action::None
+                    }
+                    MenuItem::ReviewDormant => {
+                        self.open_review(ReviewGroup::Dormant);
                         Action::None
                     }
                     MenuItem::Rescan => Action::Rescan,
@@ -344,6 +435,15 @@ impl App {
             .collect()
     }
 
+    pub fn selected_tiers(&self) -> Vec<Tier> {
+        self.selected_rows()
+            .iter()
+            .map(|r| r.tier)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub fn selected_bytes(&self) -> Bytes {
         self.selected_rows().iter().filter_map(|r| r.size).sum()
     }
@@ -379,18 +479,13 @@ pub enum Key {
     Char(char),
 }
 
-/// Everything needing a human decision, biggest first.
-///
-/// Tier 1 is deliberately absent: it is actioned from the main screen and needs
-/// no review. What lands here is orphaned or stale, and in this build it is
-/// **inspect-only** — deleting an orphaned volume is irreversible until the
-/// vault exists, and offering that behind two keystrokes would be exactly the
-/// risk this tool is supposed to remove.
-fn build_review_rows(plan: &Plan) -> Vec<ReviewRow> {
+/// Everything in one explicit-cost review group, cheaper tiers first and then
+/// biggest first. Tier 1 is actioned separately from the main screen.
+fn build_review_rows(plan: &Plan, group: ReviewGroup) -> Vec<ReviewRow> {
     let mut rows: Vec<ReviewRow> = plan
         .items
         .iter()
-        .filter(|i| matches!(i.verdict.tier, Tier::Orphan | Tier::Stale))
+        .filter(|i| group.includes(i.verdict.tier))
         .map(|i| ReviewRow {
             kind: i.kind,
             name: i.name.clone(),
@@ -408,10 +503,15 @@ fn build_review_rows(plan: &Plan) -> Vec<ReviewRow> {
         })
         .collect();
 
-    // Orphans first — they are the actionable finding — then by size.
+    // Put the lower-cost option first within each group, then largest first.
     rows.sort_by_key(|r| {
+        let tier_rank = match r.tier {
+            Tier::Repullable | Tier::Orphan => 0,
+            Tier::Rebuildable | Tier::Stale => 1,
+            _ => 2,
+        };
         (
-            r.tier != Tier::Orphan,
+            tier_rank,
             std::cmp::Reverse(r.size.unwrap_or(Bytes::ZERO).get()),
         )
     });
@@ -422,7 +522,7 @@ fn build_review_rows(plan: &Plan) -> Vec<ReviewRow> {
 mod tests {
     use super::*;
     use prune_juice_core::docker::DaemonIdentity;
-    use prune_juice_core::model::{DaemonId, ResourceSummary, RuntimeFlavor, Totals};
+    use prune_juice_core::model::{DaemonId, Recovery, ResourceSummary, RuntimeFlavor, Totals};
     use prune_juice_core::plan::Planner;
     use prune_juice_core::scan::Attributed;
 
@@ -450,6 +550,22 @@ mod tests {
         r
     }
 
+    fn recoverable_image(name: &str, tier: Tier, bytes: u64) -> Attributed {
+        let mut r = ResourceSummary::new(ResourceKind::Image, format!("sha256:{name}"), name);
+        r.created_unix = Some(OLD);
+        r.size = Some(Bytes(bytes));
+        let mut a = attributed(r, false);
+        a.recovery = Some(match tier {
+            Tier::Repullable => Recovery::Pull(format!("{name}@sha256:digest")),
+            Tier::Rebuildable => Recovery::Build {
+                command: format!("docker compose build {name}"),
+                dir: "/project".into(),
+            },
+            _ => panic!("test helper only creates recoverable image tiers"),
+        });
+        a
+    }
+
     fn report(resources: Vec<Attributed>) -> ScanReport {
         ScanReport {
             daemon: DaemonIdentity {
@@ -469,6 +585,7 @@ mod tests {
             resources,
             projects_known: 0,
             duration_ms: 10,
+            provenance_checkpointed: false,
             stale: false,
             warnings: vec![],
         }
@@ -561,6 +678,42 @@ mod tests {
         ]);
         assert!(!app.review_rows.is_empty());
         assert_eq!(app.review_rows[0].tier, Tier::Orphan);
+    }
+
+    #[test]
+    fn the_main_menu_exposes_recoverable_and_dormant_cleanup() {
+        let mut orphan = network("orphan_default");
+        orphan.size = Some(Bytes(500));
+        let app = ready_app(vec![
+            recoverable_image("pulled", Tier::Repullable, 2_000_000_000),
+            recoverable_image("built", Tier::Rebuildable, 3_000_000_000),
+            attributed(orphan, true),
+        ]);
+
+        let recoverable = app.menu_label(MenuItem::ReviewRecoverable);
+        assert!(recoverable.contains("2 items"), "{recoverable}");
+        assert!(recoverable.contains("up to 5.0 GB"), "{recoverable}");
+        let dormant = app.menu_label(MenuItem::ReviewDormant);
+        assert!(dormant.contains("1 item"), "{dormant}");
+    }
+
+    #[test]
+    fn recoverable_review_applies_exactly_the_tiers_the_user_ticked() {
+        let mut app = ready_app(vec![
+            recoverable_image("pulled", Tier::Repullable, 2_000_000_000),
+            recoverable_image("built", Tier::Rebuildable, 3_000_000_000),
+        ]);
+        app.menu_index = 1;
+        assert_eq!(app.on_key(Key::Enter), Action::None);
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(app.review_group, ReviewGroup::Recoverable);
+        assert_eq!(app.review_rows.len(), 2);
+
+        app.on_key(Key::Char('a'));
+        assert_eq!(
+            app.selected_tiers(),
+            vec![Tier::Repullable, Tier::Rebuildable]
+        );
     }
 
     #[test]
