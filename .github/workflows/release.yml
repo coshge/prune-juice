@@ -1,0 +1,319 @@
+name: release
+
+# Cutting a release is `git tag v0.2.0 && git push --tags`. Everything below
+# is derived from the tag; nothing is typed twice.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: An existing tag to re-release
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CI: "1"
+
+jobs:
+  # Nothing is built for a release until the tests pass. A tag is not a
+  # promise that the code works, and a published release is.
+  verify:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: clippy }
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: swift test
+        working-directory: app/PruneJuice
+
+      - name: the tag and the crate version agree
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          crate="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          if [ "${tag#v}" != "$crate" ]; then
+            echo "tag $tag does not match the workspace version $crate" >&2
+            echo "the updater compares against the version compiled into the" >&2
+            echo "binary, so a mismatch ships a release nobody can be offered." >&2
+            exit 1
+          fi
+
+  # One job per target triple. Each produces a .tar.gz holding a single
+  # `prune-juice` executable, which is the shape `--update` extracts.
+  cli:
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: aarch64-apple-darwin,      runner: macos-15 }
+          - { target: x86_64-apple-darwin,       runner: macos-15 }
+          - { target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "${{ matrix.target }}" }
+      - uses: Swatinem/rust-cache@v2
+
+      # The public key is compiled in here and nowhere else, so a release
+      # without it would ship binaries that can never be updated. Checked
+      # before the build rather than after, to fail in seconds.
+      - name: refuse a build with no signing key
+        env:
+          PRUNE_JUICE_UPDATE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+        run: |
+          if [ -z "$PRUNE_JUICE_UPDATE_PUBKEY" ]; then
+            echo "MINISIGN_PUBLIC_KEY is not set." >&2
+            echo "Releasing without it ships binaries that can never be" >&2
+            echo "updated. See RELEASING.md for generating the keypair." >&2
+            exit 1
+          fi
+
+      - name: build
+        env:
+          PRUNE_JUICE_UPDATE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+        run: cargo build --release --locked -p prune-juice-cli --target ${{ matrix.target }}
+
+      - name: package
+        run: |
+          version="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${version#v}"
+          name="prune-juice-$version-${{ matrix.target }}"
+          # `-C` so the archive holds a bare `prune-juice`, with no directory
+          # for the extractor to have to reason about.
+          tar czf "$name.tar.gz" -C "target/${{ matrix.target }}/release" prune-juice
+          shasum -a 256 "$name.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: prune-juice-*.tar.gz
+          if-no-files-found: error
+
+  # The app archive Sparkle downloads: the whole bundle, helper included, so
+  # the two can never end up on different versions.
+  app:
+    needs: verify
+    runs-on: macos-15
+    env:
+      # Mapped here so the steps below can branch on presence. `secrets` is
+      # not available in an `if:` expression; `env` is.
+      HAVE_CERT: ${{ secrets.MACOS_CERTIFICATE != '' && 'yes' || '' }}
+      HAVE_NOTARY: ${{ (secrets.MACOS_SIGN_ID != '' && secrets.NOTARY_APPLE_ID != '') && 'yes' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: "aarch64-apple-darwin,x86_64-apple-darwin" }
+      - uses: Swatinem/rust-cache@v2
+
+      - name: import the Developer ID certificate
+        # Optional, and absent today. Without it the bundle is ad-hoc signed:
+        # updates still verify, because Sparkle checks the EdDSA signature on
+        # the archive, but the *first* install has to be approved through
+        # Gatekeeper by hand. See RELEASING.md.
+        if: env.HAVE_CERT == 'yes'
+        env:
+          CERT: ${{ secrets.MACOS_CERTIFICATE }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$CERT" | base64 --decode > /tmp/certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security import /tmp/certificate.p12 -k build.keychain \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          rm -f /tmp/certificate.p12
+
+      - name: assemble the bundle
+        working-directory: app/PruneJuice
+        env:
+          SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
+          SIGN_ID: ${{ secrets.MACOS_SIGN_ID }}
+          NOTARY_PROFILE: ""
+        run: |
+          if [ -z "$SPARKLE_PUBLIC_KEY" ]; then
+            echo "SPARKLE_PUBLIC_KEY is not set." >&2
+            echo "The app would ship with no update mechanism. See RELEASING.md." >&2
+            exit 1
+          fi
+          ./scripts/bundle.sh
+
+      - name: notarise
+        # Needs a Developer ID. Skipped until there is one, and skipping it
+        # only affects the first manual install, never an update.
+        if: env.HAVE_NOTARY == 'yes'
+        working-directory: app/PruneJuice
+        env:
+          APPLE_ID: ${{ secrets.NOTARY_APPLE_ID }}
+          TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
+          PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
+        run: |
+          zip="$(ls dist/PruneJuice-*.zip)"
+          xcrun notarytool submit "$zip" \
+            --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$PASSWORD" --wait
+          xcrun stapler staple dist/PruneJuice.app
+          # Re-archive: the ticket is stapled into the bundle, so the archive
+          # made before stapling does not contain it.
+          rm -f dist/PruneJuice-*.zip
+          ditto -c -k --keepParent dist/PruneJuice.app "$zip"
+
+      - name: sign the update archive
+        working-directory: app/PruneJuice
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          tool="$(find .build/artifacts -type f -name sign_update | head -1)"
+          zip="$(ls dist/PruneJuice-*.zip)"
+          # `--ed-key-file -` reads the key from stdin, so it never reaches
+          # the keychain, the filesystem, or a process argument list.
+          sig="$(printf '%s' "$SPARKLE_PRIVATE_KEY" | "$tool" -p --ed-key-file - "$zip")"
+          [ -n "$sig" ] || { echo "sign_update produced no signature" >&2; exit 1; }
+          echo "$sig" > dist/ed-signature.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app
+          path: |
+            app/PruneJuice/dist/PruneJuice-*.zip
+            app/PruneJuice/dist/ed-signature.txt
+          if-no-files-found: error
+
+  publish:
+    needs: [cli, app]
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts }
+
+      - name: collect
+        run: |
+          mkdir -p release
+          find artifacts -name 'prune-juice-*.tar.gz' -exec mv {} release/ \;
+          find artifacts -name 'PruneJuice-*.zip' -exec mv {} release/ \;
+          ls -la release
+
+      - name: describe the release
+        id: meta
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "notes=${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag" >> "$GITHUB_OUTPUT"
+          echo "base=${{ github.server_url }}/${{ github.repository }}/releases/download/$tag" >> "$GITHUB_OUTPUT"
+
+      # The document the CLI reads. Digests are computed from the artifacts
+      # that are about to be uploaded, so the manifest cannot describe
+      # something else by accident.
+      - name: the update manifest
+        run: |
+          args=()
+          for f in release/prune-juice-*.tar.gz; do
+            # The triple is everything after `prune-juice-<version>-`.
+            target="$(basename "$f" .tar.gz)"
+            target="${target#prune-juice-${{ steps.meta.outputs.version }}-}"
+            args+=(--cli "$target=$f")
+          done
+          app="$(ls release/PruneJuice-*.zip 2>/dev/null | head -1)"
+          [ -n "$app" ] && args+=(--app "$app")
+          cargo run -q -p xtask -- manifest \
+            --version "${{ steps.meta.outputs.version }}" \
+            --base-url "${{ steps.meta.outputs.base }}" \
+            --notes-url "${{ steps.meta.outputs.notes }}" \
+            --out release/update-manifest.json \
+            "${args[@]}"
+          cat release/update-manifest.json
+
+      # Signed here and verified in the binary. This is the only link in the
+      # chain that has to be trusted, which is why the key never leaves a
+      # secret and the signature covers the digests rather than each file.
+      - name: sign the manifest
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+          MINISIGN_PUBLIC_KEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "MINISIGN_SECRET_KEY is not set; the manifest would be unsigned" >&2
+            echo "and every installed copy would refuse it. See RELEASING.md." >&2
+            exit 1
+          fi
+          brew install minisign
+          printf '%s' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+          printf '%s' "$MINISIGN_PASSWORD" | minisign -S \
+            -s /tmp/minisign.key \
+            -m release/update-manifest.json \
+            -t "prune-juice ${{ steps.meta.outputs.tag }}"
+          rm -f /tmp/minisign.key
+          # Verified against the public half before publishing. A release that
+          # ships a signature nobody can check is worse than no release.
+          printf '%s' "$MINISIGN_PUBLIC_KEY" > /tmp/minisign.pub
+          minisign -V -p /tmp/minisign.pub -m release/update-manifest.json
+          rm -f /tmp/minisign.pub
+
+      # The document Sparkle reads. The previous feed is fetched first so the
+      # version history survives; a missing one starts a new feed.
+      - name: the Sparkle appcast
+        run: |
+          curl -fsSL -o release/previous-appcast.xml \
+            "${{ github.server_url }}/${{ github.repository }}/releases/latest/download/appcast.xml" \
+            || echo "no previous appcast; starting a new feed"
+          zip="$(ls release/PruneJuice-*.zip)"
+          cargo run -q -p xtask -- appcast \
+            --version "${{ steps.meta.outputs.version }}" \
+            --zip "$zip" \
+            --url "${{ steps.meta.outputs.base }}/$(basename "$zip")" \
+            --signature "$(cat artifacts/app/ed-signature.txt)" \
+            --notes-url "${{ steps.meta.outputs.notes }}" \
+            --previous release/previous-appcast.xml \
+            --out release/appcast.xml
+          rm -f release/previous-appcast.xml
+          cat release/appcast.xml
+
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "${{ steps.meta.outputs.tag }}" \
+            --generate-notes --verify-tag 2>/dev/null || true
+          gh release upload "${{ steps.meta.outputs.tag }}" \
+            release/prune-juice-*.tar.gz \
+            release/PruneJuice-*.zip \
+            release/update-manifest.json \
+            release/update-manifest.json.minisig \
+            release/appcast.xml \
+            --clobber
+
+      # Proves the thing that actually matters: an installed copy can find and
+      # verify this release at the URL it will really use. Runs after the
+      # upload, because there is nothing to find before it.
+      - name: an installed copy can see this release
+        env:
+          PRUNE_JUICE_UPDATE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
+        run: |
+          cargo build --release --locked -p prune-juice-cli
+          set +e
+          ./target/release/prune-juice --check-update
+          code=$?
+          set -e
+          # 0 means "you are the newest", which is the correct answer for a
+          # binary built from the tag being released. 5 would mean the feed
+          # could not be read or verified.
+          [ "$code" = 0 ] || { echo "the published release is not readable (exit $code)"; exit 1; }

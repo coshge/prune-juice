@@ -28,6 +28,11 @@ sha2         = "0.10"
 flate2       = "1"
 tar          = "0.4"
 ratatui      = "0.29"
+# Both zero-dependency crates, which is why they are acceptable here. The
+# updater needs exactly two things it should not hand-roll: EdDSA signature
+# verification, and semver ordering that gets pre-releases right.
+minisign-verify = "0.2"
+semver          = "1"
 crossterm    = "0.28"
 
 [profile.release]

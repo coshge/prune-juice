@@ -19,6 +19,18 @@ The app includes its command-line helper. The default build is signed for local
 use, not notarized for redistribution. Move the complete `PruneJuice.app` bundle
 to Applications if you want to keep it there.
 
+A build with no `SPARKLE_PUBLIC_KEY` in its environment has no update
+mechanism, which is deliberate — an update that cannot be verified is not a
+lesser update. The bundle script says so when it happens, and the app leaves
+the update controls out rather than showing buttons that do nothing:
+
+```sh
+SPARKLE_PUBLIC_KEY="…" ./scripts/bundle.sh   # updates enabled
+```
+
+See [RELEASING.md](../../RELEASING.md) for generating that key and for how a
+release is cut.
+
 ## Scan and review
 
 The app scans on launch. Use **Scan again** or **Command-R** to refresh.
@@ -30,7 +42,7 @@ The app scans on launch. Use **Scan again** or **Command-R** to refresh.
 | Vault | List, verify, preserve, restore, or permanently delete volume copies. |
 | Waivers | List, add, or remove exclusions that protect matching resources. |
 | Activity | Follow progress, read results and notices, and copy output. |
-| Settings | Set the Docker context, project folders, label filter, deadline, inspection options, vault preservation, and menu bar icon. |
+| Settings | Set the Docker context, project folders, label filter, deadline, inspection options, vault preservation, menu bar icon, and automatic update checks. |
 
 See [resource labels and their exact criteria](../../README.md#resource-labels-and-their-exact-criteria)
 for the rules behind Protected, Safe, Pull again, Build again, Orphaned, Dormant,
@@ -58,6 +70,31 @@ Vault preserve and restore use the first discovered local Docker context,
 independently of the scan context setting. Restore keeps the archive and refuses
 to overwrite an existing volume. Disabling vault preservation causes cleanup to
 refuse irreversible volumes rather than remove them without a copy.
+
+## Updates
+
+The app checks for a newer release on launch, at most once a day, using
+[Sparkle](https://sparkle-project.org). It never interrupts work to do it:
+
+- A scheduled check is declined outright while a scan, cleanup or vault
+  operation is running.
+- An update found while the app is busy or in the background puts a line in
+  the window and a badge on the Dock icon rather than an alert. **Show update**
+  presents it.
+- Installing waits until the helper has stopped. An update can never relaunch
+  the app between two deletions.
+- An update replaces the whole bundle, including the CLI helper, so the two are
+  always the same version.
+
+**Check for Updates…** in the Prune Juice menu asks immediately, and is allowed
+even mid-operation — only installing waits. **Settings → Updates** turns
+automatic checking off and shows when the last check ran. A failed check is
+written to the diagnostics log and never shown in the interface.
+
+The first install of an updater-enabled build needs right-click → **Open**,
+because the app is not yet signed with an Apple Developer ID. Updates after
+that verify against the EdDSA signature in the feed and install without
+ceremony.
 
 Allow active operations to finish before quitting. If the app reports a helper
 error, rebuild or replace the complete app bundle. Diagnostics are written to

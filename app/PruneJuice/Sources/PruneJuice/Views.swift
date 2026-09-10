@@ -28,6 +28,7 @@ private struct PendingAction: Identifiable {
 struct RootView: View {
     @ObservedObject var model: AppModel
     @ObservedObject var settings: Settings
+    @ObservedObject var updates: UpdateStatus
     @State private var destination: Destination = .resources
     @State private var search = ""
     @State private var tier = "all"
@@ -39,9 +40,13 @@ struct RootView: View {
     @State private var selector = ""
     @State private var waiverReason = ""
 
-    init(model: AppModel, settings: Settings, initialDestination: Destination = .resources) {
+    init(
+        model: AppModel, settings: Settings, updates: UpdateStatus = UpdateStatus(),
+        initialDestination: Destination = .resources
+    ) {
         self.model = model
         self.settings = settings
+        self.updates = updates
         _destination = State(initialValue: initialDestination)
     }
 
@@ -52,6 +57,20 @@ struct RootView: View {
             VStack(spacing: 0) {
                 toolbar
                 Divider()
+                if let version = updates.pendingVersion {
+                    // Sparkle found this and agreed not to interrupt. It sits
+                    // in the window until the user chooses to look at it —
+                    // and installing still waits for any running operation.
+                    HStack(alignment: .center, spacing: 10) {
+                        Image(systemName: "arrow.down.circle.fill").foregroundStyle(plum)
+                        Text("Prune Juice \(version) is available.")
+                        Text("Includes the command-line helper.").foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Show update") { updates.checkForUpdates() }
+                    }
+                    .font(.callout).padding(.horizontal, 26).padding(.vertical, 12)
+                    .background(plum.opacity(0.08))
+                }
                 if case .failed(let reason) = model.state {
                     HStack(alignment: .top, spacing: 10) {
                         Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
@@ -87,10 +106,7 @@ struct RootView: View {
         VStack(alignment: .leading, spacing: 28) {
             HStack(spacing: 10) {
                 Image(systemName: "drop.halffull").font(.system(size: 25, weight: .medium)).foregroundStyle(plum)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Prune Juice").font(.system(size: 16, weight: .semibold))
-                    Text("Space to build.").font(.caption).foregroundStyle(.secondary)
-                }
+                Text("Prune Juice").font(.system(size: 16, weight: .semibold))
             }.padding(.horizontal, 12).padding(.top, 18)
             VStack(spacing: 5) {
                 ForEach(Destination.allCases) { item in
@@ -434,6 +450,25 @@ struct RootView: View {
             Section("App") {
                 Toggle("Show menu bar icon", isOn: $settings.showMenuBarIcon)
                 Button("Show CLI help") { model.command("CLI help", ["--help"]); destination = .activity }
+            }
+            if updates.isConfigured {
+                Section("Updates") {
+                    Toggle(
+                        "Check for updates automatically",
+                        isOn: Binding(
+                            get: { updates.automaticallyChecks },
+                            set: { updates.setAutomaticChecks($0) })
+                    )
+                    Text("Checks in the background at most once a day, never during a scan or cleanup. Updates replace the whole app, including its command-line helper, so the two stay the same version.")
+                        .font(.caption).foregroundStyle(.secondary)
+                    HStack {
+                        Button("Check now") { updates.checkForUpdates() }
+                        if let last = updates.lastCheck {
+                            Text("Last checked \(last.formatted(date: .abbreviated, time: .shortened))")
+                                .font(.caption).foregroundStyle(.tertiary)
+                        }
+                    }
+                }
             }
             if let error = model.options.validation { Text(error).foregroundStyle(.orange) }
             Button("Apply settings and scan") { selected = nil; model.scan(); destination = .resources }

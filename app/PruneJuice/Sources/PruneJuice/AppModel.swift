@@ -73,6 +73,10 @@ final class AppModel: ObservableObject {
     private var contextTotals: [String: Totals] = [:]
     private let service: PruneJuiceService
     let entitlements: Entitlements
+    /// Set by the composition root. Told when an operation ends so an install
+    /// the updater postponed can go ahead — the app never installs over a
+    /// running scan, cleanup, or vault operation.
+    weak var updates: UpdateStatus?
 
     init(service: PruneJuiceService = SubprocessService(), entitlements: Entitlements = AlwaysEntitled()) {
         self.service = service
@@ -133,6 +137,9 @@ final class AppModel: ObservableObject {
             delivery.async { DispatchQueue.main.async {
                 guard let self else { return }
                 self.progress = nil
+                // Before anything else about the outcome: whatever happened,
+                // the helper is no longer running.
+                self.updates?.hostBecameIdle()
                 if let error {
                     self.state = .failed(displayText(error.localizedDescription))
                     self.status = "\(title) needs attention"

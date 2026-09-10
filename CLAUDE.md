@@ -10,7 +10,7 @@ model strong enough that the headline action needs no confirmation. Free MIT
 Rust CLI; a free macOS app comes later, architected so a one-time paid tier
 could be added without rework.
 
-## Status: M6 — macOS app builds and runs
+## Status: M7 — automatic updates
 
 | milestone | state |
 |---|---|
@@ -21,10 +21,11 @@ could be added without rework.
 | M4b vault (dump / verify / restore) | done |
 | M5 review actions, waivers, host disk measurement | done |
 | M6 macOS app — window, scan, review; unsigned | done |
+| M7 updates — GitHub Releases, Sparkle, CLI self-update, CI | done |
 | README tutorial | done |
 
 ```
-cargo test --workspace                  # 206 tests
+cargo test --workspace                  # 276 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -38,15 +39,35 @@ cargo build -p prune-juice-cli
 ./target/debug/prune-juice --waivers          # what is being held back by hand
 ./target/debug/prune-juice --waive SEL --reason "..."   # hold something back
 
+./target/debug/prune-juice --check-update       # ask now (0 current, 1 newer, 5 could not)
+./target/debug/prune-juice --update             # install the newest release
+./target/debug/prune-juice --update-check off   # stop checking, and remember that
+./target/debug/prune-juice --no-update-check    # skip it for one run
+
 cargo run -p prune-juice-tui --example preview   # render every screen, no TTY needed
 
+cargo run -p xtask -- manifest                  # the document the CLI reads
+cargo run -p xtask -- appcast                   # the document Sparkle reads
+
 cd app/PruneJuice && ./scripts/bundle.sh        # assemble PruneJuice.app (ad-hoc signed)
+SPARKLE_PUBLIC_KEY=… ./scripts/bundle.sh        # …with updates enabled
 SIGN_ID="Developer ID Application: …" ./scripts/bundle.sh --notarize
 open app/PruneJuice/dist/PruneJuice.app
 ```
 
 App diagnostics land in `~/Library/Logs/prune-juice-app.log`. A GUI launch has
 no terminal, so that file is the only way to see why a scan failed.
+
+**There is no release-signing key in this checkout**, so nothing here checks
+for updates: `verify::release_key()` returns `None` and the whole feature
+reports itself absent. That is the correct state for a working tree — see
+`RELEASING.md`. To exercise the real path locally:
+
+```
+PRUNE_JUICE_UPDATE_PUBKEY=RW… cargo build -p prune-juice-cli
+PRUNE_JUICE_UPDATE_URL=https://…/update-manifest.json \
+  ./target/debug/prune-juice --check-update
+```
 
 ## Deliberately not implemented — do not "fix" these
 
@@ -107,6 +128,29 @@ no terminal, so that file is the only way to see why a scan failed.
   is sent before asking Docker to delete an item, followed by its terminal
   outcome. The TUI forwards these events directly and keeps only ten activity
   lines, so a slow daemon remains visibly active without large-run UI overhead.
+- **There is no HTTP client in the dependency graph.** The updater fetches
+  through the platform's `curl`, behind a `Fetcher` trait. A TLS stack would be
+  the single heaviest thing in this workspace, added for a peripheral
+  convenience — the same reasoning that kept `prune-juice-ffi` out. It is safe
+  because nothing is trusted for having been fetched: the manifest is verified
+  in-process against a compiled-in Ed25519 key, so a missing, old, or
+  subverted `curl` can only ever cause "no update", never a bad one. Swapping
+  in `ureq` later means writing one more `Fetcher`.
+- **A build with no release key has no update system, not an unverified one.**
+  `RELEASE_KEY` is empty in the repository and `verify::release_key()` returns
+  `None`, which disables *checking* as well as installing. An unverifiable
+  version number is not a lesser form of news; it is a stranger telling you to
+  go and download something. Same rule in the app: no `SUPublicEDKey` and
+  Sparkle is never started.
+- **The updater never overwrites a binary a package manager owns.** The check
+  still runs and still reports the version; only the action changes, to the
+  command that manager understands. Overwriting a Homebrew binary in place
+  would leave the manager serving a version it did not install, and the next
+  `brew upgrade` would silently undo the update. `origin.rs`.
+- **The app updates the whole bundle, never the helper alone.** Replacing one
+  file inside a signed bundle breaks its seal, and an app and helper on
+  different versions is a protocol mismatch waiting to happen. So the helper's
+  origin is `AppBundle` and it refuses to self-replace.
 - **`--only-label` skips the build cache entirely.** Build cache records carry
   no labels, so the fence cannot be honoured for them; pruning it anyway would
   break the promise the flag makes.
@@ -229,6 +273,48 @@ All have regression tests — if you break one, a test will tell you.
     below it the innermost `io::ErrorKind`. Note that `IOError` is
     `#[error(transparent)]`, so `source()` forwards *past* the wrapped error
     and a chain walk alone cannot see it.
+35. **An update check never delays or fails a scan.** The cache is read
+    synchronously because that is a file read; the network is only ever touched
+    on a detached thread whose result is used if it arrives and dropped if it
+    does not. Every failure — no network, no `curl`, a 404, a bad signature —
+    resolves to "no news". There is a test that a dead server produces
+    `Decision::Failed` and never a propagated error.
+36. **Nothing in a manifest is read before its signature verifies.** Not the
+    version, not a URL, not a digest. `Manifest::parse` is private and
+    `Checker::fetch_manifest` is the only way to obtain one, which is the same
+    shape as `SafeToDelete`: a type you cannot hold without having done the
+    check. Artifacts are then authenticated by the SHA-256 the signed manifest
+    names, so the release host is not trusted at all.
+37. **Only the pre-hashed minisign form is accepted.** `verify` passes
+    `allow_legacy: false`. Accepting both would mean accepting the weaker one,
+    and an attacker gets to choose which they present. There is a fixture pair
+    — one signature in each format over the same bytes — asserting the modern
+    one verifies and the legacy one does not.
+38. **The new binary has to run before it replaces the old one.** A signature
+    says who built a file; only executing it says the platform will accept it.
+    The staged binary is asked for `--version` and must report exactly what the
+    manifest promised. Then one `rename`, which is atomic: either the new
+    binary is there or the old one is, never neither.
+39. **A release archive never chooses where its contents land.** The member is
+    found by file name and read into memory; `tar::Archive::unpack` would treat
+    the path inside the archive as an instruction. A signature proves who built
+    an archive, not that they built it correctly.
+40. **A notice is not payload.** Update notices go to stderr, only when both
+    streams are terminals, never under `CI`, never with `--json`. `core` cannot
+    break this: it returns `Notice::lines()` and does not know what a terminal
+    is.
+41. **The update preference is config and the last check is cache.** Losing the
+    cache costs one request; losing the preference would silently turn checking
+    back on. Different directories, and a test asserting they are.
+42. **The app never installs over a running helper.** A scheduled check is
+    declined while an operation runs, and a relaunch is postponed by holding
+    Sparkle's install handler until the helper stops — released on every
+    completion, successful or not, and exactly once. Relaunching mid-`--apply`
+    would kill the executor between two deletions.
+43. **The tag and the workspace version must agree.** Checked in CI before
+    anything is built. The updater compares against the version compiled into
+    the binary, so a release tagged `v0.2.0` built from `0.1.0` sources is a
+    release nobody is ever offered.
 
 ## The acceptance gate
 
@@ -286,6 +372,8 @@ checkouts "derivative" because they contained a `vendor` directory.
   why and changes nothing.
 - Exclusions and waivers require a human-authored reason.
 - Conventional commit prefixes: `feat:`, `fix:`, `chore:`, `docs:`.
+- A release is a tag. `RELEASING.md` is the whole procedure; nothing is typed
+  twice, and the version lives only in `[workspace.package]`.
 - Honour `NO_COLOR` and TTY detection.
 
 ## Known gaps worth picking up
@@ -294,6 +382,18 @@ checkouts "derivative" because they contained a `vendor` directory.
   once (82.5 GB reported vs ~80.5 GB actual). Needs exclusive-size accounting.
 - Waivers still live in a JSON file rather than the index. Harmless, but they
   could move now that the index exists.
+- **No release has been cut yet, so one link is unexercised.** Every piece of
+  the update chain is tested — the signature format against a real minisign
+  fixture, the whole checker against a signed manifest, the install against a
+  tampered archive and a binary that will not run, and the `curl` transport
+  against a live 404 — but nothing has yet fetched a *published* manifest over
+  HTTPS and verified it, because there is nothing published. The last step of
+  `release.yml` does exactly that against the release it just made, which is
+  why it is the step to watch on the first tag.
+- **There is no Homebrew formula.** `Origin::Homebrew` detection and the
+  `brew upgrade prune-juice` hint are correct and tested, but nothing is in a
+  tap yet, so that branch is currently unreachable in practice. It costs
+  nothing to have ready and is wrong to remove.
 - **There is no SIGINT handler.** `Error::Cancelled`/exit 130 is only reachable
   by quitting the TUI mid-scan; Ctrl-C during a one-shot `--apply` kills the
   process wherever it happens to be. Harmless for a read-only scan, and the

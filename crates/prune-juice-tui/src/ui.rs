@@ -216,6 +216,19 @@ fn totals(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(WARN),
         )));
     }
+    // Below the warnings, and dimmer than them: a new release is the least
+    // urgent thing on this screen. Clipped to the actual width like every
+    // other line here — a notice that wraps a narrow terminal would push the
+    // real content off it.
+    if let Some(u) = &app.update {
+        let room = area.width.saturating_sub(4) as usize;
+        for line in u.lines() {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", clip(&line, room)),
+                Style::default().fg(ACCENT),
+            )));
+        }
+    }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
@@ -794,6 +807,43 @@ mod tests {
         app.screen = Screen::Review;
         for w in [40u16, 60, 80, 98, 140] {
             let out = render_at(&app, w, 20);
+            for line in out.lines() {
+                assert!(
+                    line.chars().count() <= w as usize,
+                    "line of {} chars at width {w}: {line:?}",
+                    line.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_available_release_is_shown_without_crowding_out_the_report() {
+        let mut app = demo_app();
+        app.note_update(prune_juice_core::update::Notice {
+            current: "0.1.0".into(),
+            latest: "0.2.0".into(),
+            notes_url: None,
+            origin: prune_juice_core::update::Origin::Standalone,
+        });
+        let out = render_at(&app, 100, 30);
+        assert!(out.contains("Prune Juice 0.2.0 is available"), "{out}");
+        assert!(out.contains("--update"), "{out}");
+        // The figures it sits under are still there.
+        assert!(out.contains("safe to reclaim"), "{out}");
+    }
+
+    #[test]
+    fn the_update_notice_fits_every_width_like_every_other_line() {
+        let mut app = demo_app();
+        app.note_update(prune_juice_core::update::Notice {
+            current: "0.1.0".into(),
+            latest: "0.2.0".into(),
+            notes_url: None,
+            origin: prune_juice_core::update::Origin::Standalone,
+        });
+        for w in [20u16, 40, 60, 80, 140] {
+            let out = render_at(&app, w, 30);
             for line in out.lines() {
                 assert!(
                     line.chars().count() <= w as usize,

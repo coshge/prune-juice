@@ -13,6 +13,9 @@ final class StubService: PruneJuiceService, @unchecked Sendable {
     }
 }
 
+/// A counter a non-escaping-unfriendly closure can increment.
+final class Counter: @unchecked Sendable { var value = 0 }
+
 final class AppTests: XCTestCase {
     @MainActor func settle() async { try? await Task.sleep(for: .milliseconds(100)) }
 
@@ -146,6 +149,82 @@ final class AppTests: XCTestCase {
         let future = Data(#"{"v":1,"seq":2,"event":"future_event"}"#.utf8)
         guard case .unknown = try Envelope.decode(line: future)?.event else { return XCTFail("Unknown event rejected") }
         XCTAssertFalse(displayText("A\u{2014}B").contains("\u{2014}"))
+    }
+
+    // MARK: - Updates
+
+    @MainActor func testUnconfiguredUpdatesOfferNothingRatherThanADeadButton() {
+        // A `swift run` or a bundle built without a signing key has no update
+        // mechanism, and the interface must leave the controls out instead of
+        // showing a Check button that silently does nothing.
+        let status = UpdateStatus()
+        XCTAssertFalse(status.isConfigured)
+        XCTAssertNil(status.pendingVersion)
+        status.checkForUpdates()  // no closure wired: must not crash
+        status.setAutomaticChecks(true)
+        XCTAssertTrue(status.automaticallyChecks)
+    }
+
+    @MainActor func testAPostponedInstallWaitsForTheOperationAndThenRunsOnce() async {
+        // The rule the whole design turns on: an update never relaunches the
+        // app out from under a running helper.
+        let service = StubService()
+        let model = AppModel(service: service)
+        let status = UpdateStatus()
+        model.updates = status
+
+        let installs = Counter()
+        status.postpone { installs.value += 1 }
+
+        model.scan()
+        XCTAssertTrue(model.busy)
+        XCTAssertEqual(installs.value, 0, "an install must not run during an operation")
+
+        service.event?(.scanFinished(totals: Totals(), durationMs: 1, stale: false))
+        service.finish?(nil)
+        await settle()
+        XCTAssertEqual(installs.value, 1)
+
+        // And it is released exactly once — a second completion must not try
+        // to install again.
+        model.command("Vault", ["--vault"])
+        service.finish?(nil)
+        await settle()
+        XCTAssertEqual(installs.value, 1)
+    }
+
+    @MainActor func testAFailedOperationStillReleasesAPostponedInstall() async {
+        // The helper has stopped either way. Holding the install because a
+        // scan failed would strand the update for the rest of the session.
+        let service = StubService()
+        let model = AppModel(service: service)
+        let status = UpdateStatus()
+        model.updates = status
+        let installs = Counter()
+        status.postpone { installs.value += 1 }
+
+        model.scan()
+        service.finish?(ServiceError.helperMissing)
+        await settle()
+        XCTAssertEqual(installs.value, 1)
+        if case .failed = model.state {} else { XCTFail("expected a failed state") }
+    }
+
+    @MainActor func testAHeldUpdateAppearsInTheWindowAndIsClearedWhenShown() {
+        _ = NSApplication.shared
+        let status = UpdateStatus()
+        let checks = Counter()
+        status.mechanismStarted(
+            automatic: true, lastCheck: nil,
+            onCheck: { checks.value += 1; status.reminderRetired() },
+            onSetAutomatic: { _ in })
+        XCTAssertTrue(status.isConfigured)
+
+        status.hold(version: "0.2.0")
+        XCTAssertEqual(status.pendingVersion, "0.2.0")
+        status.checkForUpdates()
+        XCTAssertEqual(checks.value, 1)
+        XCTAssertNil(status.pendingVersion, "presenting the update retires the reminder")
     }
 
     @MainActor func testRenderScreens() throws {

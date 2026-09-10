@@ -21,6 +21,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = AppModel()
     private let settings = Settings()
     private var settingsObserver: NSObjectProtocol?
+    /// What the interface reads about updates. Populated by Sparkle when this
+    /// bundle has a feed and a key, and left unconfigured otherwise.
+    private let updates = UpdateStatus()
+    /// Held for its lifetime: Sparkle's scheduled checks stop the moment its
+    /// controller is deallocated.
+    private var sparkle: SparkleUpdater?
+
+    override init() {
+        // The updater has to ask the model whether an operation is running,
+        // and the model has to tell the updater when one finishes. A closure
+        // one way and a weak reference the other keeps that from being a
+        // retain cycle.
+        super.init()
+        model.updates = updates
+        sparkle = SparkleUpdater.configured(
+            status: updates, isBusy: { [weak model] in model?.busy ?? false })
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -70,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.makeKeyAndOrderFront(nil)
             return
         }
-        let root = RootView(model: model, settings: settings)
+        let root = RootView(model: model, settings: settings, updates: updates)
         let w = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1180, height: 780),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -122,6 +139,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.scan()
     }
 
+    @objc private func checkForUpdatesFromMenu() {
+        // Explicit, so it is allowed even mid-operation: the person asking can
+        // see what the app is doing. Only the *install* waits.
+        updates.checkForUpdates()
+    }
+
     /// Without a menu bar an app has no Cmd-Q, no Cmd-W, and no edit commands.
     private func buildMenu() {
         let main = NSMenu()
@@ -131,6 +154,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             withTitle: "About Prune Juice",
             action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(.separator())
+        if updates.isConfigured {
+            appMenu.addItem(
+                withTitle: "Check for Updates…", action: #selector(checkForUpdatesFromMenu),
+                keyEquivalent: "")
+            appMenu.addItem(.separator())
+        }
         appMenu.addItem(
             withTitle: "Scan Again", action: #selector(scanFromMenu), keyEquivalent: "r")
         appMenu.addItem(.separator())

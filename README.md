@@ -21,6 +21,7 @@ in a verified local vault before removal.
 - [Resource labels and their exact criteria](#resource-labels-and-their-exact-criteria)
 - [Vault](#vault)
 - [Waivers](#waivers)
+- [Updates](#updates)
 - [Docker contexts and project folders](#docker-contexts-and-project-folders)
 - [Command reference](#command-reference)
 - [Scripting and exit codes](#scripting-and-exit-codes)
@@ -293,6 +294,83 @@ The blanket selector `*` is refused. Waivers are stored locally and are not scop
 to a single Docker context, so the same selector can protect matching resources
 on multiple daemons.
 
+## Updates
+
+Both the CLI and the Mac app check for a newer release in the background and
+offer it. Neither installs anything without being asked.
+
+### The CLI
+
+A check runs at most once a day, on a terminal only, and never delays or fails
+a scan. If the release server cannot be reached the run is unaffected and
+nothing is said. When there is something newer, two lines follow the report:
+
+```
+  Prune Juice 0.2.0 is available. You have 0.1.0.
+  Run prune-juice --update to install.
+```
+
+Notices go to stderr, so they stay out of `--json` and out of anything you
+pipe. Nothing is printed under `CI`, when output is redirected, or when
+`--json` is used.
+
+```sh
+# Ask now, whatever the cache says.
+prune-juice --check-update
+
+# Install it.
+prune-juice --update
+
+# Stop checking automatically, permanently or for one run.
+prune-juice --update-check off
+prune-juice --no-update-check
+```
+
+`--update` downloads the archive for this machine's exact target, checks it
+against the SHA-256 in a manifest signed with the project's release key,
+confirms the new binary runs and reports the expected version, and only then
+replaces the executable with a single atomic rename. Any failure leaves the
+working copy exactly as it was.
+
+**Installations a package manager owns are never overwritten.** The check
+still reports the new version, but the second line becomes the command that
+manager understands:
+
+| How it was installed | What you are told to run |
+| --- | --- |
+| A downloaded binary | `prune-juice --update` |
+| Homebrew | `brew upgrade prune-juice` |
+| `cargo install` | `cargo install prune-juice-cli --force` |
+| MacPorts | `sudo port upgrade prune-juice` |
+| Nix | `nix profile upgrade prune-juice` |
+| Inside `PruneJuice.app` | nothing — the app updates it |
+
+A build with no release key compiled in — which includes a plain `cargo build`
+from this repository — has no update system at all and says so, rather than
+reporting a version it cannot verify.
+
+### The Mac app
+
+The app checks on launch, at most once a day, and uses
+[Sparkle](https://sparkle-project.org) for the download, the release notes,
+the signature check, the install and the relaunch.
+
+It will not interrupt you. If an update is found while a scan, cleanup or
+vault operation is running, or while the app is in the background, a line
+appears in the window and a badge on the Dock icon instead of an alert. The
+install itself waits until the operation has finished, so an update can never
+relaunch the app between two deletions. **Check for Updates…** in the Prune
+Juice menu asks immediately, and **Settings → Updates** turns automatic
+checking off.
+
+An update replaces the whole app bundle, including the CLI helper inside it,
+so the two are always the same version.
+
+Because the app is not yet signed with an Apple Developer ID, the *first*
+install of an updater-enabled build has to be opened once through right-click
+→ **Open** to clear Gatekeeper. Updates after that are verified by their EdDSA
+signature and install without ceremony.
+
 ## Docker contexts and project folders
 
 The Mac app and one-shot CLI scan discovered local Docker contexts by default.
@@ -365,6 +443,11 @@ inspection, so no volume can qualify as Safe on the basis of its contents.
 | `--waive SELECTOR` | Protect matching resources. Requires `--reason`. |
 | `--unwaive SELECTOR` | Remove a waiver. |
 | `--reason TEXT` | Reason for adding a waiver or deleting a vault copy; at least 12 characters. |
+| `--check-update` | Ask now whether a newer release exists. Exits 0 up to date, 1 update available, 5 could not check. |
+| `--update` | Install the newest release. Refused when a package manager owns the binary, which then names the command to run instead. |
+| `--update-check on\|off` | Turn the automatic once-a-day check on or off and remember the answer. |
+| `--no-update-check` | Skip the automatic check for this run. `PRUNE_JUICE_NO_UPDATE_CHECK=1` does the same. |
+| `-V`, `--version` | Print the version. |
 | `-h`, `--help` | Show help. |
 
 Use one vault or waiver operation per invocation. These commands run independently
@@ -411,10 +494,17 @@ operation.
 | Ownership history | `~/Library/Application Support/prune-juice/index.db` | `~/.local/share/prune-juice/index.db` |
 | Preserved volumes | `~/Library/Application Support/prune-juice/vault/` | `~/.local/share/prune-juice/vault/` |
 | Waivers | `~/.config/prune-juice/waivers.json` | `~/.config/prune-juice/waivers.json` |
+| Update preference | `~/.config/prune-juice/config.json` | `~/.config/prune-juice/config.json` |
+| Last update check | `~/.cache/prune-juice/update-check.json` | `~/.cache/prune-juice/update-check.json` |
 
 `XDG_DATA_HOME` overrides the base folder for ownership history and vault storage.
-`XDG_CONFIG_HOME` overrides the base folder for waivers. The Mac app writes
-diagnostics to `~/Library/Logs/prune-juice-app.log`.
+`XDG_CONFIG_HOME` overrides the base folder for waivers and the update
+preference; `XDG_CACHE_HOME` overrides it for the update check. The Mac app
+writes diagnostics to `~/Library/Logs/prune-juice-app.log`.
+
+Deleting the update check costs one extra request. Deleting the update
+preference turns automatic checking back on, which is why the two are kept
+apart: one is a cache and the other is a decision you made.
 
 Deleting ownership history loses recorded associations and observations used to
 confirm missing projects. Deleting the vault loses preserved data. Removing the

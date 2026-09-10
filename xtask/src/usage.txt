@@ -1,0 +1,7 @@
+xtask — Prune Juice release plumbing
+
+    manifest   write update-manifest.json, which the CLI's updater reads
+    appcast    write appcast.xml, which Sparkle reads
+
+Run either with no flags to be told which ones are required.
+See RELEASING.md for how a release is cut.

@@ -133,6 +133,11 @@ pub struct App {
     pub seen_volumes: u32,
     pub seen_networks: u32,
 
+    /// A newer release, if the background check found one. Held as the core
+    /// type rather than as pre-formatted text so the renderer decides how it
+    /// looks and this module keeps knowing nothing about a terminal.
+    pub update: Option<prune_juice_core::update::Notice>,
+
     pub should_quit: bool,
 }
 
@@ -164,8 +169,13 @@ impl App {
             seen_images: 0,
             seen_volumes: 0,
             seen_networks: 0,
+            update: None,
             should_quit: false,
         }
+    }
+
+    pub fn note_update(&mut self, notice: prune_juice_core::update::Notice) {
+        self.update = Some(notice);
     }
 
     pub fn note_resource(&mut self, kind: ResourceKind) {
@@ -1109,6 +1119,28 @@ mod tests {
             "both are irreversible volumes, so both get copied first"
         );
         assert!(app.selected_unpreservable().is_empty());
+    }
+
+    #[test]
+    fn a_new_release_is_not_scan_state_and_survives_a_new_report() {
+        // The inverse of the rule below. A selection indexes into a list a
+        // rescan replaces, so carrying it over would act on the wrong row; an
+        // available release is a fact about the world outside this scan, and
+        // forgetting it every time the user presses `r` would be a bug.
+        let mut app = reviewable_app();
+        app.note_update(prune_juice_core::update::Notice {
+            current: "0.1.0".into(),
+            latest: "0.2.0".into(),
+            notes_url: None,
+            origin: prune_juice_core::update::Origin::Standalone,
+        });
+        let rep = report(vec![]);
+        let plan = Planner::plan(&rep, NOW);
+        app.ready(rep, plan);
+        assert_eq!(
+            app.update.as_ref().map(|u| u.latest.as_str()),
+            Some("0.2.0")
+        );
     }
 
     #[test]

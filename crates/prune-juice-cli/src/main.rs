@@ -18,6 +18,7 @@ use prune_juice_core::model::{Bytes, Confidence, Liveness, ResourceKind};
 use prune_juice_core::plan::tier::{Reversibility, Tier};
 use prune_juice_core::plan::{Plan, Planner};
 use prune_juice_core::scan::{ScanOptions, ScanReport, Scanner};
+use prune_juice_core::update::{self, Decision};
 use prune_juice_core::vault::Vault;
 use prune_juice_core::waiver::Waivers;
 use prune_juice_core::Error;
@@ -73,6 +74,17 @@ OPTIONS:
     --vault-restore ID  Recreate a volume from a preserved copy
     --vault-forget ID   Delete a preserved copy. Irreversible, so it needs
                         --reason, same as a waiver.
+
+    --check-update      Ask now whether a newer release exists
+    --update            Install the newest release. Refuses when a package
+                        manager owns this binary, and names the command that
+                        manager wants instead.
+    --update-check on|off
+                        Turn the automatic once-a-day check on or off and
+                        remember the answer
+    --no-update-check   Skip the automatic check for this run only
+                        (PRUNE_JUICE_NO_UPDATE_CHECK=1 does the same)
+    -V, --version       Print the version
     -h, --help          Show this help
 
 With no arguments on a terminal, `prune-juice` opens an interactive
@@ -82,6 +94,11 @@ instead, so it composes in a script without special-casing.
 Tier `free` is the only one safe without review. Every other tier is an
 explicit choice about a cost you are accepting — run without --apply first
 and read what it says it would do.
+
+An automatic check runs at most once a day, in the background, on a terminal
+only. It never delays a scan and never fails one: if the release server cannot
+be reached the run is unaffected and nothing is said. Notices go to stderr, so
+they stay out of --json and out of anything you pipe.
 
 EXIT CODES:
     0  nothing needing attention
@@ -109,6 +126,18 @@ struct Args {
     vault_cmd: Option<VaultCmd>,
     waiver_cmd: Option<WaiverCmd>,
     reason: Option<String>,
+    update_cmd: Option<UpdateCmd>,
+    no_update_check: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpdateCmd {
+    /// Ask now, and say what the answer is either way.
+    Check,
+    /// Ask, and install if there is something newer.
+    Install,
+    /// Remember whether the automatic check should run.
+    Automatic(bool),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -144,6 +173,8 @@ fn parse_args() -> Result<Args, String> {
         vault_cmd: None,
         waiver_cmd: None,
         reason: None,
+        update_cmd: None,
+        no_update_check: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -190,6 +221,26 @@ fn parse_args() -> Result<Args, String> {
                 a.vault_cmd = Some(VaultCmd::Restore(
                     it.next().ok_or("--vault-restore needs an entry id")?,
                 ))
+            }
+            "--check-update" => a.update_cmd = Some(UpdateCmd::Check),
+            "--update" => a.update_cmd = Some(UpdateCmd::Install),
+            "--update-check" => {
+                let v = it.next().ok_or("--update-check needs `on` or `off`")?;
+                a.update_cmd = Some(match v.as_str() {
+                    "on" => UpdateCmd::Automatic(true),
+                    "off" => UpdateCmd::Automatic(false),
+                    other => {
+                        return Err(format!("--update-check takes `on` or `off`, not {other}"))
+                    }
+                });
+            }
+            "--no-update-check" => a.no_update_check = true,
+            "-V" | "--version" => {
+                // Two words, version last. `--update` parses this from the
+                // binary it just downloaded before it will install it, so the
+                // shape is load-bearing rather than cosmetic.
+                println!("prune-juice {}", update::current_version());
+                std::process::exit(0);
             }
             "--apply" => a.apply = true,
             "--tiers" => {
@@ -482,12 +533,146 @@ fn run_waivers(cmd: &WaiverCmd, reason: Option<&str>) -> Result<i32, Error> {
     }
 }
 
+/// The explicit update commands.
+///
+/// These are foreground and synchronous, unlike the automatic check: the user
+/// asked, so waiting a moment and hearing the answer — including a failure —
+/// is the point. The automatic path is the one that must never be felt.
+fn run_update(cmd: UpdateCmd) -> Result<i32, Error> {
+    if let UpdateCmd::Automatic(on) = cmd {
+        let path = update::set_automatic_checks(on)?;
+        println!(
+            "  automatic update checks are {}  ({})",
+            if on { "on" } else { "off" },
+            path.display()
+        );
+        return Ok(0);
+    }
+
+    if update::verify::release_key().is_none() {
+        return Err(Error::Config(
+            "this build has no release-signing key, so it cannot verify an update. \
+             Install from a release build, or upgrade the way you installed it."
+                .into(),
+        ));
+    }
+    if !update::net::Curl::available() {
+        return Err(Error::Config(
+            "curl was not found, and it is how updates are fetched".into(),
+        ));
+    }
+
+    let exe = std::env::current_exe().map_err(Error::Io)?;
+    let origin = update::Origin::detect(&exe);
+    let curl = update::net::Curl;
+    // A forced refresh, not the cached answer: someone who typed the command
+    // wants today's answer, not yesterday's.
+    let checker = update::Checker::new(&curl, now_unix()).with_origin(origin.clone());
+
+    eprint!("checking for a newer release… ");
+    io::stderr().flush().ok();
+    let manifest = match checker.fetch_manifest() {
+        Ok(m) => {
+            eprintln!("ok");
+            m
+        }
+        Err(e) => {
+            eprintln!("failed");
+            // Exit 5, not 1: nothing is wrong with this machine, the check
+            // did not complete. A script can tell those apart.
+            eprintln!("error: {e}");
+            return Ok(5);
+        }
+    };
+
+    if !update::is_newer(update::current_version(), &manifest.version)? {
+        println!(
+            "  prune-juice {} is the newest release.",
+            update::current_version()
+        );
+        return Ok(0);
+    }
+
+    let notice = update::Notice {
+        current: update::current_version().to_string(),
+        latest: manifest.version.clone(),
+        notes_url: manifest.notes_url.clone(),
+        origin: origin.clone(),
+    };
+    println!();
+    for line in notice.lines() {
+        println!("  {line}");
+    }
+    if let Some(url) = &notice.notes_url {
+        println!("  {url}");
+    }
+    println!();
+
+    if cmd == UpdateCmd::Check {
+        // A finding, in the same sense as reclaimable space: something is
+        // there for you to act on.
+        return Ok(1);
+    }
+
+    eprintln!("downloading and verifying…");
+    let done = update::install::install(&curl, &manifest, &origin, &exe)?;
+    println!(
+        "  installed prune-juice {} at {} ({})",
+        done.version,
+        done.path.display(),
+        Bytes(done.bytes).human()
+    );
+    println!("  the copy already running is unchanged; the next invocation is the new one.");
+    Ok(0)
+}
+
+/// Should this run mention an update at the end?
+///
+/// Deliberately as conservative as `wants_tui`. A notice is for a person
+/// reading a terminal: not for a pipe, not for a log, not for CI, and never
+/// mixed into machine output.
+fn wants_update_notice(args: &Args) -> bool {
+    !args.json
+        && !args.no_update_check
+        && args.update_cmd.is_none()
+        && io::stdout().is_terminal()
+        && io::stderr().is_terminal()
+        && std::env::var("CI").is_err()
+        && update::automatic_checks().is_ok()
+}
+
+/// Print whatever the background check found, if it found anything in time.
+///
+/// The 250 ms grace exists because the alternative is worse in the common
+/// case: a cached answer is ready almost immediately, and a bare `try_recv`
+/// would lose it to a race for no benefit. It is not a wait on the network —
+/// the check has had the whole scan to finish, and if it has not, the answer
+/// is already in the cache for next time.
+fn report_update(rx: Option<&std::sync::mpsc::Receiver<Decision>>) {
+    let Some(rx) = rx else { return };
+    let Ok(decision) = rx.recv_timeout(std::time::Duration::from_millis(250)) else {
+        return;
+    };
+    // Anything other than "there is a newer version" is silence. A failed
+    // check is not news, and telling someone their update check failed while
+    // they were reclaiming disk is noise.
+    if let Decision::Available(notice) = decision {
+        eprintln!();
+        for line in notice.lines() {
+            eprintln!("  {line}");
+        }
+    }
+}
+
 fn run(args: &Args) -> Result<i32, Error> {
     if let Some(cmd) = &args.waiver_cmd {
         return run_waivers(cmd, args.reason.as_deref());
     }
     if let Some(cmd) = &args.vault_cmd {
         return run_vault(cmd, args.reason.as_deref());
+    }
+    if let Some(cmd) = args.update_cmd {
+        return run_update(cmd);
     }
     let cancel = Cancel::new();
 
@@ -522,8 +707,16 @@ fn run(args: &Args) -> Result<i32, Error> {
             endpoint: ctx.endpoint.clone(),
             context: ctx.name.clone(),
             scan: opts,
+            // The interface is a terminal by definition, so the only question
+            // left is whether the user asked for silence.
+            update_check: !args.no_update_check,
         });
     }
+
+    // Started before the scan and read after it, on a thread of its own. By
+    // the time the report is rendered the answer is either here or it is not,
+    // and either way the scan ran at full speed.
+    let update = wants_update_notice(args).then(|| update::spawn_check(now_unix()));
 
     // One index for the whole run. A failure to open it degrades the scan
     // rather than stopping it: attribution gets worse, nothing gets unsafe.
@@ -659,6 +852,9 @@ fn run(args: &Args) -> Result<i32, Error> {
     if !any {
         return Err(last_err.unwrap_or(Error::NoContext));
     }
+    // Last, after the report and the receipt: an update notice is the least
+    // important thing on the screen and should read as a footnote.
+    report_update(update.as_ref());
     Ok(exit)
 }
 

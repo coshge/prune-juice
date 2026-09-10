@@ -1,0 +1,89 @@
+name: ci
+
+on:
+  push:
+    branches: [production]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The scan gates on this to stay non-interactive, and the update checker
+  # gates on it to stay silent. Both behaviours are worth exercising here.
+  CI: "1"
+
+jobs:
+  rust:
+    name: rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+      # The seam that makes the Docker client replaceable. It is only a seam
+      # while this keeps compiling, so it is checked rather than trusted.
+      - name: core builds without the bollard client
+        run: cargo build -p prune-juice-core --no-default-features
+
+      # A distribution that manages its own upgrades builds without the
+      # updater. That configuration has to keep working too.
+      - name: core builds without the updater
+        run: cargo build -p prune-juice-core --no-default-features --features bollard-client
+
+      # No daemon on the runner, so this exercises the documented exit code
+      # for an unreachable one rather than a scan.
+      - name: an unreachable daemon exits 3
+        run: |
+          cargo build -p prune-juice-cli
+          set +e
+          DOCKER_HOST=unix:///nonexistent.sock ./target/debug/prune-juice --no-tui --json
+          code=$?
+          set -e
+          [ "$code" = 3 ] || { echo "expected exit 3, got $code"; exit 1; }
+
+  swift:
+    name: swift app
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: app/PruneJuice/.build
+          key: spm-${{ runner.os }}-${{ hashFiles('app/PruneJuice/Package.resolved') }}
+
+      - run: swift build
+        working-directory: app/PruneJuice
+      - run: swift test
+        working-directory: app/PruneJuice
+
+      # Assembling the bundle is the only thing that checks the Info.plist,
+      # the Sparkle framework copy and the signing order — none of which a
+      # `swift build` touches. Unsigned and keyless here, which is also the
+      # configuration where the app must report "no updates available to me"
+      # rather than half-starting an updater.
+      - run: ./scripts/bundle.sh
+        working-directory: app/PruneJuice
+      - name: the bundle carries Sparkle and its helper
+        working-directory: app/PruneJuice
+        run: |
+          test -x dist/PruneJuice.app/Contents/MacOS/prune-juice
+          test -d dist/PruneJuice.app/Contents/Frameworks/Sparkle.framework
+          test -f dist/PruneJuice.app/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate
+          codesign --verify --strict --verbose=2 dist/PruneJuice.app

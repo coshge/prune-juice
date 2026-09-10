@@ -21,6 +21,8 @@ pub mod plan;
 pub mod probe;
 pub mod providers;
 pub mod scan;
+#[cfg(feature = "updater")]
+pub mod update;
 pub mod vault;
 pub mod waiver;
 

@@ -32,6 +32,7 @@ use prune_juice_core::execute::{ExecuteOptions, Executor, Mode, Receipt};
 use prune_juice_core::plan::tier::Tier;
 use prune_juice_core::plan::{Plan, Planner};
 use prune_juice_core::scan::{ScanOptions, ScanReport, Scanner};
+use prune_juice_core::update;
 use prune_juice_core::Error;
 
 use app::{Action, App, Key, Screen};
@@ -62,6 +63,10 @@ pub struct TuiOptions {
     pub endpoint: String,
     pub context: String,
     pub scan: ScanOptions,
+    /// Whether the automatic once-a-day update check may run. The CLI has
+    /// already decided; this is only `--no-update-check` reaching the screen
+    /// the user is actually looking at.
+    pub update_check: bool,
 }
 
 fn now_unix() -> i64 {
@@ -126,11 +131,23 @@ fn event_loop(terminal: &mut Term, opts: TuiOptions) -> Result<i32, Error> {
     let (tx, rx) = mpsc::channel::<Msg>();
     spawn_scan(&opts, tx.clone(), cancel.clone());
 
+    // Its own thread and its own channel, never joined and never waited on.
+    // The scan is what the user is here for; if the check has not finished by
+    // the time they quit, the answer is in the cache for next time.
+    let updates = (opts.update_check && update::automatic_checks().is_ok())
+        .then(|| update::spawn_check(now_unix()));
+
     loop {
         // Drain whatever the workers have produced without blocking the
         // redraw. Doing this before drawing removes a full frame of latency
         // from progress emitted immediately before a slow Docker call.
         drain(&rx, &mut app);
+        if let Some(rx) = &updates {
+            // A poll, not a receive: this must never be able to stall a frame.
+            if let Ok(update::Decision::Available(notice)) = rx.try_recv() {
+                app.note_update(notice);
+            }
+        }
 
         terminal.draw(|f| ui::draw(f, &app)).map_err(Error::Io)?;
 
@@ -147,7 +164,14 @@ fn event_loop(terminal: &mut Term, opts: TuiOptions) -> Result<i32, Error> {
                             break;
                         }
                         Action::Rescan => {
+                            // A rescan replaces every fact on the screen, and
+                            // the available release is not one of them —
+                            // carried over deliberately, because the check
+                            // runs once per process and re-running it would
+                            // just re-read the cache.
+                            let carried = app.update.take();
                             app = App::new();
+                            app.update = carried;
                             spawn_scan(&opts, tx.clone(), cancel.clone());
                         }
                         Action::ReclaimFree => {

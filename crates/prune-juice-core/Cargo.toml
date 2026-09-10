@@ -8,8 +8,12 @@ license.workspace      = true
 repository.workspace   = true
 
 [features]
-default        = ["bollard-client"]
+default        = ["bollard-client", "updater"]
 bollard-client = ["dep:bollard", "dep:tokio", "dep:futures-util"]
+# The self-update checker. On by default; a distribution that manages its own
+# upgrades (Homebrew, a distro package) can build without it and the binary
+# then has no update code in it at all, rather than code that declines to run.
+updater        = ["dep:minisign-verify", "dep:semver"]
 
 [dependencies]
 serde.workspace      = true
@@ -21,6 +25,9 @@ etcetera.workspace   = true
 sha2.workspace       = true
 flate2.workspace     = true
 tar.workspace        = true
+
+minisign-verify = { workspace = true, optional = true }
+semver          = { workspace = true, optional = true }
 
 bollard      = { workspace = true, optional = true }
 tokio        = { workspace = true, optional = true }
