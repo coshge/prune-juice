@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members  = ["crates/*", "xtask"]
+
+# prune-juice-ffi is deliberately absent. A staticlib crate slows every workspace
+# build and breaks `cargo install` for zero present benefit. Subprocess is the
+# shipping architecture; UniFFI is an optimisation, not a scheduled milestone.
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2021"
+rust-version = "1.85"
+license      = "MIT"
+repository   = "https://github.com/coshge/prune-juice"
+
+[workspace.dependencies]
+bollard      = { version = "0.19", default-features = false, features = ["pipe", "http"] }
+tokio        = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+futures-util = "0.3"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+thiserror    = "2"
+rusqlite     = { version = "0.32", features = ["bundled"] }
+uuid         = { version = "1", features = ["v4", "serde"] }
+etcetera     = "0.8"
+anyhow       = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

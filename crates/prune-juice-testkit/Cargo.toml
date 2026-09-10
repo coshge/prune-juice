@@ -1,0 +1,12 @@
+[package]
+name        = "prune-juice-testkit"
+description = "Recorded fixtures and a replay Docker client. Dev-only."
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish     = false
+
+[dependencies]
+prune-juice-core = { path = "../prune-juice-core" }
+serde_json.workspace = true

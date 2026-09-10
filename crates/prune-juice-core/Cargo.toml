@@ -1,0 +1,24 @@
+[package]
+name        = "prune-juice-core"
+description = "Docker disk-usage analysis, provenance attribution and safe deletion planning"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[features]
+default        = ["bollard-client"]
+bollard-client = ["dep:bollard", "dep:tokio", "dep:futures-util"]
+
+[dependencies]
+serde.workspace      = true
+serde_json.workspace = true
+thiserror.workspace  = true
+rusqlite.workspace   = true
+uuid.workspace       = true
+etcetera.workspace   = true
+
+bollard      = { workspace = true, optional = true }
+tokio        = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }

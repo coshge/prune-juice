@@ -1,0 +1,16 @@
+[package]
+name        = "prune-juice-cli"
+description = "Prune Juice command-line interface"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[[bin]]
+name = "prune-juice"
+path = "src/main.rs"
+
+[dependencies]
+prune-juice-core = { path = "../prune-juice-core" }
+serde_json.workspace = true
