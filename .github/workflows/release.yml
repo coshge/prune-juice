@@ -198,24 +198,38 @@ jobs:
           zip="$1"
           [ -f "$zip" ] || { echo "no update archive in dist/" >&2; exit 1; }
 
-          # Straight to a file rather than through `$(…)`: whatever the tool
-          # says when it fails then reaches the log instead of being swallowed
-          # as output. `--ed-key-file -` reads the key from stdin, so it never
-          # touches the keychain, the filesystem, or an argument list.
-          printf '%s' "$SPARKLE_PRIVATE_KEY" \
-            | "$tool" -p --ed-key-file - "$zip" > dist/ed-signature.txt
+          # `--ed-key-file -` reads the key from stdin, so it never touches the
+          # keychain, the filesystem, or an argument list.
+          #
+          # This tool reports its failures on **stdout**, which is also where
+          # the signature comes from. Redirecting to a file and letting
+          # `set -e` abort therefore produced a step that failed in 80 ms with
+          # an empty log — twice: once on the legacy DSA script's usage text,
+          # once on a key the tool rejected, with no way to see that it had
+          # said so. So the failure branch prints what was captured.
+          if ! printf '%s' "$SPARKLE_PRIVATE_KEY" \
+               | "$tool" -p --ed-key-file - "$zip" > dist/ed-signature.txt; then
+            echo "sign_update failed. It said:" >&2
+            cat dist/ed-signature.txt >&2
+            exit 1
+          fi
           sig="$(cat dist/ed-signature.txt)"
           case "$sig" in
-            "" | *Usage* | *" "*)
-              echo "sign_update produced no signature, but: $sig" >&2
+            "" | *Usage* | *rror* | *" "*)
+              echo "sign_update printed this instead of a signature:" >&2
+              echo "$sig" >&2
               exit 1 ;;
           esac
 
           # A signature that verifies is a signature. Checked here, because the
           # alternative place to discover it is an installed app that quietly
           # refuses every update.
-          printf '%s' "$SPARKLE_PRIVATE_KEY" \
-            | "$tool" --verify --ed-key-file - "$zip" "$sig"
+          if ! printf '%s' "$SPARKLE_PRIVATE_KEY" \
+               | "$tool" --verify --ed-key-file - "$zip" "$sig" > /tmp/verify.log 2>&1; then
+            echo "the signature just produced does not verify:" >&2
+            cat /tmp/verify.log >&2
+            exit 1
+          fi
           echo "signed and verified $zip"
 
       - uses: actions/upload-artifact@v4
