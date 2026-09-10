@@ -73,8 +73,10 @@ no terminal, so that file is the only way to see why a scan failed.
   image and routes to `repullable` (bandwidth only) or `rebuildable` (time, and
   an old build may not reproduce). Both are opt-in through the interactive
   review flow; `--tiers` is the non-interactive equivalent.
-- **The app reads only.** It scans, classifies and shows evidence; reclaiming
-  is still `prune-juice --apply` in a terminal.
+- **The app uses the bundled CLI for all operations.** It scans, previews and
+  reclaims whole tiers after review, manages the vault and waivers, and exposes
+  all scan options. Keep the AppKit window lifecycle and CLI safety checks.
+  See `app/PruneJuice/README.md` for UI coverage and verification.
 - **Docker Desktop is a first-class target.** Its data root lives inside a VM,
   so `VolumeAccess::detect` reports unavailable and the scan falls back to
   `DockerProbe` — a throwaway container with the volumes bound read-only, no
@@ -101,6 +103,10 @@ no terminal, so that file is the only way to see why a scan failed.
   with space, `d` to act, and it goes via a confirm screen that states the
   re-pull, rebuild, vault or permanent-loss cost. Only `y` proceeds; every other
   key backs out. Never straight from a list keypress to a deletion.
+- **Apply progress is emitted around the blocking call.** `ApplyProgress::Removing`
+  is sent before asking Docker to delete an item, followed by its terminal
+  outcome. The TUI forwards these events directly and keeps only ten activity
+  lines, so a slow daemon remains visibly active without large-run UI overhead.
 - **`--only-label` skips the build cache entirely.** Build cache records carry
   no labels, so the fence cannot be honoured for them; pruning it anyway would
   break the promise the flag makes.
@@ -206,8 +212,10 @@ All have regression tests — if you break one, a test will tell you.
     locally built images, so `fen-wordpress@sha256:…` looks pullable and is
     not. Check for a local build context *first*; fall back to the digest.
 31. **An image is always `Referenced::Unknown`** (layers unfetched), so the
-    live-container check never fires for one. Ask `graph.image_is_live()`
-    directly — otherwise an image serving a running container can be offered.
+    generic container check never fires for one. Ask `graph.image_containers()`
+    directly. Running containers protect the image; stopped containers block
+    it until they are reclaimed and a rescan proves the image is unlocked.
+    Docker refuses both without force, and force remains forbidden.
 32. **Every opt-in tier must state its price.** `Tier::caveat()` is not
     decoration; a tier a user cannot cost is a tier they cannot consent to.
 33. **Permission to delete is a value, not a flag.** `SafeToDelete` has private

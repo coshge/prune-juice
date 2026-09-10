@@ -136,6 +136,93 @@ Three independent properties, all required:
 The run-level summary states the third property as a number rather than a
 promise, and the word "irreversible" only ever appears beside a non-zero one.
 
+## Resource labels and their exact criteria
+
+The Mac app and CLI use the same classifier. Labels describe why a resource can
+or cannot be offered for cleanup. They are not simply age or last-used categories.
+Select a resource in the Mac app to see its **Why** and **Evidence**.
+
+| Mac app label | CLI tier | Criteria |
+| --- | --- | --- |
+| **Protected** | `protected` | A known reference or explicit protection keeps the resource out of cleanup. Examples include volumes held by live containers, volumes declared by an existing Compose project, attached networks, built-in Docker networks (`bridge`, `host`, `none`), and matching waivers. Images remain protected while **any container, including a stopped one**, references them. An image without an identified recovery route stays protected unless it qualifies as orphaned. |
+| **Safe** | `free` | Proven unreferenced, reconstructible, safe to remove without losing other resources' provenance, and created **at least 24 hours ago**. Creation time must be known. Additional resource-specific checks are listed below. Images never enter this tier. |
+| **Pull again** | `repullable` | An image has no referencing containers and its recovery route is a recorded registry digest. Local-build detection takes precedence. The scanner does **not** contact the registry to verify availability. |
+| **Build again** | `rebuildable` | An image has no referencing containers, its name matches the local `<project>-<service>` pattern, the project directory exists, and a recognised Dockerfile is found. The suggested recovery command is `docker compose build <service>`. The scanner does **not** run the build or verify that the Compose service reproduces the image. |
+| **Orphaned** | `orphan` | A **Strong or stronger ownership claim** identifies a project absent across **at least two consecutive scans**, with no competing claim pointing to an existing project. A missing parent directory makes the project unverifiable instead. Live-container references block this classification. Recoverable images normally become Pull again or Build again first. |
+| **Dormant** | `stale` | Generally an unreferenced resource that fails a Safe requirement: meaningful or unreadable volume contents, recent volume writes, container writable-layer data, provenance that would be lost, or creation less than 24 hours ago. Insufficient ownership evidence sends many of these cases to Unattributed instead. **There is no inactivity period that defines Dormant.** |
+| **Unattributed** | `unattributed` | There is not enough evidence to offer cleanup. This can mean uncertain references, missing visibility, insufficient ownership evidence for a risky resource, or missing creation time. A project name can still be known. Never offered for deletion. |
+
+**Dormant is broader than its name suggests.** A newly created resource or a volume
+written recently can receive this label. It does not prove that the project has
+been unused for days or weeks. Read the individual reason before selecting it.
+
+### Additional Safe checks by resource kind
+
+- **Volumes:** inspection must identify empty contents or a recognised regenerable
+  dependency/cache tree. The recognised top-level markers are `node_modules`,
+  `vendor`, `registry`, `.cache`, `_cacache`, and `cache`. A marker must be the
+  **only meaningful top-level entry**, ignoring housekeeping entries such as
+  `.DS_Store` and `lost+found`. A checkout containing `vendor` alongside application
+  files does not qualify. Database signatures take precedence over cache markers.
+  Database contents, user data, unknown contents, and uninspected volumes are not
+  Safe. If the newest observed write is **less than 24 hours ago**, the volume
+  cannot be Safe.
+- **Containers:** recorded writable-layer size must be zero. Any positive size
+  makes deletion irreversible; above 50 MB the classifier also gives a specific
+  writable-layer warning. The current implementation treats an **unknown
+  writable-layer size as zero**, which is a limitation. Mounted-volume provenance
+  must have been durably recorded, and removal must not lose the last unrecorded
+  project-path evidence.
+- **Networks:** must be unreferenced, non-built-in, and pass the creation-age check.
+- **Build cache:** handled separately as Docker-reported reclaimable cache rather
+  than classified rows. It is included when Safe is selected, unless sizing is
+  disabled or a label filter is active.
+
+### Recovery detection and classification order
+
+Local image recovery uses the first image tag, falling back to its name. A bare
+repository name without `/` is split at its last hyphen into project and service.
+The scanner looks up that project in its catalog and configured project roots.
+It checks `Dockerfile`, `docker/Dockerfile`, `docker/wordpress/Dockerfile`,
+`Dockerfile.nginx`, and directories up to two levels below the project for a
+`Dockerfile`. This is a recovery heuristic, not a verified build recipe. A
+local-looking name with a missing project or Dockerfile is considered unrecoverable
+by this route; it does not automatically fall back to a registry digest.
+
+Otherwise, the first recorded registry digest supplies the pull command. Neither
+registry availability nor build reproducibility is tested during a scan.
+
+Order matters: live references are checked first; image container references and
+recovery routes have their own branch. Built-in networks are protected. Unknown
+reference status blocks the general path. Confirmed orphan ownership is considered
+before the general reconstructibility, provenance, and age gates. The 24-hour
+creation gate therefore applies to **Safe**, not to every offered tier. A waiver
+overrides the resulting classification to Protected.
+
+### A label is not a deletion guarantee
+
+Cleanup rechecks the resource against a fresh scan, applies the selected tiers and
+label filter, and lets Docker refuse removal without force. Protected and
+Unattributed resources are never offered. Images held by stopped containers need
+those containers removed and another scan before they can become actionable.
+
+Irreversible **volumes** require a vault copy that has been written, re-read, and
+verified before removal. Disabling the vault or failing preservation leaves the
+volume alone. This preservation guarantee does **not** extend to container
+writable layers or unrecoverable images.
+
+The selected reclaim total is an estimate from known resource sizes, plus eligible
+build cache when Safe is selected. Unknown sizes are not counted, image totals can
+count shared layers more than once, and Docker can refuse items during cleanup.
+Docker logical bytes and host-measured physical reclamation are separate results.
+
+Implementation references: [tier classification](crates/prune-juice-core/src/plan/tier.rs),
+[reference graph](crates/prune-juice-core/src/plan/graph.rs),
+[image recovery](crates/prune-juice-core/src/scan/mod.rs),
+[ownership and orphan detection](crates/prune-juice-core/src/providers/mod.rs),
+[volume content classification](crates/prune-juice-core/src/probe/mod.rs), and
+[execution and preservation](crates/prune-juice-core/src/execute/mod.rs).
+
 ## Two bugs worth knowing about
 
 Both were found by running the tool against a real machine, and both now have
@@ -313,7 +400,7 @@ Five blocks, and it is worth knowing what each one is claiming:
 | `SAFE TO RECLAIM` | proven reconstructible. `irreversible` is `0 B` or it is not here |
 | `IF YOU KNOW YOU CAN REBUILD` | real space, behind a cost you have to accept yourself |
 | `NEEDS REVIEW` | a verdict was reached, and it wants you to look at the evidence |
-| `UNATTRIBUTED` | ownership unknown. **Never offered for deletion, in any tier** |
+| `UNATTRIBUTED` | insufficient ownership or safety evidence. **Never offered for deletion, in any tier** |
 | `attribution` | how the 205 volumes were identified. `guess` can never license a delete |
 
 Progress goes to stderr, the report to stdout, so `prune-juice --no-tui > report.txt`
@@ -353,9 +440,18 @@ cannot consent to:
 
 Enter a review group, use `space` to tick individual rows or `a` to tick the
 group, `e` to inspect the evidence, and `d` to continue. The confirmation screen
-then spells out every selected cost before `y` can proceed. After the receipt,
-press `r` to scan again and expose volumes that were previously referenced by
-the stopped containers just removed.
+then spells out every selected cost before `y` can proceed. A receipt is a
+workflow checkpoint, not an automatic exit: press `Enter` to scan again and
+continue, or `q` to quit. After Reclaim, the receipt calls out how many images
+may now be unlocked for the pullable/rebuildable review. Images held by stopped
+containers are never offered prematurely: Docker will refuse them without
+force, so the main Reclaim row states how many images its container cleanup
+will unlock.
+
+While cleanup runs, the interface shows the current preflight or Docker action,
+an item counter, and a rolling activity log. The "removing" line is displayed
+before each Docker call, so a slow image or container deletion remains visibly
+active rather than looking frozen. The log is bounded to keep large runs fast.
 
 `--tiers` remains available for non-interactive automation, but is not required
 to reach any reclaimable tier.
@@ -633,6 +729,8 @@ Rust 1.85+. No system libraries — SQLite is bundled. `cargo build --workspace`
 
 M1 read-only scan · M2 planner and safe tier · M3 interactive TUI · M4 content
 probe and vault · M5 review actions, waivers, host disk measurement — all done.
-The provenance index is in too. M6, the macOS app, is next.
+The provenance index is in too. The macOS app now includes resource inspection,
+tier cleanup, vault operations, waivers, and scan settings. See the
+[Mac app guide](app/PruneJuice/README.md) for building and verification.
 
 MIT.

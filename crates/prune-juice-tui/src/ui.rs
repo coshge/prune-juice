@@ -413,21 +413,47 @@ fn confirm(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn applying(f: &mut Frame, area: Rect, app: &App) {
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("  {}", app.status),
-                Style::default().fg(WARN),
-            )),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Re-checking every item against a fresh scan before touching it.",
-                Style::default().fg(DIM),
-            )),
-        ]),
-        area,
-    );
+    let progress = if app.apply_total > 0 {
+        format!("  Applying cleanup  {}/{}", app.apply_done, app.apply_total)
+    } else {
+        "  Preparing cleanup".into()
+    };
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            progress,
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!("  {}", app.status),
+            Style::default().fg(WARN),
+        )),
+        Line::from(""),
+        Line::from(Span::styled("  Recent activity", Style::default().fg(DIM))),
+    ];
+
+    let max_width = usize::from(area.width).saturating_sub(4);
+    for entry in app.apply_log() {
+        let colour = if entry.starts_with('✓') {
+            GOOD
+        } else if entry.starts_with('!') {
+            BAD
+        } else {
+            DIM
+        };
+        lines.push(Line::from(Span::styled(
+            format!("  {}", clip(entry, max_width)),
+            Style::default().fg(colour),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Each item is re-checked immediately before removal. q cancels after the current item.",
+        Style::default().fg(DIM),
+    )));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn finished(f: &mut Frame, area: Rect, app: &App) {
@@ -464,6 +490,28 @@ fn finished(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(DIM),
         )));
     }
+
+    lines.push(Line::from(""));
+    let unlocked = app.reclaim_follow_up_images();
+    if unlocked > 0 {
+        let noun = if unlocked == 1 { "image" } else { "images" };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  Next: scan again to review up to {unlocked} {noun} this Reclaim may have unlocked."
+            ),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Next: scan again to refresh what remains and continue cleanup.",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "  Press Enter to continue.",
+        Style::default().fg(ACCENT),
+    )));
+
     for i in &r.items {
         use prune_juice_core::execute::ItemOutcome;
         match &i.outcome {
@@ -498,8 +546,8 @@ fn hints(f: &mut Frame, area: Rect, app: &App) {
         Screen::Main => "↑↓ move   ↵ select   q quit",
         Screen::Review => "↑↓ move   space tick   a all   e evidence   d act on ticked   esc back",
         Screen::Confirm => "y go ahead   any other key cancels",
-        Screen::Applying => "working…",
-        Screen::Finished => "r scan again   any other key quits",
+        Screen::Applying => "working…   q cancel safely",
+        Screen::Finished => "↵ continue (scan again)   r scan again   q quit",
     };
     f.render_widget(
         Paragraph::new(Span::styled(format!("  {text}"), Style::default().fg(DIM))),
@@ -521,6 +569,8 @@ mod tests {
     use super::*;
     use crate::app::{Key, Screen};
     use prune_juice_core::docker::DaemonIdentity;
+    use prune_juice_core::event::ApplyStage;
+    use prune_juice_core::execute::Receipt;
     use prune_juice_core::model::{
         DaemonId, Recovery, ResourceKind, ResourceSummary, RuntimeFlavor, Totals,
     };
@@ -636,6 +686,58 @@ mod tests {
             app.screen = screen;
             let _ = render_at(&app, 100, 30);
         }
+    }
+
+    #[test]
+    fn finished_screen_makes_continuation_the_obvious_next_step() {
+        let mut app = demo_app();
+        app.receipt = Some(Receipt {
+            daemon: DaemonId("D".into()),
+            started_unix: NOW,
+            simulated: false,
+            items: vec![],
+            build_cache_reclaimed: Bytes::ZERO,
+            docker_reported: Bytes::ZERO,
+            predicted: Bytes::ZERO,
+            reclamation: None,
+        });
+        app.screen = Screen::Finished;
+
+        let out = render_at(&app, 110, 30);
+        assert!(out.contains("Next: scan again"), "{out}");
+        assert!(out.contains("Press Enter to continue"), "{out}");
+        assert!(out.contains("q quit"), "{out}");
+        assert!(!out.contains("any other key quits"), "{out}");
+    }
+
+    #[test]
+    fn applying_screen_shows_live_progress_and_recent_activity() {
+        let mut app = demo_app();
+        app.begin_apply("re-checking Docker state…");
+        app.note_activity("safety scan complete");
+        app.note_apply_progress(
+            ApplyStage::Removed,
+            Some(ResourceKind::Container),
+            Some("site-web-1".into()),
+            1,
+            3,
+        );
+        app.note_apply_progress(
+            ApplyStage::Removing,
+            Some(ResourceKind::Image),
+            Some("site-wordpress:latest".into()),
+            1,
+            3,
+        );
+
+        let out = render_at(&app, 110, 30);
+        assert!(out.contains("Applying cleanup  1/3"), "{out}");
+        assert!(
+            out.contains("removing image site-wordpress:latest"),
+            "{out}"
+        );
+        assert!(out.contains("Recent activity"), "{out}");
+        assert!(out.contains("removed  container site-web-1"), "{out}");
     }
 
     #[test]

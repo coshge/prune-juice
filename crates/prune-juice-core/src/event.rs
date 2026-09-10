@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
 use crate::model::{
-    Bytes, DaemonId, ProjectSummary, ResourceId, ResourceSummary, RuntimeFlavor, SizeSource, Totals,
+    Bytes, DaemonId, ProjectSummary, ResourceId, ResourceKind, ResourceSummary, RuntimeFlavor,
+    SizeSource, Totals,
 };
 
 /// Everything the engine reports while working.
@@ -81,6 +82,15 @@ pub enum Event {
         owner: Option<String>,
         provenance: Vec<String>,
     },
+    /// Fine-grained apply feedback. `Removing` is emitted before the Docker
+    /// call so a slow daemon operation never looks like a frozen interface.
+    ApplyProgress {
+        stage: ApplyStage,
+        kind: Option<ResourceKind>,
+        name: Option<String>,
+        done: u32,
+        total: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +102,21 @@ pub enum Phase {
     Sizing,
     Probing,
     Attributing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyStage {
+    Checking,
+    Preserving,
+    Removing,
+    Removed,
+    WouldRemove,
+    Skipped,
+    Refused,
+    Failed,
+    PruningBuildCache,
+    MeasuringHost,
 }
 
 /// Where events go. Implementations must be cheap and non-blocking; the engine

@@ -6,6 +6,7 @@
 //!     cargo run -p prune-juice-tui --example preview
 
 use prune_juice_core::docker::DaemonIdentity;
+use prune_juice_core::event::ApplyStage;
 use prune_juice_core::model::{
     Bytes, DaemonId, Recovery, ResourceKind, ResourceSummary, RuntimeFlavor, Totals,
 };
@@ -157,6 +158,32 @@ fn main() {
     app.screen = Screen::Confirm;
     println!("\n=== CONFIRM ===");
     print!("{}", render(&app, w, 20));
+
+    app.begin_apply("safety scan complete; beginning cleanup…");
+    app.note_activity("re-checking Docker state before deleting anything…");
+    app.note_apply_progress(
+        ApplyStage::Removed,
+        Some(ResourceKind::Container),
+        Some("redkite-wordpress-1".into()),
+        12,
+        153,
+    );
+    app.note_apply_progress(
+        ApplyStage::Removed,
+        Some(ResourceKind::Container),
+        Some("fen-wordpress-1".into()),
+        13,
+        153,
+    );
+    app.note_apply_progress(
+        ApplyStage::Removing,
+        Some(ResourceKind::Container),
+        Some("saffronfields-wordpress-1".into()),
+        13,
+        153,
+    );
+    println!("\n=== APPLYING ===");
+    print!("{}", render(&app, w, 18));
 
     // And the scanning screen, mid-flight.
     let mut scanning = App::new();

@@ -34,7 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsObserver = NotificationCenter.default.addObserver(
             forName: Settings.changed, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.syncStatusItem()
+            MainActor.assumeIsolated { self?.syncStatusItem() }
         }
 
         NSApp.activate(ignoringOtherApps: true)
@@ -54,6 +54,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         MainActor.assumeIsolated { !settings.showMenuBarIcon }
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard model.busy else { return .terminateNow }
+        showWindow()
+        let alert = NSAlert()
+        alert.messageText = "An operation is still running"
+        alert.informativeText = "Wait for it to finish before quitting so Prune Juice can show the complete result."
+        alert.addButton(withTitle: "Keep running")
+        alert.runModal()
+        return .terminateCancel
+    }
+
     private func showWindow() {
         if let window {
             window.makeKeyAndOrderFront(nil)
@@ -61,12 +72,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let root = RootView(model: model, settings: settings)
         let w = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 880, height: 640),
+            contentRect: NSRect(x: 0, y: 0, width: 1180, height: 780),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         w.title = "Prune Juice"
+        w.titlebarAppearsTransparent = true
+        w.toolbarStyle = .unified
+        w.minSize = NSSize(width: 980, height: 690)
         w.contentView = NSHostingView(rootView: root)
         w.center()
         w.isReleasedWhenClosed = false
@@ -128,6 +142,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             keyEquivalent: "q")
         appItem.submenu = appMenu
         main.addItem(appItem)
+
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        for (title, action, key) in [("Undo", Selector(("undo:")), "z"),
+                                     ("Cut", #selector(NSText.cut(_:)), "x"),
+                                     ("Copy", #selector(NSText.copy(_:)), "c"),
+                                     ("Paste", #selector(NSText.paste(_:)), "v"),
+                                     ("Select All", #selector(NSText.selectAll(_:)), "a")] {
+            editMenu.addItem(withTitle: title, action: action, keyEquivalent: key)
+        }
+        editItem.submenu = editMenu
+        main.addItem(editItem)
 
         let windowItem = NSMenuItem()
         let windowMenu = NSMenu(title: "Window")

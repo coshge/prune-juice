@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::disk::{reconcile, BackingStore, Reclamation};
 use crate::docker::{DockerMutate, DockerProbe};
 use crate::error::Result;
-use crate::event::{Cancel, Event, EventSink};
+use crate::event::{ApplyStage, Cancel, Event, EventSink};
 use crate::model::{Bytes, DaemonId, ResourceKind};
 use crate::plan::tier::Tier;
 use crate::plan::{Plan, Staleness};
@@ -254,6 +254,34 @@ impl<'a> Executor<'a> {
         });
 
         let mut plan = plan;
+        let item_is_selected = |item: &&crate::plan::PlanItem| {
+            opts.tiers.contains(&item.verdict.tier)
+                && opts
+                    .only_label
+                    .as_ref()
+                    .is_none_or(|(k, v)| item.labels.get(k).map(String::as_str) == Some(v.as_str()))
+                && opts
+                    .only_names
+                    .as_ref()
+                    .is_none_or(|names| names.contains(&item.name))
+        };
+        let includes_build_cache = opts.only_label.is_none()
+            && opts.only_names.is_none()
+            && opts.tiers.contains(&Tier::Free)
+            && plan.build_cache_reclaimable > Bytes::ZERO;
+        let total = plan.items.iter().filter(item_is_selected).count() as u32
+            + u32::from(includes_build_cache);
+        let mut done = 0u32;
+        let progress = |stage, kind, name, done| {
+            sink.emit(Event::ApplyProgress {
+                stage,
+                kind,
+                name,
+                done,
+                total,
+            });
+        };
+
         for item in plan.items.iter_mut() {
             if !opts.tiers.contains(&item.verdict.tier) {
                 continue;
@@ -278,6 +306,13 @@ impl<'a> Executor<'a> {
                 continue;
             };
 
+            progress(
+                ApplyStage::Checking,
+                Some(item.kind),
+                Some(item.name.clone()),
+                done,
+            );
+
             let hash = witness.evidence_hash().to_string();
             let record = |outcome: ItemOutcome| ReceiptItem {
                 kind: item.kind,
@@ -299,6 +334,13 @@ impl<'a> Executor<'a> {
                         message: format!("{name} was removed by something else"),
                         resource: None,
                     });
+                    done += 1;
+                    progress(
+                        ApplyStage::Skipped,
+                        Some(item.kind),
+                        Some(item.name.clone()),
+                        done,
+                    );
                     continue;
                 }
                 Err(s) => {
@@ -308,6 +350,13 @@ impl<'a> Executor<'a> {
                         resource: None,
                     });
                     items.push(record(ItemOutcome::Skipped(s)));
+                    done += 1;
+                    progress(
+                        ApplyStage::Skipped,
+                        Some(item.kind),
+                        Some(item.name.clone()),
+                        done,
+                    );
                     continue;
                 }
             };
@@ -315,6 +364,13 @@ impl<'a> Executor<'a> {
             if simulated {
                 items.push(record(ItemOutcome::WouldDelete));
                 freed = freed + item.size.unwrap_or(Bytes::ZERO);
+                done += 1;
+                progress(
+                    ApplyStage::WouldRemove,
+                    Some(item.kind),
+                    Some(item.name.clone()),
+                    done,
+                );
                 continue;
             }
 
@@ -328,17 +384,37 @@ impl<'a> Executor<'a> {
             // failure at any step leaves the volume exactly where it was.
             let mut preserved: Option<VaultEntry> = None;
             if item.verdict.reversibility.is_gone() && item.kind == ResourceKind::Volume {
+                progress(
+                    ApplyStage::Preserving,
+                    Some(item.kind),
+                    Some(item.name.clone()),
+                    done,
+                );
                 if !opts.vault {
                     // Declining to take a backup is not consent to lose data.
                     items.push(record(ItemOutcome::Refused(
                         "irreversible, and --no-vault was given, so it was left alone".into(),
                     )));
+                    done += 1;
+                    progress(
+                        ApplyStage::Refused,
+                        Some(item.kind),
+                        Some(item.name.clone()),
+                        done,
+                    );
                     continue;
                 }
                 let (Some(prober), Some(vault)) = (self.prober, self.vault) else {
                     items.push(record(ItemOutcome::Refused(
                         "irreversible, and no vault is configured to preserve it".into(),
                     )));
+                    done += 1;
+                    progress(
+                        ApplyStage::Refused,
+                        Some(item.kind),
+                        Some(item.name.clone()),
+                        done,
+                    );
                     continue;
                 };
                 let engine = item.engine;
@@ -365,11 +441,24 @@ impl<'a> Executor<'a> {
                     }
                     Err(e) => {
                         items.push(record(ItemOutcome::PreserveFailed(e.to_string())));
+                        done += 1;
+                        progress(
+                            ApplyStage::Failed,
+                            Some(item.kind),
+                            Some(item.name.clone()),
+                            done,
+                        );
                         continue;
                     }
                 }
             }
 
+            progress(
+                ApplyStage::Removing,
+                Some(item.kind),
+                Some(item.name.clone()),
+                done,
+            );
             let res = match w.kind() {
                 ResourceKind::Volume => mutate.remove_volume(w.name()),
                 ResourceKind::Image => mutate.remove_image(w.resource().as_str()),
@@ -386,17 +475,26 @@ impl<'a> Executor<'a> {
                         Some(e) => items.push(record(ItemOutcome::Preserved(e.id.clone()))),
                         None => items.push(record(ItemOutcome::Deleted)),
                     }
+                    done += 1;
+                    progress(
+                        ApplyStage::Removed,
+                        Some(item.kind),
+                        Some(item.name.clone()),
+                        done,
+                    );
                 }
                 Err(e) => {
                     let msg = e.to_string();
                     // "in use" from the daemon is not a bug on our side; it is
                     // the backstop catching a race we could not see.
-                    let outcome = if msg.to_ascii_lowercase().contains("in use") {
-                        ItemOutcome::Refused(msg)
+                    let (outcome, stage) = if msg.to_ascii_lowercase().contains("in use") {
+                        (ItemOutcome::Refused(msg), ApplyStage::Refused)
                     } else {
-                        ItemOutcome::Failed(msg)
+                        (ItemOutcome::Failed(msg), ApplyStage::Failed)
                     };
                     items.push(record(outcome));
+                    done += 1;
+                    progress(stage, Some(item.kind), Some(item.name.clone()), done);
                 }
             }
         }
@@ -413,16 +511,47 @@ impl<'a> Executor<'a> {
             && opts.tiers.contains(&Tier::Free)
             && plan.build_cache_reclaimable > Bytes::ZERO
         {
+            progress(
+                ApplyStage::PruningBuildCache,
+                Some(ResourceKind::BuildCache),
+                Some("build cache".into()),
+                done,
+            );
             if simulated {
                 cache_freed = plan.build_cache_reclaimable;
+                done += 1;
+                progress(
+                    ApplyStage::WouldRemove,
+                    Some(ResourceKind::BuildCache),
+                    Some("build cache".into()),
+                    done,
+                );
             } else if let Some(m) = self.mutate {
                 match m.prune_build_cache(super::plan::tier::MIN_AGE_SECS as u64) {
-                    Ok(b) => cache_freed = b,
-                    Err(e) => sink.emit(Event::Warning {
-                        code: "build_cache_prune_failed".into(),
-                        message: e.to_string(),
-                        resource: None,
-                    }),
+                    Ok(b) => {
+                        cache_freed = b;
+                        done += 1;
+                        progress(
+                            ApplyStage::Removed,
+                            Some(ResourceKind::BuildCache),
+                            Some("build cache".into()),
+                            done,
+                        );
+                    }
+                    Err(e) => {
+                        sink.emit(Event::Warning {
+                            code: "build_cache_prune_failed".into(),
+                            message: e.to_string(),
+                            resource: None,
+                        });
+                        done += 1;
+                        progress(
+                            ApplyStage::Failed,
+                            Some(ResourceKind::BuildCache),
+                            Some("build cache".into()),
+                            done,
+                        );
+                    }
                 }
             }
         }
@@ -435,6 +564,7 @@ impl<'a> Executor<'a> {
         // reading it once and reporting a lie.
         let reclamation = match (self.disk, before) {
             (Some(store), Some(before)) if !simulated => {
+                progress(ApplyStage::MeasuringHost, None, None, done);
                 let after = settle(store, now_unix, &sink);
                 let r = reconcile(&before, &after, freed + cache_freed, store);
                 sink.emit(Event::HostReclaim {
@@ -550,6 +680,15 @@ mod tests {
     struct SpyMutate {
         calls: Mutex<Vec<String>>,
         fail_with: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(Mutex<Vec<Event>>);
+
+    impl EventSink for RecordingSink {
+        fn emit(&self, event: Event) {
+            self.0.lock().unwrap().push(event);
+        }
     }
 
     impl DockerMutate for SpyMutate {
@@ -714,6 +853,51 @@ mod tests {
         assert!(calls.iter().any(|c| c.starts_with("network:")));
         assert!(calls.contains(&"build_cache".to_string()));
         assert_eq!(receipt.build_cache_reclaimed, Bytes(16_300_000_000));
+    }
+
+    #[test]
+    fn apply_reports_before_and_after_each_slow_delete() {
+        let rep = report(vec![attributed(network("proj_default"))]);
+        let plan = Planner::plan(&rep, NOW);
+        let spy = SpyMutate::default();
+        let sink = Arc::new(RecordingSink::default());
+
+        Executor::applying(&spy)
+            .run(
+                plan,
+                &rep,
+                NOW,
+                &ExecuteOptions {
+                    mode: Mode::Apply,
+                    ..Default::default()
+                },
+                sink.clone(),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        let stages: Vec<_> = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                Event::ApplyProgress {
+                    stage,
+                    name: Some(name),
+                    ..
+                } if name == "proj_default" => Some(*stage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stages,
+            vec![
+                ApplyStage::Checking,
+                ApplyStage::Removing,
+                ApplyStage::Removed
+            ]
+        );
     }
 
     #[test]

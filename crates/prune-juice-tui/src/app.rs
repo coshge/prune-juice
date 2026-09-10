@@ -4,8 +4,9 @@
 //! about terminals, so the whole state machine is testable without one. The
 //! renderer reads this; it never owns state.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 
+use prune_juice_core::event::ApplyStage;
 use prune_juice_core::execute::Receipt;
 use prune_juice_core::model::{Bytes, ResourceKind};
 use prune_juice_core::plan::tier::{Reversibility, Tier};
@@ -106,6 +107,10 @@ pub struct App {
     pub report: Option<ScanReport>,
     pub plan: Option<Plan>,
     pub receipt: Option<Receipt>,
+    /// Images blocked by safe stopped containers when Reclaim began. This
+    /// survives the plan being consumed so the receipt can explain that the
+    /// run unlocked another cleanup step.
+    reclaim_follow_up_images: usize,
 
     pub menu_index: usize,
     pub review_index: usize,
@@ -115,6 +120,12 @@ pub struct App {
     pub expanded: BTreeSet<usize>,
     /// Rows the user has ticked for action.
     pub selected: BTreeSet<usize>,
+
+    /// Small bounded activity feed for the apply screen. Keeping this bounded
+    /// makes hundreds of deletes no more expensive to render than ten.
+    apply_log: VecDeque<String>,
+    pub apply_done: u32,
+    pub apply_total: u32,
 
     /// Progressive counts, so the scan screen fills in rather than hanging.
     pub seen_containers: u32,
@@ -139,12 +150,16 @@ impl App {
             report: None,
             plan: None,
             receipt: None,
+            reclaim_follow_up_images: 0,
             menu_index: 0,
             review_index: 0,
             review_group: ReviewGroup::Dormant,
             review_rows: Vec::new(),
             expanded: BTreeSet::new(),
             selected: BTreeSet::new(),
+            apply_log: VecDeque::new(),
+            apply_done: 0,
+            apply_total: 0,
             seen_containers: 0,
             seen_images: 0,
             seen_volumes: 0,
@@ -169,17 +184,99 @@ impl App {
         self.review_rows = build_review_rows(&plan, self.review_group);
         self.report = Some(report);
         self.plan = Some(plan);
+        self.receipt = None;
+        self.reclaim_follow_up_images = 0;
         self.screen = Screen::Main;
         self.menu_index = 0;
         self.review_index = 0;
         self.expanded.clear();
         self.selected.clear();
+        self.apply_log.clear();
+        self.apply_done = 0;
+        self.apply_total = 0;
         self.status.clear();
     }
 
     pub fn finished(&mut self, receipt: Receipt) {
         self.receipt = Some(receipt);
         self.screen = Screen::Finished;
+    }
+
+    pub fn reclaim_follow_up_images(&self) -> usize {
+        self.reclaim_follow_up_images
+    }
+
+    pub fn begin_apply(&mut self, status: impl Into<String>) {
+        self.screen = Screen::Applying;
+        self.status = status.into();
+        self.apply_log.clear();
+        self.apply_done = 0;
+        self.apply_total = 0;
+    }
+
+    pub fn note_activity(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.status = message.clone();
+        self.push_apply_log(format!("• {message}"));
+    }
+
+    pub fn note_apply_progress(
+        &mut self,
+        stage: ApplyStage,
+        kind: Option<ResourceKind>,
+        name: Option<String>,
+        done: u32,
+        total: u32,
+    ) {
+        self.apply_done = done;
+        self.apply_total = total;
+        let subject = match (kind, name) {
+            (Some(kind), Some(name)) => format!("{} {name}", kind.as_str()),
+            (_, Some(name)) => name,
+            _ => "Docker storage".into(),
+        };
+
+        match stage {
+            ApplyStage::Checking => self.status = format!("checking {subject}…"),
+            ApplyStage::Preserving => self.status = format!("preserving {subject}…"),
+            ApplyStage::Removing => self.status = format!("removing {subject}…"),
+            ApplyStage::PruningBuildCache => self.status = "pruning unused build cache…".into(),
+            ApplyStage::MeasuringHost => {
+                self.status = "checking how much space the host returned…".into()
+            }
+            ApplyStage::Removed => {
+                self.status = format!("removed {subject}");
+                self.push_apply_log(format!("✓ removed  {subject}"));
+            }
+            ApplyStage::WouldRemove => {
+                self.status = format!("would remove {subject}");
+                self.push_apply_log(format!("· would remove  {subject}"));
+            }
+            ApplyStage::Skipped => {
+                self.status = format!("skipped {subject}");
+                self.push_apply_log(format!("– skipped  {subject}"));
+            }
+            ApplyStage::Refused => {
+                self.status = format!("refused {subject}");
+                self.push_apply_log(format!("! refused  {subject}"));
+            }
+            ApplyStage::Failed => {
+                self.status = format!("failed to remove {subject}");
+                self.push_apply_log(format!("! failed   {subject}"));
+            }
+        }
+    }
+
+    pub fn apply_log(&self) -> impl Iterator<Item = &str> {
+        self.apply_log.iter().map(String::as_str)
+    }
+
+    fn push_apply_log(&mut self, message: String) {
+        const MAX_ACTIVITY: usize = 10;
+        if self.apply_log.len() == MAX_ACTIVITY {
+            self.apply_log.pop_front();
+        }
+        self.apply_log.push_back(message);
     }
 
     pub fn free_bytes(&self) -> Bytes {
@@ -214,7 +311,16 @@ impl App {
                 if self.free_count() == 0 && self.free_bytes() == Bytes::ZERO {
                     "Nothing to reclaim".into()
                 } else {
-                    format!("Reclaim {}", self.free_bytes().human())
+                    let unlocks = self.unlockable_image_count();
+                    if unlocks > 0 {
+                        let noun = if unlocks == 1 { "image" } else { "images" };
+                        format!(
+                            "Reclaim {} · unlocks {unlocks} {noun}",
+                            self.free_bytes().human()
+                        )
+                    } else {
+                        format!("Reclaim {}", self.free_bytes().human())
+                    }
                 }
             }
             MenuItem::ReviewRecoverable => {
@@ -277,6 +383,39 @@ impl App {
             .unwrap_or(Bytes::ZERO)
     }
 
+    /// Images Docker currently refuses, but which become actionable after the
+    /// safe stopped-container batch has been removed and the tool rescans.
+    pub fn unlockable_image_count(&self) -> usize {
+        let Some(plan) = &self.plan else { return 0 };
+        let free_containers: BTreeSet<&str> = plan
+            .of_tier(Tier::Free)
+            .filter(|i| i.kind == ResourceKind::Container)
+            .map(|i| i.name.as_str())
+            .collect();
+
+        plan.items
+            .iter()
+            .filter(|i| i.kind == ResourceKind::Image && i.verdict.tier == Tier::Protected)
+            .filter(|image| {
+                let expected = image
+                    .evidence
+                    .facts()
+                    .find(|f| f.key == "container_referrer_count")
+                    .and_then(|f| f.value.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let blockers: Vec<&str> = image
+                    .evidence
+                    .facts()
+                    .filter(|f| f.key == "container_referrer")
+                    .filter_map(|f| f.value.strip_prefix("Container:"))
+                    .collect();
+                expected > 0
+                    && blockers.len() == expected
+                    && blockers.iter().all(|name| free_containers.contains(name))
+            })
+            .count()
+    }
+
     fn open_review(&mut self, group: ReviewGroup) {
         self.review_group = group;
         self.review_rows = self
@@ -318,11 +457,12 @@ impl App {
                 }
             },
             Screen::Finished => match key {
-                Key::Char('r') => Action::Rescan,
-                _ => {
+                Key::Enter | Key::Char('r' | 'R') => Action::Rescan,
+                Key::Char('q' | 'Q') | Key::Esc => {
                     self.should_quit = true;
                     Action::Quit
                 }
+                _ => Action::None,
             },
         }
     }
@@ -345,7 +485,10 @@ impl App {
                     return Action::None;
                 }
                 match item {
-                    MenuItem::Reclaim => Action::ReclaimFree,
+                    MenuItem::Reclaim => {
+                        self.reclaim_follow_up_images = self.unlockable_image_count();
+                        Action::ReclaimFree
+                    }
                     MenuItem::ReviewRecoverable => {
                         self.open_review(ReviewGroup::Recoverable);
                         Action::None
@@ -566,6 +709,14 @@ mod tests {
         a
     }
 
+    fn stopped_container_using(image: &Attributed, name: &str) -> Attributed {
+        let mut r = ResourceSummary::new(ResourceKind::Container, name, name);
+        r.created_unix = Some(OLD);
+        r.state = Some(prune_juice_core::model::ContainerState::Exited);
+        r.image_id = Some(image.resource.id.clone());
+        attributed(r, false)
+    }
+
     fn report(resources: Vec<Attributed>) -> ScanReport {
         ScanReport {
             daemon: DaemonIdentity {
@@ -663,6 +814,66 @@ mod tests {
     }
 
     #[test]
+    fn reclaim_completion_makes_rescan_the_primary_next_step() {
+        let image = recoverable_image("blocked", Tier::Repullable, 2_000_000_000);
+        let container = stopped_container_using(&image, "project-web-1");
+        let mut app = ready_app(vec![image, container]);
+
+        assert_eq!(app.on_key(Key::Enter), Action::ReclaimFree);
+        assert_eq!(app.reclaim_follow_up_images(), 1);
+
+        app.screen = Screen::Finished;
+        assert_eq!(app.on_key(Key::Char('x')), Action::None);
+        assert!(!app.should_quit);
+        assert_eq!(app.on_key(Key::Enter), Action::Rescan);
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn finished_screen_only_quits_explicitly() {
+        let mut app = ready_app(vec![]);
+        app.screen = Screen::Finished;
+
+        assert_eq!(app.on_key(Key::Char('q')), Action::Quit);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn apply_progress_updates_immediately_and_keeps_a_bounded_log() {
+        let mut app = ready_app(vec![]);
+        app.begin_apply("starting…");
+
+        app.note_apply_progress(
+            ApplyStage::Removing,
+            Some(ResourceKind::Image),
+            Some("slow-image".into()),
+            0,
+            12,
+        );
+        assert!(
+            app.status.contains("removing image slow-image"),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.apply_done, 0);
+        assert_eq!(app.apply_total, 12);
+
+        for n in 1..=12 {
+            app.note_apply_progress(
+                ApplyStage::Removed,
+                Some(ResourceKind::Image),
+                Some(format!("image-{n}")),
+                n,
+                12,
+            );
+        }
+        let log: Vec<_> = app.apply_log().collect();
+        assert_eq!(log.len(), 10);
+        assert!(log[0].contains("image-3"), "{log:?}");
+        assert!(log[9].contains("image-12"), "{log:?}");
+    }
+
+    #[test]
     fn the_safe_tier_reports_zero_irreversible_bytes() {
         let app = ready_app(vec![attributed(network("proj_default"), false)]);
         assert_eq!(app.irreversible_bytes(), Bytes::ZERO);
@@ -695,6 +906,18 @@ mod tests {
         assert!(recoverable.contains("up to 5.0 GB"), "{recoverable}");
         let dormant = app.menu_label(MenuItem::ReviewDormant);
         assert!(dormant.contains("1 item"), "{dormant}");
+    }
+
+    #[test]
+    fn reclaim_menu_says_when_safe_containers_unlock_images() {
+        let image = recoverable_image("blocked", Tier::Repullable, 2_000_000_000);
+        let container = stopped_container_using(&image, "project-web-1");
+        let app = ready_app(vec![image, container]);
+
+        assert_eq!(app.unlockable_image_count(), 1);
+        let label = app.menu_label(MenuItem::Reclaim);
+        assert!(label.contains("unlocks 1 image"), "{label}");
+        assert_eq!(app.review_count(ReviewGroup::Recoverable), 0);
     }
 
     #[test]

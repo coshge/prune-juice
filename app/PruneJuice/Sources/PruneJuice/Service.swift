@@ -10,7 +10,9 @@ import Foundation
 /// Callback-shaped rather than `async` on purpose — it is the same shape a
 /// UniFFI callback interface takes, so the seam stays honest.
 protocol PruneJuiceService: Sendable {
-    func scan(
+    func run(
+        arguments: [String],
+        onOutput: @escaping @Sendable (String) -> Void,
         onEvent: @escaping @Sendable (PJEvent) -> Void,
         onFinish: @escaping @Sendable (Error?) -> Void
     )
@@ -91,7 +93,9 @@ final class SubprocessService: PruneJuiceService {
     static var helperAvailable: Bool { helperURL() != nil }
     static var helperPath: String { helperURL()?.path ?? "(not found)" }
 
-    func scan(
+    func run(
+        arguments: [String],
+        onOutput: @escaping @Sendable (String) -> Void,
         onEvent: @escaping @Sendable (PJEvent) -> Void,
         onFinish: @escaping @Sendable (Error?) -> Void
     ) {
@@ -112,7 +116,7 @@ final class SubprocessService: PruneJuiceService {
             process.executableURL = helper
             // --no-tui because stdout is a pipe. The CLI would work that out on
             // its own; being explicit means the app does not rely on it.
-            process.arguments = ["--json", "--no-tui"]
+            process.arguments = ["--json", "--no-tui"] + arguments
 
             let out = Pipe()
             let err = Pipe()
@@ -142,6 +146,7 @@ final class SubprocessService: PruneJuiceService {
                     let chunk = h.availableData
                     if chunk.isEmpty { break }
                     stderrBox.value.append(chunk)
+                    if let text = String(data: chunk, encoding: .utf8) { onOutput(text) }
                 }
                 stderrDone.signal()
             }
@@ -163,6 +168,8 @@ final class SubprocessService: PruneJuiceService {
                     do {
                         if let env = try Envelope.decode(line: line) {
                             onEvent(env.event)
+                        } else if let text = String(data: line, encoding: .utf8) {
+                            onOutput(text + "\n")
                         }
                     } catch DecodeError.unsupportedProtocol(let v) {
                         failure = ServiceError.unsupportedProtocol(v)
@@ -179,6 +186,9 @@ final class SubprocessService: PruneJuiceService {
                 }
             }
 
+            if failure == nil, !buffer.isEmpty, let text = String(data: buffer, encoding: .utf8) {
+                onOutput(text)
+            }
             if failure != nil { process.terminate() }
             process.waitUntilExit()
             _ = stderrDone.wait(timeout: .now() + 5)

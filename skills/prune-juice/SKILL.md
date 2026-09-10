@@ -20,8 +20,13 @@ read-only. All offered cleanup is reachable inside the interface:
 - **Review stale / orphaned** exposes dormant or abandoned resources. The same
   review flow applies; irreversible volumes are copied to the vault and
   verified before removal.
-- After a receipt, press `r` to scan again. Removing stopped containers can
-  expose volumes that were previously referenced.
+- The Reclaim row says when its stopped-container cleanup will unlock images.
+  Its receipt makes the next step explicit: press `Enter` to scan again and
+  continue (`q` quits). Newly-unreferenced images and volumes then move into
+  their appropriate review groups.
+- Applying shows the current resource, completed/total count, and a bounded
+  rolling activity log. A slow Docker deletion should still show its
+  `removing` line immediately; a static apply screen indicates an old build.
 
 No tier requires the user to leave the interface and rerun the program with a
 flag. Flags remain available for scripting and CI.

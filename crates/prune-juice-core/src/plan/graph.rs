@@ -312,18 +312,30 @@ impl RefGraph {
         self.live_volumes.contains(name)
     }
 
-    /// Is this image held by a container that is running right now?
+    /// Every container holding this image, including stopped ones.
     ///
     /// Asked directly rather than inferred from [`Referenced`], because an
     /// image is always `Unknown` — its layer stack is not fetched, so a
     /// base-image relationship cannot be ruled out. That opacity is about
-    /// *other images*, and must not be allowed to obscure the much simpler
-    /// question of whether something is running on this one.
-    pub fn image_is_live(&self, id: &str) -> bool {
-        self.image_referrers
+    /// *other images*, and must not obscure Docker's concrete container
+    /// references. Docker refuses an image removal while a stopped container
+    /// still holds it just as it does for a running one.
+    pub fn image_containers(&self, id: &str) -> Vec<Referrer> {
+        let mut out: Vec<Referrer> = self
+            .image_referrers
             .get(id)
-            .map(|rs| rs.iter().any(|r| r.kind == ReferrerKind::LiveContainer))
-            .unwrap_or(false)
+            .into_iter()
+            .flatten()
+            .filter(|r| {
+                matches!(
+                    r.kind,
+                    ReferrerKind::Container | ReferrerKind::LiveContainer
+                )
+            })
+            .cloned()
+            .collect();
+        out.sort();
+        out
     }
 
     /// Answer the reference question, recording every fact consulted.

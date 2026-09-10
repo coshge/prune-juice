@@ -156,19 +156,52 @@ pub fn classify(a: &Attributed, graph: &RefGraph, now_unix: i64, rs: &mut ReadSe
     // A tagged image used to end here, which made `Protected` a dead end and
     // put 82 GB permanently out of reach. A tag is a statement of intent, but
     // intent is not the same as irreplaceability: what actually matters is
-    // whether anything is *running* on it, and what it would cost to get back.
+    // whether any container still holds it, and what it would cost to get back.
     if r.kind == ResourceKind::Image {
         // An image is always `Referenced::Unknown` because its layer stack is
         // not fetched, so the live-container check above never fires for one.
-        // Ask the graph the simple question instead — otherwise a cheap-to-
-        // replace image serving a running container would be offered up.
-        let live = graph.image_is_live(r.id.as_str());
+        // Ask the graph for concrete container references instead. Docker
+        // refuses removal for stopped containers too, so an image is not
+        // actionable until those containers have been reclaimed and the tool
+        // has scanned again.
+        let containers = graph.image_containers(r.id.as_str());
+        let live = containers
+            .iter()
+            .any(|x| x.kind == super::graph::ReferrerKind::LiveContainer);
         rs.record(&subject, "held_by_live_container", live.to_string());
+        rs.record(
+            &subject,
+            "container_referrer_count",
+            containers.len().to_string(),
+        );
+        for container in &containers {
+            rs.record(
+                &subject,
+                "container_referrer",
+                format!("{:?}:{}", container.kind, container.name),
+            );
+        }
         if live {
             return Verdict {
                 tier: Tier::Protected,
                 reversibility,
                 because: "held by a running container".into(),
+                referenced,
+            };
+        }
+        if let Some(container) = containers.first() {
+            let suffix = if containers.len() == 1 {
+                String::new()
+            } else {
+                format!(" and {} other(s)", containers.len() - 1)
+            };
+            return Verdict {
+                tier: Tier::Protected,
+                reversibility,
+                because: format!(
+                    "held by stopped container \"{}\"{suffix}; reclaim containers and scan again",
+                    container.name
+                ),
                 referenced,
             };
         }
@@ -927,6 +960,34 @@ mod tests {
             Tier::Protected,
             "a running container outranks any recovery route"
         );
+    }
+
+    #[test]
+    fn an_image_a_stopped_container_holds_is_not_offered_until_it_is_unlocked() {
+        let img = image(
+            "blocked",
+            Some(crate::model::Recovery::Pull("blocked@sha256:def".into())),
+        );
+        let img_id = img.resource.id.clone();
+        let mut c = ResourceSummary::new(ResourceKind::Container, "stopped", "project-web-1");
+        c.state = Some(ContainerState::Exited);
+        c.created_unix = Some(OLD);
+        c.image_id = Some(img_id);
+
+        let rep = report(vec![img, attributed(c)]);
+        let verdict = classify_one(&rep, 0);
+        assert_eq!(verdict.tier, Tier::Protected);
+        assert!(verdict.because.contains("stopped container"));
+        assert!(verdict.because.contains("scan again"));
+    }
+
+    #[test]
+    fn a_recoverable_image_is_offered_after_its_stopped_container_is_gone() {
+        let rep = report(vec![image(
+            "unlocked",
+            Some(crate::model::Recovery::Pull("unlocked@sha256:def".into())),
+        )]);
+        assert_eq!(classify_one(&rep, 0).tier, Tier::Repullable);
     }
 
     #[test]

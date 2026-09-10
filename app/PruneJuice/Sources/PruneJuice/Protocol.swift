@@ -41,7 +41,9 @@ struct Classified: Decodable, Sendable, Identifiable {
     let owner: String?
     let provenance: [String]
 
-    var id: String { "\(kind):\(name)" }
+    var context: String = ""
+    enum CodingKeys: String, CodingKey { case kind, name, tier, because, size, owner, provenance }
+    var id: String { "\(context):\(kind):\(name)" }
 }
 
 enum PJEvent: Sendable {
@@ -57,6 +59,7 @@ enum PJEvent: Sendable {
     /// The protocol's own rule is that adding an event is not a breaking
     /// change and consumers must ignore unknown ones. Modelling that as a case
     /// rather than a thrown error is what makes the rule true in practice.
+    case progress(stage: String, name: String?, done: UInt32, total: UInt32)
     case unknown(String)
 }
 
@@ -151,6 +154,11 @@ extension Envelope {
         case "classified":
             event = .classified(try decoder.decode(Classified.self, from: line))
 
+        case "apply_progress":
+            struct P: Decodable { let stage: String; let name: String?; let done: UInt32; let total: UInt32 }
+            let p = try decoder.decode(P.self, from: line)
+            event = .progress(stage: p.stage, name: p.name, done: p.done, total: p.total)
+
         case "host_reclaim":
             struct P: Decodable {
                 let dockerReported: UInt64
@@ -191,4 +199,9 @@ func humanBytes(_ n: UInt64) -> String {
     return v >= 100
         ? String(format: "%.0f %@", v, units[u])
         : String(format: "%.1f %@", v, units[u])
+}
+
+/// Normalize engine messages at the presentation boundary.
+func displayText(_ text: String) -> String {
+    text.replacingOccurrences(of: "—", with: "; ")
 }

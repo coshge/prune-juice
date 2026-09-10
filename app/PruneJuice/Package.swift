@@ -8,6 +8,7 @@ let package = Package(
         .executableTarget(
             name: "PruneJuice",
             path: "Sources/PruneJuice"
-        )
+        ),
+        .testTarget(name: "PruneJuiceTests", dependencies: ["PruneJuice"])
     ]
 )

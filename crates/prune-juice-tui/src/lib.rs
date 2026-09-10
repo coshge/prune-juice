@@ -27,7 +27,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use prune_juice_core::docker::bollard_client::BollardClient;
-use prune_juice_core::event::{Cancel, ChannelSink, Event};
+use prune_juice_core::event::{Cancel, ChannelSink, Event, EventSink, NullSink};
 use prune_juice_core::execute::{ExecuteOptions, Executor, Mode, Receipt};
 use prune_juice_core::plan::tier::Tier;
 use prune_juice_core::plan::{Plan, Planner};
@@ -43,7 +43,19 @@ enum Msg {
     Scan(Box<Event>),
     Ready(Box<(ScanReport, Plan)>),
     Applied(Box<Receipt>),
+    Activity(String),
     Failed(String),
+}
+
+/// Sends execution events straight onto the UI queue. Unlike the scan
+/// forwarder this needs no intermediary thread, so a "removing…" event is
+/// visible before the worker enters a potentially slow Docker call.
+struct TuiEventSink(Sender<Msg>);
+
+impl EventSink for TuiEventSink {
+    fn emit(&self, event: Event) {
+        let _ = self.0.send(Msg::Scan(Box::new(event)));
+    }
 }
 
 pub struct TuiOptions {
@@ -115,13 +127,14 @@ fn event_loop(terminal: &mut Term, opts: TuiOptions) -> Result<i32, Error> {
     spawn_scan(&opts, tx.clone(), cancel.clone());
 
     loop {
-        terminal.draw(|f| ui::draw(f, &app)).map_err(Error::Io)?;
-
         // Drain whatever the workers have produced without blocking the
-        // redraw. A slow `df` must not freeze the interface.
+        // redraw. Doing this before drawing removes a full frame of latency
+        // from progress emitted immediately before a slow Docker call.
         drain(&rx, &mut app);
 
-        if event::poll(Duration::from_millis(80)).map_err(Error::Io)? {
+        terminal.draw(|f| ui::draw(f, &app)).map_err(Error::Io)?;
+
+        if event::poll(Duration::from_millis(50)).map_err(Error::Io)? {
             if let CtEvent::Key(k) = event::read().map_err(Error::Io)? {
                 if k.kind != KeyEventKind::Release {
                     if is_hard_quit(&k) {
@@ -139,8 +152,7 @@ fn event_loop(terminal: &mut Term, opts: TuiOptions) -> Result<i32, Error> {
                         }
                         Action::ReclaimFree => {
                             if let Some(plan) = app.plan.take() {
-                                app.screen = Screen::Applying;
-                                app.status = "reclaiming…".into();
+                                app.begin_apply("starting reclaim…");
                                 spawn_apply(
                                     &opts,
                                     plan,
@@ -156,9 +168,7 @@ fn event_loop(terminal: &mut Term, opts: TuiOptions) -> Result<i32, Error> {
                                 app.selected_names().into_iter().collect();
                             let tiers = app.selected_tiers();
                             if let Some(plan) = app.plan.take() {
-                                app.screen = Screen::Applying;
-                                app.status =
-                                    "re-checking and removing the items you ticked…".into();
+                                app.begin_apply("preparing the items you ticked…");
                                 spawn_apply(
                                     &opts,
                                     plan,
@@ -230,6 +240,13 @@ fn drain(rx: &Receiver<Msg>, app: &mut App) {
                     };
                 }
                 Event::Warning { message, .. } => app.status = format!("! {message}"),
+                Event::ApplyProgress {
+                    stage,
+                    kind,
+                    name,
+                    done,
+                    total,
+                } => app.note_apply_progress(stage, kind, name, done, total),
                 _ => {}
             },
             Msg::Ready(b) => {
@@ -237,6 +254,7 @@ fn drain(rx: &Receiver<Msg>, app: &mut App) {
                 app.ready(report, plan);
             }
             Msg::Applied(r) => app.finished(*r),
+            Msg::Activity(message) => app.note_activity(message),
             Msg::Failed(e) => {
                 app.status = format!("error: {e}");
                 app.screen = Screen::Finished;
@@ -297,6 +315,7 @@ fn spawn_apply(
     let scan_opts = opts.scan.clone();
 
     std::thread::spawn(move || {
+        let _ = tx.send(Msg::Activity("connecting to Docker…".into()));
         let client = match BollardClient::connect(&endpoint) {
             Ok(c) => c,
             Err(e) => {
@@ -307,24 +326,26 @@ fn spawn_apply(
 
         // Re-scan first. Every witness is revalidated against THIS report,
         // item by item, immediately before its own delete.
-        let (etx, _erx) = mpsc::channel::<Event>();
-        let sink = Arc::new(ChannelSink(etx));
+        let _ = tx.send(Msg::Activity(
+            "re-checking Docker state before deleting anything…".into(),
+        ));
+        let quiet_sink: Arc<dyn EventSink> = Arc::new(NullSink);
         // The planning scan may have admitted stopped containers only because
         // their volume provenance was durably checkpointed. Revalidation must
         // use the same index or every such witness changes tier and is skipped.
         let index = prune_juice_core::index::Index::open().ok();
-        let fresh = match scanner(&client, index.as_ref()).scan(
-            &context,
-            &scan_opts,
-            sink.clone(),
-            &cancel,
-        ) {
+        let fresh = match scanner(&client, index.as_ref())
+            .scan(&context, &scan_opts, quiet_sink, &cancel)
+        {
             Ok(r) => r,
             Err(e) => {
                 let _ = tx.send(Msg::Failed(e.to_string()));
                 return;
             }
         };
+        let _ = tx.send(Msg::Activity(
+            "safety scan complete; beginning cleanup…".into(),
+        ));
 
         let exec_opts = ExecuteOptions {
             mode: Mode::Apply,
@@ -349,16 +370,19 @@ fn spawn_apply(
             fresh.daemon.data_root.as_deref(),
             &endpoint,
         );
+        let sink = Arc::new(TuiEventSink(tx.clone()));
         match Executor::applying(&client)
             .with_vault(&client, &vault)
             .with_disk(&store)
-            .run(plan, &fresh, now_unix(), &exec_opts, sink, &cancel)
+            .run(plan, &fresh, now_unix(), &exec_opts, sink.clone(), &cancel)
         {
             Ok(r) => {
-                let _ = tx.send(Msg::Applied(Box::new(r)));
+                // Use the same sender as the progress events so the receipt
+                // cannot overtake the final log line in a multi-producer queue.
+                let _ = sink.0.send(Msg::Applied(Box::new(r)));
             }
             Err(e) => {
-                let _ = tx.send(Msg::Failed(e.to_string()));
+                let _ = sink.0.send(Msg::Failed(e.to_string()));
             }
         }
     });
