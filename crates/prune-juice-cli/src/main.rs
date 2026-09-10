@@ -17,6 +17,7 @@ use prune_juice_core::plan::tier::{Reversibility, Tier};
 use prune_juice_core::plan::{Plan, Planner};
 use prune_juice_core::scan::{ScanOptions, ScanReport, Scanner};
 use prune_juice_core::Error;
+use prune_juice_tui::TuiOptions;
 
 const USAGE: &str = "\
 prune-juice — reclaim Docker disk with provenance
@@ -32,7 +33,12 @@ OPTIONS:
     --no-sizes          Skip volume sizing (the expensive call)
     --roots <PATHS>     Colon-separated dirs to search for projects
     --context <NAME>    Scan only this context
+    --no-tui            Force the one-shot report even on a terminal
     -h, --help          Show this help
+
+With no arguments on a terminal, `prune-juice` opens an interactive
+interface. Piped, redirected, or under CI it prints a one-shot report
+instead, so it composes in a script without special-casing.
 
 Tier `free` is the only one safe without review. Asking for `orphan` or
 `stale` on the command line skips a review step that exists for a reason.
@@ -55,6 +61,7 @@ struct Args {
     only_label: Option<(String, String)>,
     roots: Vec<PathBuf>,
     only_context: Option<String>,
+    no_tui: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -66,12 +73,14 @@ fn parse_args() -> Result<Args, String> {
         only_label: None,
         roots: default_roots(),
         only_context: None,
+        no_tui: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--json" => a.json = true,
             "--no-sizes" => a.with_sizes = false,
+            "--no-tui" => a.no_tui = true,
             "--apply" => a.apply = true,
             "--tiers" => {
                 let v = it.next().ok_or("--tiers needs a value")?;
@@ -161,6 +170,17 @@ fn main() {
     }
 }
 
+/// Interactive by default, but only when there is a human on the other end and
+/// no flag has already asked for a specific machine-readable behaviour.
+fn wants_tui(args: &Args) -> bool {
+    !args.no_tui
+        && !args.json
+        && !args.apply
+        && io::stdout().is_terminal()
+        && io::stdin().is_terminal()
+        && std::env::var("CI").is_err()
+}
+
 fn run(args: &Args) -> Result<i32, Error> {
     let cancel = Cancel::new();
 
@@ -179,6 +199,19 @@ fn run(args: &Args) -> Result<i32, Error> {
         project_roots: args.roots.clone(),
         with_sizes: args.with_sizes,
     };
+
+    if wants_tui(args) {
+        // The interface scans on its own thread, so it takes an endpoint rather
+        // than a connected client. The first local context wins; multi-daemon
+        // selection lives in the settings screen, not the launch path.
+        let ctx = contexts.first().expect("checked non-empty above");
+        return prune_juice_tui::run(TuiOptions {
+            endpoint: ctx.endpoint.clone(),
+            context: ctx.name.clone(),
+            scan: opts,
+        });
+    }
+
     let mut seen: Vec<String> = Vec::new();
     let mut exit = 0;
     let mut any = false;
@@ -485,11 +518,4 @@ fn truncate(s: &str, n: usize) -> String {
         let head: String = s.chars().take(n.saturating_sub(1)).collect();
         format!("{head}…")
     }
-}
-
-/// Reserved for M3. Interactive mode is the default only on a TTY; piped or CI
-/// invocations always take the one-shot path above.
-#[allow(dead_code)]
-fn is_interactive() -> bool {
-    io::stdout().is_terminal() && std::env::var("CI").is_err()
 }

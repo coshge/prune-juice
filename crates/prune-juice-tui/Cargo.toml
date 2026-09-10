@@ -1,0 +1,16 @@
+[package]
+name        = "prune-juice-tui"
+description = "Interactive terminal interface for Prune Juice"
+version.workspace      = true
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+
+[dependencies]
+prune-juice-core = { path = "../prune-juice-core" }
+ratatui.workspace   = true
+crossterm.workspace = true
+
+[dev-dependencies]
+ratatui = { workspace = true, features = ["unstable-backend-writer"] }

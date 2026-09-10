@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 use crate::model::{Bytes, DaemonId, ResourceId, ResourceKind};
+use crate::providers::best_claim;
 use crate::scan::ScanReport;
 
 use evidence::ReadSet;
@@ -176,8 +177,13 @@ pub struct PlanItem {
     /// merely documented.
     pub labels: BTreeMap<String, String>,
     pub verdict: Verdict,
-    /// Human-readable, one line per consulted fact.
+    /// The facts the verdict rested on. Hashed for staleness detection; not
+    /// meant for humans.
     pub evidence: ReadSet,
+    /// Citable provenance, one line per fact, already tagged with its source —
+    /// `[label] com.docker.compose.project = nbk`. This is what a person reads;
+    /// `evidence` is what the machine compares.
+    pub provenance: Vec<String>,
     /// Present only for tiers that may be acted on. `Protected` never has one.
     witness: Option<SafeToDelete>,
 }
@@ -270,6 +276,14 @@ impl Planner {
                 size: a.resource.size,
                 owner: a.owner.clone(),
                 labels: a.resource.labels.clone(),
+                provenance: best_claim(&a.claims)
+                    .map(|c| {
+                        c.evidence
+                            .iter()
+                            .map(|e| format!("[{}] {}", e.source.tag(), e.detail))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 verdict,
                 evidence: rs,
                 witness,

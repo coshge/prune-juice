@@ -13,4 +13,5 @@ path = "src/main.rs"
 
 [dependencies]
 prune-juice-core = { path = "../prune-juice-core" }
+prune-juice-tui  = { path = "../prune-juice-tui" }
 serde_json.workspace = true
