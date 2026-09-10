@@ -13,6 +13,7 @@ use prune_juice_core::docker::bollard_client::BollardClient;
 use prune_juice_core::docker::{context, DockerClient};
 use prune_juice_core::event::{Cancel, JsonlSink, NullSink};
 use prune_juice_core::execute::{ExecuteOptions, Executor, ItemOutcome, Mode, Receipt};
+use prune_juice_core::index::Index;
 use prune_juice_core::model::{Bytes, Confidence, Liveness, ResourceKind};
 use prune_juice_core::plan::tier::{Reversibility, Tier};
 use prune_juice_core::plan::{Plan, Planner};
@@ -216,6 +217,16 @@ fn default_roots() -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// A scanner with everything available on this machine: a container probe for
+/// runtimes that hide their data root, and the index for memory across runs.
+fn scanner<'a>(client: &'a BollardClient, index: Option<&'a Index>) -> Scanner<'a> {
+    let s = Scanner::with_probe(client, client);
+    match index {
+        Some(i) => s.with_index(i),
+        None => s,
+    }
 }
 
 fn now_unix() -> i64 {
@@ -436,6 +447,16 @@ fn run(args: &Args) -> Result<i32, Error> {
         });
     }
 
+    // One index for the whole run. A failure to open it degrades the scan
+    // rather than stopping it: attribution gets worse, nothing gets unsafe.
+    let index = match Index::open() {
+        Ok(i) => Some(i),
+        Err(e) => {
+            eprintln!("  ! the provenance index is unavailable ({e}); attribution will not improve across runs");
+            None
+        }
+    };
+
     let mut seen: Vec<String> = Vec::new();
     let mut exit = 0;
     let mut any = false;
@@ -476,7 +497,7 @@ fn run(args: &Args) -> Result<i32, Error> {
             io::stderr().flush().ok();
         }
         let report =
-            Scanner::with_probe(&client, &client).scan(&ctx.name, &opts, sink.clone(), &cancel)?;
+            scanner(&client, index.as_ref()).scan(&ctx.name, &opts, sink.clone(), &cancel)?;
         if !args.json {
             eprintln!("{} ms", report.duration_ms);
         }
@@ -510,7 +531,7 @@ fn run(args: &Args) -> Result<i32, Error> {
         }
         // Re-scan so witnesses are revalidated against a freshly taken world.
         let fresh =
-            Scanner::with_probe(&client, &client).scan(&ctx.name, &opts, sink.clone(), &cancel)?;
+            scanner(&client, index.as_ref()).scan(&ctx.name, &opts, sink.clone(), &cancel)?;
         if args.apply && !args.json {
             eprintln!("ok");
         }

@@ -10,7 +10,7 @@ model strong enough that the headline action needs no confirmation. Free MIT
 Rust CLI; a free macOS app comes later, architected so a one-time paid tier
 could be added without rework.
 
-## Status: M5 complete
+## Status: M5 complete + provenance index
 
 | milestone | state |
 |---|---|
@@ -23,7 +23,7 @@ could be added without rework.
 | M6 macOS app | next |
 
 ```
-cargo test --workspace                  # 177 tests
+cargo test --workspace                  # 189 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -70,8 +70,11 @@ cargo run -p prune-juice-tui --example preview   # render every screen, no TTY n
   build and breaks `cargo install` for no present benefit. Subprocess is the
   shipping architecture for the macOS app; UniFFI is an optimisation to take
   only if profiling demands it.
-- **No SQLite index yet.** Tier 1 deliberately does not depend on it, so this is
-  a missing feature rather than a broken one. Attribution is cold-start only.
+- **An orphan verdict needs two consecutive absences.** On a cold index the
+  first run reports "looks orphaned but has only been missing across 1 scan —
+  run again to confirm" and offers nothing. That is not a bug: one observation
+  cannot distinguish a deleted project from an unplugged disk. `MIN_ABSENT_SCANS`
+  in `providers/mod.rs`.
 - **The TUI can now act on reviewed rows**, because the vault makes them
   recoverable. Tick with space, `d` to act, and it goes via a confirm screen
   that states how many will be copied to the vault first. Only `y` proceeds;
@@ -154,7 +157,16 @@ All have regression tests — if you break one, a test will tell you.
 23. **Docker-reported and host-measured are different numbers.** Shown on
     separate lines, never summed, and where the host cannot be measured the
     answer is "could not be measured" — not the Docker figure in disguise.
-24. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
+24. **The index is written before anything is judged, let alone deleted.** A
+    container's labels and mounts are the only place an anonymous volume's
+    provenance lives, so recording has to precede removal — otherwise the
+    evidence is destroyed before it is written down.
+25. **An index edge is Weak evidence.** It is a memory, not a current fact, so
+    it can attribute a volume for display but can never license a deletion.
+26. **Evidence never leaks between daemons.** Every table is keyed by the
+    daemon's `/info` ID. Attributing one engine's volume from another's history
+    would be worse than knowing nothing. There is a test.
+27. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
     fields and no public constructor; `Fresh` comes only from `revalidate()` and
     is consumed by the executor. Do not add a public constructor or a `Clone`.
 
@@ -220,8 +232,8 @@ checkouts "derivative" because they contained a `vendor` directory.
 
 - Image sizes are summed naively, so shared base layers are counted more than
   once (82.5 GB reported vs ~80.5 GB actual). Needs exclusive-size accounting.
-- No SQLite index yet; waivers live in a JSON file instead. That is the
-  remaining piece of the original plan's storage design.
+- Waivers still live in a JSON file rather than the index. Harmless, but they
+  could move now that the index exists.
 - Warm scan is ~3–6 s, over the sub-2 s target. The fix is the size cache: an
   orphaned volume's size is immutable, so its cache entry is valid forever, and
   the expensive `df` is only needed for in-use volumes — exactly the ones that

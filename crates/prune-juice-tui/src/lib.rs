@@ -255,7 +255,12 @@ fn spawn_scan(opts: &TuiOptions, tx: Sender<Msg>, cancel: Cancel) {
             }
         };
         let sink = Arc::new(ChannelSink(etx));
-        match Scanner::with_probe(&client, &client).scan(&context, &scan_opts, sink, &cancel) {
+        let index = prune_juice_core::index::Index::open().ok();
+        let scanner = match index.as_ref() {
+            Some(i) => Scanner::with_probe(&client, &client).with_index(i),
+            None => Scanner::with_probe(&client, &client),
+        };
+        match scanner.scan(&context, &scan_opts, sink, &cancel) {
             Ok(report) => {
                 let plan = Planner::plan(&report, now_unix());
                 let _ = tx.send(Msg::Ready(Box::new((report, plan))));

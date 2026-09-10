@@ -523,6 +523,15 @@ pub fn best_claim(claims: &[Claim]) -> Option<&Claim> {
     })
 }
 
+/// How many consecutive scans a project must be missing before its resources
+/// can be called orphaned.
+///
+/// One observation is never enough. An unmounted external disk, a repo not yet
+/// cloned on this laptop, a network share that was slow to appear — all look
+/// exactly like a deleted project for the length of a single scan. Two
+/// consecutive misses rules out the one-off without making the user wait a week.
+pub const MIN_ABSENT_SCANS: u32 = 2;
+
 /// Would calling this resource an orphan be defensible?
 ///
 /// Requires a `Strong` or better claim naming an absent project, **and** no
@@ -534,8 +543,24 @@ pub fn is_orphan_candidate(claims: &[Claim]) -> bool {
         return false;
     }
     claims.iter().any(|c| {
-        c.confidence >= Confidence::Strong && matches!(c.liveness, Liveness::Absent { .. })
+        c.confidence >= Confidence::Strong
+            && matches!(c.liveness, Liveness::Absent { scans, .. } if scans >= MIN_ABSENT_SCANS)
     })
+}
+
+/// Absent, but not yet for long enough to act on.
+pub fn is_orphan_pending(claims: &[Claim]) -> Option<u32> {
+    if claims.iter().any(|c| c.liveness == Liveness::Present) {
+        return None;
+    }
+    claims
+        .iter()
+        .filter(|c| c.confidence >= Confidence::Strong)
+        .filter_map(|c| match c.liveness {
+            Liveness::Absent { scans, .. } if scans < MIN_ABSENT_SCANS => Some(scans),
+            _ => None,
+        })
+        .max()
 }
 
 #[cfg(test)]
@@ -681,6 +706,44 @@ mod tests {
             claims_for(&v, &cat).is_empty(),
             "a 64-hex name carries no provenance and must not be guessed at"
         );
+    }
+
+    #[test]
+    fn one_missing_observation_is_never_enough_for_an_orphan() {
+        // The F3 mitigation. An unplugged disk looks exactly like a deleted
+        // project for the length of one scan.
+        let one = Claim {
+            project: ProjectId("/gone".into()),
+            project_name: "gone".into(),
+            provider: ProviderKind::Compose,
+            confidence: Confidence::Strong,
+            root: Some(PathBuf::from("/gone")),
+            liveness: Liveness::Absent {
+                since_unix: None,
+                scans: 1,
+            },
+            evidence: vec![],
+        };
+        assert!(!is_orphan_candidate(std::slice::from_ref(&one)));
+        assert_eq!(is_orphan_pending(&[one]), Some(1));
+
+        let confirmed = Claim {
+            liveness: Liveness::Absent {
+                since_unix: None,
+                scans: MIN_ABSENT_SCANS,
+            },
+            ..Claim {
+                project: ProjectId("/gone".into()),
+                project_name: "gone".into(),
+                provider: ProviderKind::Compose,
+                confidence: Confidence::Strong,
+                root: Some(PathBuf::from("/gone")),
+                liveness: Liveness::Present,
+                evidence: vec![],
+            }
+        };
+        assert!(is_orphan_candidate(std::slice::from_ref(&confirmed)));
+        assert_eq!(is_orphan_pending(&[confirmed]), None);
     }
 
     #[test]

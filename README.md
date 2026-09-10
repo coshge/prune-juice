@@ -70,8 +70,15 @@ The consequence is the single most important fact about this tool:
 **`docker container prune` destroys provenance permanently.** Of 97 anonymous
 volumes here, 47 were still traceable through a stopped container's mounts. The
 other 50 are already lost — no back-reference, no label, no path — because their
-containers are gone. Anything that prunes containers before recording their
-edges has destroyed the information needed to explain what it later deletes.
+containers are gone.
+
+So the tool keeps its own notes. Every scan records container→volume→project
+edges to a local index *before* anything is judged, which is what makes those 47
+mappings durable rather than one `docker container prune` away from oblivion.
+The index also answers a question Docker cannot: how long has this been like
+this. An orphan verdict needs the project directory missing across two
+consecutive scans, because one observation cannot tell a deleted project from an
+unplugged disk.
 
 ## Things worth knowing
 
@@ -212,7 +219,6 @@ Rust 1.85+. No system libraries — SQLite is bundled. `cargo build --workspace`
 
 M1 read-only scan · M2 planner and safe tier · M3 interactive TUI · M4 content
 probe and vault · M5 review actions, waivers, host disk measurement — all done.
-M6 macOS app is next. The SQLite provenance index from the original plan is
-still outstanding; waivers currently live in a JSON file.
+The provenance index is in too. M6, the macOS app, is next.
 
 MIT.

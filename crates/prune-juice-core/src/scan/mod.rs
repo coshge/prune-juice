@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::docker::{DaemonIdentity, DataUsage, DockerClient, DockerProbe};
 use crate::error::Result;
 use crate::event::{Cancel, Event, EventSink, Phase};
+use crate::index::Index;
 use crate::model::{
     Claim, Confidence, Liveness, ResourceKind, ResourceSummary, SizeSource, Totals,
 };
@@ -104,11 +105,31 @@ impl ScanReport {
     }
 }
 
+/// Wall-clock seconds. The scan already performs IO, so reading a clock here
+/// costs nothing in testability — the *classifier* is the part that takes time
+/// as an input, and it still does.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Push a warning unless an identical one is already there.
+fn warnings_once(warnings: &mut Vec<String>, msg: String) {
+    if !warnings.contains(&msg) {
+        warnings.push(msg);
+    }
+}
+
 pub struct Scanner<'a> {
     client: &'a dyn DockerClient,
     /// Used only when the data root cannot be read from the host — which is
     /// every VM-backed runtime, Docker Desktop included.
     probe: Option<&'a dyn DockerProbe>,
+    /// Remembers what Docker forgets. Without it, provenance dies with the
+    /// container that carried it, and "absent for how long?" has no answer.
+    index: Option<&'a Index>,
 }
 
 impl<'a> Scanner<'a> {
@@ -116,6 +137,7 @@ impl<'a> Scanner<'a> {
         Self {
             client,
             probe: None,
+            index: None,
         }
     }
 
@@ -124,6 +146,23 @@ impl<'a> Scanner<'a> {
         Self {
             client,
             probe: Some(probe),
+            index: None,
+        }
+    }
+
+    /// Give the scan a memory.
+    pub fn with_index(mut self, index: &'a Index) -> Self {
+        self.index = Some(index);
+        self
+    }
+
+    /// A scan with an index but no container probe. Used by tests and by
+    /// runtimes where the host can read the data root directly.
+    pub fn with_index_only(client: &'a dyn DockerClient, index: &'a Index) -> Self {
+        Self {
+            client,
+            probe: None,
+            index: Some(index),
         }
     }
 
@@ -353,6 +392,46 @@ impl<'a> Scanner<'a> {
             catalog.add_disk_projects(&opts.project_roots);
         }
 
+        // Write down what we saw BEFORE anything is judged, let alone deleted.
+        // A container's labels and mounts are the only place an anonymous
+        // volume's provenance lives, so recording has to come first.
+        let now_unix = now_unix();
+        let mut project_absences: BTreeMap<String, u32> = BTreeMap::new();
+        let mut remembered: BTreeMap<String, crate::index::RememberedOwner> = BTreeMap::new();
+        if let Some(index) = self.index {
+            let all: Vec<ResourceSummary> = containers
+                .iter()
+                .chain(images.iter())
+                .chain(volumes.iter())
+                .chain(networks.iter())
+                .cloned()
+                .collect();
+            if let Err(e) = index
+                .begin_scan(&daemon.id, now_unix)
+                .and_then(|_| index.record_scan(&daemon.id, &all, now_unix))
+            {
+                warnings.push(format!("the index could not be updated: {e}"));
+            }
+
+            let observed: Vec<(String, String, bool)> = catalog
+                .projects()
+                .filter_map(|p| {
+                    p.root
+                        .as_ref()
+                        .map(|r| (r.to_string_lossy().into_owned(), p.name.clone(), r.is_dir()))
+                })
+                .collect();
+            if let Err(e) = index.record_projects(&daemon.id, &observed, now_unix) {
+                warnings.push(format!("project history could not be updated: {e}"));
+            }
+            for (path, _, _) in &observed {
+                if let Ok(Some(h)) = index.project_history(&daemon.id, path) {
+                    project_absences.insert(path.clone(), h.absent_scans);
+                }
+            }
+            remembered = index.all_historical_owners(&daemon.id).unwrap_or_default();
+        }
+
         for p in catalog.projects() {
             sink.emit(Event::ProjectFound {
                 project: crate::model::ProjectSummary {
@@ -392,7 +471,57 @@ impl<'a> Scanner<'a> {
                 r.in_use = true;
             }
 
-            let claims = claims_for(&r, &catalog);
+            let mut claims = claims_for(&r, &catalog);
+
+            // Replace the single-observation guess with what the index
+            // actually counted. Without this, one missing directory would be
+            // enough to call something orphaned.
+            for c in claims.iter_mut() {
+                if let (Liveness::Absent { since_unix, .. }, Some(root)) =
+                    (&c.liveness, c.root.as_ref())
+                {
+                    let key = root.to_string_lossy().into_owned();
+                    if let Some(n) = project_absences.get(&key) {
+                        c.liveness = Liveness::Absent {
+                            since_unix: *since_unix,
+                            scans: *n,
+                        };
+                    }
+                }
+            }
+
+            // A volume nothing can currently account for may still be
+            // remembered from a container that has since been removed. This is
+            // the index earning its keep.
+            if claims.is_empty() && r.kind == ResourceKind::Volume {
+                if let Some((name, path)) = remembered.get(&r.name) {
+                    let root = path.as_ref().map(std::path::PathBuf::from);
+                    let liveness = crate::providers::liveness_of(root.as_ref());
+                    claims.push(crate::model::Claim {
+                        project: crate::model::ProjectId(
+                            path.clone()
+                                .unwrap_or_else(|| name.clone().unwrap_or_default()),
+                        ),
+                        project_name: name.clone().unwrap_or_else(|| "?".into()),
+                        provider: crate::model::ProviderKind::Heuristic,
+                        // Historical, not current: an index edge is a memory,
+                        // and a memory is Weak evidence by construction. Weak
+                        // can never justify a deletion.
+                        confidence: Confidence::Weak,
+                        root,
+                        liveness,
+                        evidence: vec![crate::model::Evidence::new(
+                            crate::model::EvidenceSource::Index,
+                            format!(
+                                "remembered from a container that has since been removed{}",
+                                name.as_ref()
+                                    .map(|n| format!(" (project {n})"))
+                                    .unwrap_or_default()
+                            ),
+                        )],
+                    });
+                }
+            }
             let best = best_claim(&claims).cloned();
 
             // A volume declared by a compose file whose project is on disk is
@@ -404,6 +533,20 @@ impl<'a> Scanner<'a> {
                 r.in_use = true;
             }
             let orphan = !declared_live && is_orphan_candidate(&claims);
+            if !orphan && !declared_live {
+                if let Some(n) = crate::providers::is_orphan_pending(&claims) {
+                    // Visible, but not actionable: say so rather than either
+                    // hiding it or acting on one observation.
+                    warnings_once(
+                        &mut warnings,
+                        format!(
+                            "{} looks orphaned but has only been missing across {n} scan(s) — \
+                             run again to confirm",
+                            r.name
+                        ),
+                    );
+                }
+            }
             let unattributed = best
                 .as_ref()
                 .map(|c| c.confidence < Confidence::Strong)
@@ -589,9 +732,10 @@ mod tests {
     }
 
     #[test]
-    fn a_volume_whose_project_path_is_gone_is_an_orphan_candidate() {
-        // This is `nbk_mysql`: the label is authoritative, but the directory
-        // was renamed away years ago.
+    fn one_scan_is_not_enough_to_call_a_volume_orphaned() {
+        // This is `nbk_mysql` on the first ever run: the label is
+        // authoritative and the directory is gone, but a single observation
+        // cannot distinguish that from a disk that was unplugged this morning.
         let client = FakeDocker {
             containers: vec![container(
                 "nbk-wordpress-1",
@@ -617,7 +761,109 @@ mod tests {
             .find(|a| a.resource.name == "nbk_mysql")
             .unwrap();
         assert_eq!(v.owner.as_deref(), Some("nbk"));
-        assert!(v.orphan_candidate);
+        assert!(
+            !v.orphan_candidate,
+            "a single missing observation must never be enough"
+        );
+    }
+
+    #[test]
+    fn a_second_scan_confirms_the_orphan() {
+        // Run it twice against the same index and the absence is corroborated,
+        // which is what licenses the verdict.
+        let client = FakeDocker {
+            containers: vec![container(
+                "nbk-wordpress-1",
+                &[
+                    (COMPOSE_PROJECT, "nbk"),
+                    (COMPOSE_WORKING_DIR, "/tmp/pj-definitely-absent-nbk"),
+                ],
+                &[],
+            )],
+            volumes: vec![volume("nbk_mysql", &[(COMPOSE_PROJECT, "nbk")])],
+        };
+        let index = crate::index::Index::in_memory().unwrap();
+
+        let first = Scanner::with_index_only(&client, &index)
+            .scan(
+                "test",
+                &ScanOptions::default(),
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+        assert!(
+            !first
+                .of_kind(ResourceKind::Volume)
+                .any(|a| a.orphan_candidate),
+            "not on the first run"
+        );
+
+        let second = Scanner::with_index_only(&client, &index)
+            .scan(
+                "test",
+                &ScanOptions::default(),
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+        let v = second
+            .of_kind(ResourceKind::Volume)
+            .find(|a| a.resource.name == "nbk_mysql")
+            .unwrap();
+        assert!(
+            v.orphan_candidate,
+            "two consecutive absences is corroboration"
+        );
+    }
+
+    #[test]
+    fn a_volume_is_attributed_from_a_container_that_has_since_gone() {
+        // The index earning its keep. First scan sees the container that
+        // mounts the anonymous volume; by the second the container is gone,
+        // and Docker has no way left to connect the two.
+        let anon = "c".repeat(64);
+        let index = crate::index::Index::in_memory().unwrap();
+
+        let with_container = FakeDocker {
+            containers: vec![container(
+                "oak-s3-1",
+                &[(COMPOSE_PROJECT, "oak"), (COMPOSE_WORKING_DIR, "/")],
+                &[&anon],
+            )],
+            volumes: vec![volume(&anon, &[])],
+        };
+        Scanner::with_index_only(&with_container, &index)
+            .scan(
+                "test",
+                &ScanOptions::default(),
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        let container_gone = FakeDocker {
+            containers: vec![],
+            volumes: vec![volume(&anon, &[])],
+        };
+        let after = Scanner::with_index_only(&container_gone, &index)
+            .scan(
+                "test",
+                &ScanOptions::default(),
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        let v = after.of_kind(ResourceKind::Volume).next().unwrap();
+        assert_eq!(
+            v.owner.as_deref(),
+            Some("oak"),
+            "the index should still know whose this was"
+        );
+        // But a memory is Weak evidence, and Weak can never license a deletion.
+        assert_eq!(v.confidence, Some(Confidence::Weak));
+        assert!(v.unattributed, "Weak does not reach Strong");
     }
 
     #[test]

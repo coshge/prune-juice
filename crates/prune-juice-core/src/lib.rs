@@ -14,6 +14,7 @@ pub mod docker;
 pub mod error;
 pub mod event;
 pub mod execute;
+pub mod index;
 pub mod json;
 pub mod model;
 pub mod plan;
