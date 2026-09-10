@@ -58,9 +58,16 @@ Then, in the repository settings under **Secrets and variables → Actions**:
 
 | Secret | Value |
 | --- | --- |
-| `MINISIGN_PUBLIC_KEY` | the second line of `prune-juice.pub` |
-| `MINISIGN_SECRET_KEY` | the whole contents of `prune-juice.key` |
+| `MINISIGN_PUBLIC_KEY` | the second line of `prune-juice.pub` — the key alone |
+| `MINISIGN_SECRET_KEY` | `prune-juice.key`: the whole file, or its second line |
 | `MINISIGN_PASSWORD` | the passphrase you chose |
+
+Either shape works for the secret key, because the workflow rebuilds the
+two-line file minisign wants from whichever arrived. That is not fussiness:
+a minisign key file is an `untrusted comment:` line plus the key, and a paste
+of the key alone fails with "Error while loading the secret key file", which
+says nothing about the shape being the problem. The comment line carries no
+information — minisign never reads it back.
 
 The public key also belongs in `RELEASE_KEY` in
 `crates/prune-juice-core/src/update/verify.rs`, and **is already there** — that

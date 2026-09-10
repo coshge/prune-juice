@@ -303,17 +303,36 @@ jobs:
             exit 1
           fi
           brew install minisign
-          printf '%s' "$MINISIGN_SECRET_KEY" > /tmp/minisign.key
+
+          # A minisign key file is two lines — an `untrusted comment:` line and
+          # the key — and a secret pasted as the key line alone does not load.
+          # It fails with "Error while loading the secret key file", which does
+          # not hint at the shape being wrong, and both plausible pastes (the
+          # whole file, or the line RELEASING.md points at) are easy to make.
+          # So the file is rebuilt in canonical form from whichever arrived:
+          # the last non-empty line is the key, and the comment is ours to
+          # supply. The comment line carries no information — minisign does not
+          # read it back.
+          key="$(printf '%s\n' "$MINISIGN_SECRET_KEY" | sed '/^[[:space:]]*$/d' | tail -1)"
+          {
+            echo "untrusted comment: minisign encrypted secret key"
+            printf '%s\n' "$key"
+          } > /tmp/minisign.key
+
           printf '%s' "$MINISIGN_PASSWORD" | minisign -S \
             -s /tmp/minisign.key \
             -m release/update-manifest.json \
             -t "prune-juice ${{ steps.meta.outputs.tag }}"
           rm -f /tmp/minisign.key
+
           # Verified against the public half before publishing. A release that
           # ships a signature nobody can check is worse than no release.
-          printf '%s' "$MINISIGN_PUBLIC_KEY" > /tmp/minisign.pub
-          minisign -V -p /tmp/minisign.pub -m release/update-manifest.json
-          rm -f /tmp/minisign.pub
+          #
+          # `-P <key>` rather than `-p <file>`: the public key is stored as the
+          # bare base64 line — the same form the CLI compiles in — and writing
+          # that to a file makes a one-line file minisign will not load either.
+          pub="$(printf '%s\n' "$MINISIGN_PUBLIC_KEY" | sed '/^[[:space:]]*$/d' | tail -1)"
+          minisign -V -P "$pub" -m release/update-manifest.json
 
       # The document Sparkle reads. The previous feed is fetched first so the
       # version history survives; a missing one starts a new feed.
