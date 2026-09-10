@@ -10,23 +10,26 @@ model strong enough that the headline action needs no confirmation. Free MIT
 Rust CLI; a free macOS app comes later, architected so a one-time paid tier
 could be added without rework.
 
-## Status: M2 complete
+## Status: M3 complete
 
 | milestone | state |
 |---|---|
 | M1 read-only scan with provenance attribution | done |
 | M2 planner, tier classification, apply path | done |
-| M3 interactive ratatui TUI | next |
-| M4 content probe + vault — **unlocks volumes** | not started |
+| M3 interactive ratatui TUI | done |
+| M4 content probe + vault — **unlocks volumes** | next |
 | M5 review, waivers, host disk measurement | not started |
 | M6 macOS app | not started |
 
 ```
-cargo test --workspace                  # 88 tests
+cargo test --workspace                  # 108 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
-./target/debug/prune-juice              # report + dry run, touches nothing
+./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
+./target/debug/prune-juice --no-tui     # force the one-shot report
 ./target/debug/prune-juice --apply      # reclaims the safe tier only
+
+cargo run -p prune-juice-tui --example preview   # render every screen, no TTY needed
 ```
 
 ## Deliberately not implemented — do not "fix" these
@@ -45,6 +48,10 @@ cargo build -p prune-juice-cli
   only if profiling demands it.
 - **No SQLite index yet.** Tier 1 deliberately does not depend on it, so this is
   a missing feature rather than a broken one. Attribution is cold-start only.
+- **The TUI only ever actions the safe tier.** Orphaned and stale items are
+  inspect-only there. Deleting an orphaned volume is irreversible until the
+  vault exists, and two keystrokes is the wrong amount of friction for that.
+  The CLI still permits it via `--tiers orphan --apply` for someone explicit.
 - **`--only-label` skips the build cache entirely.** Build cache records carry
   no labels, so the fence cannot be honoured for them; pruning it anyway would
   break the promise the flag makes.
@@ -82,9 +89,14 @@ All have regression tests — if you break one, a test will tell you.
     or is the last container recording its project's absolute path, removing it
     is a provenance loss. Container labels are the only place a project path
     lives.
-11. **`core` never prints.** `#![deny(clippy::print_stdout, clippy::print_stderr)]`
+11. **The TUI state machine has no terminal dependency.** `app.rs` must not
+    import `ratatui` or `crossterm`; it returns an `Action` and the event loop
+    performs the effect. That is what keeps it testable.
+12. **Every rendered line must fit its terminal.** Column widths derive from the
+    actual area, never a constant. There is a test at widths down to 20.
+13. **`core` never prints.** `#![deny(clippy::print_stdout, clippy::print_stderr)]`
     in `lib.rs` makes UI-agnosticism a compile error.
-12. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
+14. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
     fields and no public constructor; `Fresh` comes only from `revalidate()` and
     is consumed by the executor. Do not add a public constructor or a `Clone`.
 

@@ -27,7 +27,8 @@ $ prune-juice
     nbk_default                                      —  belongs to "nbk", whose directory is gone
 ```
 
-**Status: M2.** Dry-run by default. `--apply` reclaims the safe tier and nothing
+**Status: M3.** `prune-juice` on a terminal opens an interactive interface;
+piped or under CI it prints a one-shot report. Dry-run by default. `--apply` reclaims the safe tier and nothing
 else. Volumes cannot reach the safe tier in this build at all — without a content
 probe there is no way to tell an empty scratch volume from a Postgres data
 directory.
@@ -146,7 +147,8 @@ one that does not.
 ## Usage
 
 ```
-prune-juice                    # report + dry run. Nothing is touched.
+prune-juice                    # interactive on a terminal, one-shot otherwise
+prune-juice --no-tui           # force the one-shot report + dry run
 prune-juice --apply            # reclaim the safe tier
 prune-juice --tiers free       # which tiers to act on (default: free)
 prune-juice --only-label K=V   # hard fence: nothing else is reachable
@@ -192,8 +194,8 @@ Rust 1.85+. No system libraries — SQLite is bundled. `cargo build --workspace`
 
 ## Roadmap
 
-M1 read-only scan (done) · M2 planner and safe tier (done) · M3 interactive TUI ·
-M4 content probe and vault, which is what unlocks volumes · M5 review, waivers,
-host disk measurement · M6 macOS app.
+M1 read-only scan (done) · M2 planner and safe tier (done) · M3 interactive TUI
+(done) · M4 content probe and vault, which is what unlocks volumes · M5 review,
+waivers, host disk measurement · M6 macOS app.
 
 MIT.
