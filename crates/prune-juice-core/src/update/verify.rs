@@ -20,12 +20,14 @@ use crate::error::{Error, Result};
 
 /// The release-signing public key, in minisign's base64 form.
 ///
-/// Empty in this checkout on purpose. Generating a keypair means holding a
-/// secret half, and a public key whose secret half nobody can find is worse
-/// than none — it looks like verification is configured when it is not. See
-/// `RELEASING.md`: generate the pair once, put the secret in the release
-/// secrets, and paste the public half here.
-const RELEASE_KEY: &str = "";
+/// Public by design: it is compiled into every binary, printed by
+/// `minisign -G`, and is the thing installed copies verify *against*. Its
+/// secret half lives in the release secrets and nowhere in this repository —
+/// and a build that had this without that would be worse than having neither,
+/// because it would look like verification was configured when it was not.
+///
+/// It cannot be rotated for copies already installed. See `RELEASING.md`.
+const RELEASE_KEY: &str = "RWSKxpa1AOyFsPDCaVOmqhFHvdKjf9Ahj+z6/HRTLmiMNtDQ2SiA39JF";
 
 /// The key this build will verify against.
 ///
@@ -40,7 +42,17 @@ pub fn release_key() -> Option<&'static str> {
         Some(k) => k,
         None => RELEASE_KEY,
     };
-    (!key.trim().is_empty()).then_some(key.trim())
+    configured(key)
+}
+
+/// Empty — or whitespace, which is how an unset CI variable arrives — means
+/// the feature is **absent**, never "verification off".
+///
+/// Split out from [`release_key`] so that rule is testable without the test
+/// depending on what this particular checkout happens to have compiled in.
+fn configured(key: &str) -> Option<&str> {
+    let key = key.trim();
+    (!key.is_empty()).then_some(key)
 }
 
 /// Verify a detached minisign signature over `data`.
@@ -113,11 +125,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_checkout_with_no_release_key_has_no_update_system() {
-        // Guards the property the rest of the module relies on: an empty key
-        // is not "verification off", it is "the feature is absent".
-        if option_env!("PRUNE_JUICE_UPDATE_PUBKEY").is_none() {
-            assert!(release_key().is_none());
+    fn an_absent_key_means_the_feature_is_absent() {
+        // The property the rest of the module rests on: an empty key is not
+        // "verification off", it is "there is no update system". Whitespace
+        // counts as empty because that is how an unset CI variable arrives.
+        assert!(configured("").is_none());
+        assert!(configured("   \n").is_none());
+        assert_eq!(configured("  RWSKxpa1  "), Some("RWSKxpa1"));
+    }
+
+    #[test]
+    fn whatever_key_this_build_carries_is_a_usable_one() {
+        // A key that is present must load, or every update check in every
+        // copy of this build dies at the last step with "the release key in
+        // this build is unusable" — the one failure the design cannot report
+        // as "no news", because it is ours and not the network's. `None` is
+        // still a valid state: a fork, or a checkout with the key removed.
+        if let Some(key) = release_key() {
+            minisign_verify::PublicKey::from_base64(key)
+                .expect("the compiled-in release key must be a minisign public key");
         }
     }
 

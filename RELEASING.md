@@ -62,13 +62,17 @@ Then, in the repository settings under **Secrets and variables → Actions**:
 | `MINISIGN_SECRET_KEY` | the whole contents of `prune-juice.key` |
 | `MINISIGN_PASSWORD` | the passphrase you chose |
 
-Optionally paste the public key into `RELEASE_KEY` in
-`crates/prune-juice-core/src/update/verify.rs`. Doing so gives a `cargo
-install` from source the same update checking a release build has; leaving it
-empty means only CI-built binaries check for updates. Either is defensible —
-what is *not* defensible is losing the secret half, because every installed
+The public key also belongs in `RELEASE_KEY` in
+`crates/prune-juice-core/src/update/verify.rs`, and **is already there** — that
+is what gives a `cargo install` from source the same update checking a
+CI-built binary has. It is public by construction: every binary carries it, and
+it is the thing installed copies verify *against*.
+
+What is *not* defensible is losing the secret half, because every installed
 copy verifies against the public half and cannot be told to trust a new one.
-**Back up `prune-juice.key` somewhere you would trust with a password.**
+**Back up `prune-juice.key` and its passphrase somewhere you would trust with a
+password**, and keep them out of the working tree — `.gitignore` covers
+`*.key` and `*.pub`, which stops `git add .` and not `git add -f`.
 
 ### 2. The app signing key (Sparkle EdDSA)
 

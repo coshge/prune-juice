@@ -71,9 +71,14 @@ redistribution. You can move the completed `PruneJuice.app` to Applications.
 
 ### Updating a local build
 
-A build from source has no update mechanism — there is no release key in a
-checkout, so the CLI's `--update` and the app's Sparkle integration are both
-disabled deliberately. Rebuild from the working tree instead:
+A CLI built from source checks for updates like a released one, because the
+release public key is compiled in — so `--update` will replace your local build
+with the newest published release. Use `--no-update-check` for one run, or
+`--update-check off` to stop asking. The **app** built from source has no
+update mechanism at all: Sparkle is only enabled when the bundle is built with
+`SPARKLE_PUBLIC_KEY` set.
+
+To run what you have just written, rebuild from the working tree:
 
 ```sh
 ./scripts/install-local.sh          # CLI and app, from one build

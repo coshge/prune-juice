@@ -64,10 +64,22 @@ open app/PruneJuice/dist/PruneJuice.app
 App diagnostics land in `~/Library/Logs/prune-juice-app.log`. A GUI launch has
 no terminal, so that file is the only way to see why a scan failed.
 
-**There is no release-signing key in this checkout**, so nothing here checks
-for updates: `verify::release_key()` returns `None` and the whole feature
-reports itself absent. That is the correct state for a working tree — see
-`RELEASING.md`. To exercise the real path locally:
+**The release key is now compiled in**: `RELEASE_KEY` in
+`update/verify.rs` holds the public half, its secret half lives only in the
+repository secrets, and `verify::release_key()` therefore returns `Some`. So
+every build from this tree — including a `cargo install` — checks for updates
+like a released one does. Until the first tag exists that check 404s, which
+resolves to "no news" on a scan and to exit 5 under `--check-update`.
+
+Two consequences to know before being surprised by them:
+
+- A locally built CLI on your `PATH` will offer to replace itself with the
+  newest *release* once one exists. `--no-update-check` for one run, or
+  `--update-check off` to remember it.
+- The app is still update-less locally: Sparkle needs `SUPublicEDKey`, which
+  `bundle.sh` only writes when `SPARKLE_PUBLIC_KEY` is in the environment.
+
+To point a build at a staging feed and key instead:
 
 ```
 PRUNE_JUICE_UPDATE_PUBKEY=RW… cargo build -p prune-juice-cli
