@@ -61,6 +61,7 @@ fn main() {
             containers: 255,
             images: 144,
             image_bytes: Bytes(82_500_000_000),
+            image_unique_bytes: Some(Bytes(59_300_000_000)),
             volumes: 259,
             volume_bytes: Bytes(35_800_000_000),
             networks: 24,

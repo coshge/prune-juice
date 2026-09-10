@@ -173,6 +173,14 @@ pub struct PlanItem {
     pub kind: ResourceKind,
     pub name: String,
     pub size: Option<Bytes>,
+    /// What removing this one item would actually reclaim. Differs from `size`
+    /// only for images, whose layer stacks overlap: see
+    /// [`ResourceSummary::exclusive_size`]. Every total in this module is
+    /// summed over this figure, never over `size`.
+    ///
+    /// [`ResourceSummary::exclusive_size`]: crate::model::ResourceSummary::exclusive_size
+    #[serde(default)]
+    pub exclusive_size: Option<Bytes>,
     pub owner: Option<String>,
     /// Carried so `--only-label` can be enforced at apply time rather than
     /// merely documented.
@@ -193,6 +201,12 @@ pub struct PlanItem {
 }
 
 impl PlanItem {
+    /// The figure to add up. Falls back to `size` where the daemon did not
+    /// compute the overlap, which over-estimates rather than under-estimates.
+    pub fn reclaimable_size(&self) -> Option<Bytes> {
+        self.exclusive_size.or(self.size)
+    }
+
     pub fn witness(&self) -> Option<&SafeToDelete> {
         self.witness.as_ref()
     }
@@ -225,8 +239,12 @@ impl Plan {
 
     /// Bytes in a tier. Sizes we do not have are counted as zero and the caller
     /// is expected to say the figure is a floor, never to guess.
+    ///
+    /// Summed over the *exclusive* size of each item. A sum over `size` counts
+    /// a shared image layer once per image that sits on it — 82.5 GB of
+    /// "images" on the reference machine that only ever occupied 59.3 GB.
     pub fn bytes_of_tier(&self, t: Tier) -> Bytes {
-        self.of_tier(t).filter_map(|i| i.size).sum()
+        self.of_tier(t).filter_map(|i| i.reclaimable_size()).sum()
     }
 
     /// Everything Tier 1 would reclaim, including the build cache.
@@ -240,7 +258,7 @@ impl Plan {
     pub fn irreversible_free_bytes(&self) -> Bytes {
         self.of_tier(Tier::Free)
             .filter(|i| i.verdict.reversibility.is_gone())
-            .filter_map(|i| i.size)
+            .filter_map(|i| i.reclaimable_size())
             .sum()
     }
 }
@@ -315,6 +333,7 @@ impl Planner {
                 kind: a.resource.kind,
                 name: a.resource.name.clone(),
                 size: a.resource.size,
+                exclusive_size: a.resource.exclusive_size,
                 owner: a.owner.clone(),
                 labels: a.resource.labels.clone(),
                 engine: a.content.as_ref().and_then(|c| match &c.class {
@@ -534,6 +553,52 @@ mod tests {
         assert_eq!(waived.bytes_of_tier(Tier::Free), Bytes::ZERO);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_shared_image_layer_is_counted_once_in_a_tier_total() {
+        // Fifteen project images on the reference machine sit on one 145 MB
+        // WordPress base. Summing their stack sizes reported 82.5 GB of images
+        // where only 59.3 GB was ever on disk, and every opt-in tier promised
+        // more than it could deliver.
+        let image = |name: &str, total: u64, exclusive: u64| {
+            let mut r = ResourceSummary::new(ResourceKind::Image, format!("sha256:{name}"), name);
+            r.created_unix = Some(OLD);
+            r.size = Some(Bytes(total));
+            r.exclusive_size = Some(Bytes(exclusive));
+            r.repo_digests = vec![format!("registry.example/{name}@sha256:deadbeef")];
+            let mut a = attributed(r);
+            a.recovery = Some(crate::model::Recovery::Pull(format!(
+                "registry.example/{name}@sha256:deadbeef"
+            )));
+            a
+        };
+
+        // Two images, 1 GB each, 800 MB of that the same base layer.
+        let rep = report_with(
+            vec![image("one", 1_000, 200), image("two", 1_000, 200)],
+            "D",
+        );
+        let plan = Planner::plan(&rep, NOW);
+        assert_eq!(plan.of_tier(Tier::Repullable).count(), 2);
+        assert_eq!(
+            plan.bytes_of_tier(Tier::Repullable),
+            Bytes(400),
+            "the shared layer belongs to neither image alone"
+        );
+    }
+
+    #[test]
+    fn without_an_exclusive_figure_the_total_falls_back_to_the_stack_size() {
+        // A daemon that did not compute the overlap leaves the tool with one
+        // figure. Over-estimating is the honest direction to be wrong in: the
+        // run reports what it actually freed either way.
+        let mut r = ResourceSummary::new(ResourceKind::Network, "proj_default", "proj_default");
+        r.created_unix = Some(OLD);
+        r.size = Some(Bytes(4_096));
+        let rep = report_with(vec![attributed(r)], "D");
+        let plan = Planner::plan(&rep, NOW);
+        assert_eq!(plan.items[0].reclaimable_size(), Some(Bytes(4_096)));
     }
 
     #[test]

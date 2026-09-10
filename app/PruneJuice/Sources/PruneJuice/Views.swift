@@ -189,7 +189,9 @@ struct RootView: View {
     private var resources: some View {
         VStack(spacing: 0) {
             HStack(spacing: 26) {
-                metric("Images", value: humanBytes(model.totals.imageBytes), count: "\(model.totals.images) images")
+                // The layer figure, not the sum of stack sizes: fifteen images
+                // on one base layer occupy that base once, not fifteen times.
+                metric("Images", value: humanBytes(model.totals.imageDiskBytes), count: "\(model.totals.images) images")
                 Divider().frame(height: 44)
                 metric("Volumes", value: humanBytes(model.totals.volumeBytes), count: "\(model.totals.volumes) volumes")
                 Divider().frame(height: 44)
@@ -222,7 +224,7 @@ struct RootView: View {
                                 }
                                 Spacer(minLength: 8)
                                 VStack(alignment: .trailing, spacing: 5) {
-                                    Text(item.size.map(humanBytes) ?? "Unknown size").monospacedDigit().font(.callout)
+                                    Text(item.reclaimable.map(humanBytes) ?? "Unknown size").monospacedDigit().font(.callout)
                                     Text(tierTitle(item.tier)).font(.caption).foregroundStyle(item.tier == "free" ? .green : .secondary)
                                 }
                             }.padding(.vertical, 7).tag(item.id)

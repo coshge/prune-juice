@@ -143,6 +143,15 @@ pub struct ResourceSummary {
     pub created_unix: Option<i64>,
     pub labels: BTreeMap<String, String>,
     pub size: Option<Bytes>,
+    /// Bytes that removing **this alone** would reclaim.
+    ///
+    /// Equal to `size` for anything that owns all of its bytes. For an image
+    /// it is `size - shared_size`: layer stacks overlap, so fifteen images on
+    /// one 145 MB WordPress base report 145 MB each and a sum over `size`
+    /// counts that base fifteen times. `None` means the daemon did not compute
+    /// the overlap, in which case `size` is the only figure available and it
+    /// is an over-estimate, never an under-estimate.
+    pub exclusive_size: Option<Bytes>,
     /// True when a *running* container references this. Stopped containers do
     /// not count here, but they still count as referrers in the graph.
     pub in_use: bool,
@@ -174,6 +183,7 @@ impl ResourceSummary {
             created_unix: None,
             labels: BTreeMap::new(),
             size: None,
+            exclusive_size: None,
             in_use: false,
             state: None,
             mounts: Vec::new(),
@@ -183,6 +193,13 @@ impl ResourceSummary {
             repo_tags: Vec::new(),
             repo_digests: Vec::new(),
         }
+    }
+
+    /// What removing this alone would actually reclaim, preferring the
+    /// exclusive figure and falling back to the total where the daemon did not
+    /// compute the overlap.
+    pub fn reclaimable_size(&self) -> Option<Bytes> {
+        self.exclusive_size.or(self.size)
     }
 
     pub fn label(&self, key: &str) -> Option<&str> {
@@ -435,7 +452,13 @@ pub struct Totals {
     pub networks: u32,
     pub build_cache_records: u32,
     pub volume_bytes: Bytes,
+    /// Sum over image `size`. Layer stacks overlap, so this is larger than the
+    /// disk the images occupy — it is what `docker images` adds up to.
     pub image_bytes: Bytes,
+    /// What the image layers actually occupy, each shared layer counted once —
+    /// the daemon's own `LayersSize`, not a sum of ours. `None` when sizes were
+    /// not measured, so the difference from `image_bytes` is never invented.
+    pub image_unique_bytes: Option<Bytes>,
     pub build_cache_bytes: Bytes,
 }
 

@@ -18,7 +18,7 @@ use crate::error::Result;
 use crate::event::{Cancel, Event, EventSink, Phase};
 use crate::index::Index;
 use crate::model::{
-    Claim, Confidence, Liveness, ResourceKind, ResourceSummary, SizeSource, Totals,
+    Bytes, Claim, Confidence, Liveness, ResourceKind, ResourceSummary, SizeSource, Totals,
 };
 use crate::probe::{ContentReport, VolumeAccess};
 use crate::providers::{
@@ -306,6 +306,13 @@ impl<'a> Scanner<'a> {
         });
         cancel.check()?;
 
+        // `df` is the slowest call the scan makes and nothing between here and
+        // the sizing phase needs its answer, so it is started now and
+        // collected later. A client that cannot overlap ignores this.
+        if opts.with_sizes {
+            self.client.start_data_usage();
+        }
+
         // --- listing -----------------------------------------------------
         sink.emit(Event::Phase {
             phase: Phase::Listing,
@@ -313,7 +320,7 @@ impl<'a> Scanner<'a> {
             total: Some(4),
         });
 
-        let containers = self.client.list_containers()?;
+        let mut containers = self.client.list_containers()?;
         sink.emit(Event::Phase {
             phase: Phase::Listing,
             done: 1,
@@ -321,7 +328,7 @@ impl<'a> Scanner<'a> {
         });
         cancel.check()?;
 
-        let images = self.client.list_images()?;
+        let mut images = self.client.list_images()?;
         sink.emit(Event::Phase {
             phase: Phase::Listing,
             done: 2,
@@ -377,11 +384,61 @@ impl<'a> Scanner<'a> {
                     for v in &mut volumes {
                         if let Some(b) = u.volume_sizes.get(&v.name) {
                             v.size = Some(*b);
+                            // A volume owns every byte under it, so its
+                            // exclusive size is its size.
+                            v.exclusive_size = Some(*b);
                             sink.emit(Event::SizeUpdated {
                                 id: v.id.clone(),
                                 bytes: *b,
                                 source: SizeSource::DaemonDf,
                             });
+                        }
+                    }
+                    // Images: what the tool would reclaim by removing one is
+                    // its size minus the layers another image also holds.
+                    for i in &mut images {
+                        let Some(shared) = u.image_shared_sizes.get(i.id.as_str()) else {
+                            continue;
+                        };
+                        let total = i.size.unwrap_or(Bytes::ZERO);
+                        i.exclusive_size = Some(Bytes(total.get().saturating_sub(shared.get())));
+                    }
+                    // Containers: the writable layer, measured. This is the
+                    // only place it is ever known, and a container may only
+                    // reach the safe tier on a measured zero.
+                    let mut measured = 0usize;
+                    for c in &mut containers {
+                        if let Some(rw) = u.container_rw_sizes.get(c.id.as_str()) {
+                            c.size_rw = Some(*rw);
+                            measured += 1;
+                        }
+                    }
+                    // Said out loud rather than absorbed. Without these
+                    // figures no container can be proven data-free, so the
+                    // safe tier quietly loses every container — which a user
+                    // should hear about as a reason, not discover as a gap.
+                    if measured < containers.len() {
+                        let msg = format!(
+                            "the daemon reported no writable-layer size for {} of {} \
+                             containers, so those cannot be proven empty and are \
+                             not offered as safe",
+                            containers.len() - measured,
+                            containers.len()
+                        );
+                        sink.emit(Event::Warning {
+                            code: "container_sizes_unavailable".into(),
+                            message: msg.clone(),
+                            resource: None,
+                        });
+                        warnings.push(msg);
+                    }
+                    // Remembered for the next run that cannot afford the
+                    // call. Written before anything is judged with it.
+                    if let Some(index) = self.index {
+                        if let Err(e) =
+                            index.record_volume_sizes(&daemon.id, &u.volume_sizes, now_unix())
+                        {
+                            warnings.push(format!("volume sizes could not be remembered: {e}"));
                         }
                     }
                     usage = u;
@@ -402,6 +459,42 @@ impl<'a> Scanner<'a> {
                 done: 1,
                 total: Some(1),
             });
+        }
+
+        // No fresh figures — `--no-sizes`, or a `df` that failed. Fall back to
+        // what a previous run measured, but only for a volume nothing is
+        // mounting: an unreferenced volume's bytes cannot change, so the
+        // remembered figure is still true, while an in-use volume is being
+        // written to right now and last week's number for it would be an
+        // invented measurement. Labelled `Cache` so the interface can say
+        // "remembered" rather than implying it just looked.
+        let sizes_measured = opts.with_sizes && !usage.volume_sizes.is_empty();
+        if !sizes_measured {
+            if let Some(index) = self.index {
+                let remembered = index.volume_sizes(&daemon.id).unwrap_or_default();
+                let mut used = 0usize;
+                for v in &mut volumes {
+                    if v.size.is_some() || mounted.contains(&v.name) {
+                        continue;
+                    }
+                    if let Some((bytes, _measured_at)) = remembered.get(&v.name) {
+                        v.size = Some(*bytes);
+                        v.exclusive_size = Some(*bytes);
+                        used += 1;
+                        sink.emit(Event::SizeUpdated {
+                            id: v.id.clone(),
+                            bytes: *bytes,
+                            source: SizeSource::Cache,
+                        });
+                    }
+                }
+                if used > 0 {
+                    warnings.push(format!(
+                        "{used} volume size(s) are remembered from an earlier run, not \
+                         measured now; volumes in use have no figure at all"
+                    ));
+                }
+            }
         }
         cancel.check()?;
 
@@ -632,6 +725,9 @@ impl<'a> Scanner<'a> {
         };
         totals.volume_bytes = volumes.iter().filter_map(|v| v.size).sum();
         totals.image_bytes = images.iter().filter_map(|i| i.size).sum();
+        // The daemon's own figure, never a sum of ours: layer stacks overlap,
+        // and only the daemon knows which layers two images share.
+        totals.image_unique_bytes = usage.image_layers_size;
 
         let mut resources =
             Vec::with_capacity(containers.len() + images.len() + volumes.len() + networks.len());
@@ -881,6 +977,9 @@ mod tests {
         fn data_usage(&self) -> Result<DataUsage> {
             Ok(DataUsage {
                 volume_sizes: BTreeMap::new(),
+                image_shared_sizes: BTreeMap::new(),
+                image_layers_size: None,
+                container_rw_sizes: BTreeMap::new(),
                 build_cache_records: 3,
                 build_cache_reclaimable: Bytes(20_520_000_000),
             })
@@ -928,6 +1027,63 @@ mod tests {
             .find(|a| a.resource.name == anon)
             .unwrap();
         assert!(v.resource.in_use, "a mount from any container state counts");
+    }
+
+    #[test]
+    fn a_remembered_size_is_used_only_where_it_cannot_have_changed() {
+        // `--no-sizes` (and a failed `df`) leave the scan with no figures at
+        // all. An unreferenced volume's bytes cannot change while nothing is
+        // mounting it, so last run's measurement is still true — but a volume
+        // in use is being written to right now, and reporting an old number
+        // for it would be inventing a measurement.
+        let index = crate::index::Index::in_memory().unwrap();
+        let daemon = DaemonId("TEST:DAEMON".into());
+        let mut measured = BTreeMap::new();
+        measured.insert("idle_data".to_string(), Bytes(1_200_000_000));
+        measured.insert("live_data".to_string(), Bytes(800_000_000));
+        index
+            .record_volume_sizes(&daemon, &measured, 1_000)
+            .unwrap();
+
+        let client = FakeDocker {
+            containers: vec![container("app-1", &[], &["live_data"])],
+            volumes: vec![volume("idle_data", &[]), volume("live_data", &[])],
+        };
+        let report = Scanner::with_index_only(&client, &index)
+            .scan(
+                "test",
+                &ScanOptions {
+                    with_sizes: false,
+                    ..ScanOptions::default()
+                },
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        let size_of = |name: &str| {
+            report
+                .of_kind(ResourceKind::Volume)
+                .find(|a| a.resource.name == name)
+                .unwrap()
+                .resource
+                .size
+        };
+        assert_eq!(size_of("idle_data"), Some(Bytes(1_200_000_000)));
+        assert_eq!(
+            size_of("live_data"),
+            None,
+            "a mounted volume's remembered size is not a measurement of it now"
+        );
+        assert!(
+            report.stale,
+            "a report built on remembered figures is not a fresh one"
+        );
+        assert!(
+            report.warnings.iter().any(|w| w.contains("remembered")),
+            "the report must say the figures were remembered: {:?}",
+            report.warnings
+        );
     }
 
     #[test]

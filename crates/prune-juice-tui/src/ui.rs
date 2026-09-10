@@ -105,7 +105,7 @@ fn headline(f: &mut Frame, area: Rect, app: &App) {
     let (mut rebuildable, mut restorable) = (Bytes::ZERO, Bytes::ZERO);
     if let Some(p) = &app.plan {
         for i in p.of_tier(Tier::Free) {
-            let b = i.size.unwrap_or(Bytes::ZERO);
+            let b = i.reclaimable_size().unwrap_or(Bytes::ZERO);
             match i.reversibility() {
                 Reversibility::Rebuildable(_) => rebuildable = rebuildable + b,
                 Reversibility::Restorable(_) => restorable = restorable + b,
@@ -187,7 +187,9 @@ fn totals(f: &mut Frame, area: Rect, app: &App) {
                 "  {} containers · {} images ({}) · {} volumes ({}) · {} networks",
                 t.containers,
                 t.images,
-                t.image_bytes.human(),
+                // The layer figure where the daemon computed it: an image's
+                // stacks overlap, so a sum over stack sizes is not disk.
+                t.image_unique_bytes.unwrap_or(t.image_bytes).human(),
                 t.volumes,
                 t.volume_bytes.human(),
                 t.networks
@@ -713,6 +715,7 @@ mod tests {
             docker_reported: Bytes::ZERO,
             predicted: Bytes::ZERO,
             reclamation: None,
+            cancelled: false,
         });
         app.screen = Screen::Finished;
 

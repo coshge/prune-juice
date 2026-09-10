@@ -84,11 +84,11 @@ final class AppModel: ObservableObject {
     }
 
     var busy: Bool { state == .scanning }
-    var items: [Classified] { byTier.values.flatMap { $0 }.sorted { ($0.size ?? 0) > ($1.size ?? 0) } }
-    var safeBytes: UInt64 { (byTier["free"] ?? []).compactMap(\.size).reduce(0, +) + (options.label.isEmpty ? totals.buildCacheBytes : 0) }
+    var items: [Classified] { byTier.values.flatMap { $0 }.sorted { ($0.reclaimable ?? 0) > ($1.reclaimable ?? 0) } }
+    var safeBytes: UInt64 { (byTier["free"] ?? []).compactMap(\.reclaimable).reduce(0, +) + (options.label.isEmpty ? totals.buildCacheBytes : 0) }
     var selectedBytes: UInt64 {
         let resourceBytes = selectedTiers.reduce(UInt64(0)) { total, tier in
-            total + (byTier[tier] ?? []).compactMap(\.size).reduce(0, +)
+            total + (byTier[tier] ?? []).compactMap(\.reclaimable).reduce(0, +)
         }
         let cacheBytes = selectedTiers.contains("free") && options.label.isEmpty && options.sizes
             ? totals.buildCacheBytes : 0
@@ -199,6 +199,12 @@ final class AppModel: ObservableObject {
                     t.imageBytes += b.imageBytes; t.volumeBytes += b.volumeBytes; t.buildCacheBytes += b.buildCacheBytes
                     return t
                 }
+                // Layers are not shared between engines, so these add — but
+                // only if every engine reported one. A single daemon that did
+                // not compute the overlap makes the total unknown, not smaller.
+                let unique = contextTotals.values.map(\.imageUniqueBytes)
+                totals.imageUniqueBytes = unique.contains(where: { $0 == nil })
+                    ? nil : unique.compactMap { $0 }.reduce(0, +)
             }
             if stale {
                 let message = "The scan is incomplete. Sizes are lower bounds; unverified resources remain protected."

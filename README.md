@@ -180,12 +180,14 @@ been unused for days or weeks. Read the individual reason before selecting it.
   Database contents, user data, unknown contents, and uninspected volumes are not
   Safe. If the newest observed write is **less than 24 hours ago**, the volume
   cannot be Safe.
-- **Containers:** recorded writable-layer size must be zero. Any positive size
-  makes deletion irreversible; above 50 MB the classifier also gives a specific
-  writable-layer warning. The current implementation treats an **unknown
-  writable-layer size as zero**, which is a limitation. Mounted-volume provenance
-  must have been durably recorded, and removal must not lose the last unrecorded
-  project-path evidence.
+- **Containers:** the writable-layer size must be **measured** and zero. Any
+  positive size makes deletion irreversible; above 50 MB the classifier also
+  gives a specific writable-layer warning. An **unmeasured** layer is not an
+  empty one: `--no-sizes`, or a daemon that does not report container sizes,
+  leaves every container outside Safe with that stated as the reason. Sizing is
+  on by default, and the figure comes from the same call that sizes volumes, so
+  no extra work is done for it. Mounted-volume provenance must have been durably
+  recorded, and removal must not lose the last unrecorded project-path evidence.
 - **Networks:** must be unreferenced, non-built-in, and pass the creation-age check.
 - **Build cache:** handled separately as Docker-reported reclaimable cache rather
   than classified rows. It is included when Safe is selected, unless sizing is
@@ -225,9 +227,13 @@ volume alone. This preservation guarantee does **not** extend to container
 writable layers or unrecoverable images.
 
 The selected reclaim total is an estimate from known resource sizes, plus eligible
-build cache when Safe is selected. Unknown sizes are not counted, image totals can
-count shared layers more than once, and Docker can refuse items during cleanup.
-Docker logical bytes and host-measured physical reclamation are separate results.
+build cache when Safe is selected. Unknown sizes are not counted, and Docker can
+refuse items during cleanup. Image figures are **exclusive**: an image counts only
+the layers no other image holds, so a shared base layer is counted once rather
+than once per image standing on it. Sums are therefore a floor rather than an
+over-promise — a group whose members share layers with each other frees at least
+its total. Docker logical bytes and host-measured physical reclamation are
+separate results.
 
 ## Vault
 
@@ -375,7 +381,14 @@ signature and install without ceremony.
 
 The Mac app and one-shot CLI scan discovered local Docker contexts by default.
 Contexts that refer to the same daemon are counted once. The interactive terminal
-uses the first local context. Remote TCP and SSH contexts are excluded.
+uses the first local context.
+
+Remote TCP and SSH contexts are excluded, and each exclusion is named in the run
+output rather than passed over in silence. To include one, pass `--remote` with a
+`--reason` of at least 12 characters, the same rule a waiver follows: a remote
+engine's disk is not this machine's disk, its projects are not the directories
+being searched here, and host reclamation cannot be measured at all. Vault
+preserve and restore remain local-only regardless of `--remote`.
 
 ```sh
 # Inspect one named context.
@@ -427,9 +440,10 @@ inspection, so no volume can qualify as Safe on the basis of its contents.
 | `--only-label K=V` | Refuse removal of resources without that exact label. Excludes all build cache because cache records have no labels. |
 | `--no-tui` | Use the one-shot report instead of the interactive terminal. |
 | `--json` | Emit newline-delimited JSON scan and cleanup events. Vault and waiver commands still produce text. |
-| `--no-sizes` | Skip volume sizing and build-cache enumeration. Also excludes build cache from cleanup. |
+| `--no-sizes` | Skip volume sizing and build-cache enumeration. Also excludes build cache from cleanup, and leaves every container outside Safe because its writable layer cannot be proven empty. Volume sizes measured by an earlier run are reported as remembered figures, for volumes nothing is mounting. |
 | `--roots PATHS` | Colon-separated project search directories. |
 | `--context NAME` | Select a local context for scanning and cleanup. Does not select the context for vault preserve or restore. |
+| `--remote` | Include a context that is not a local socket (`tcp://`, `ssh://`). Requires `--reason`. |
 | `--deadline SECS` | Scan deadline, default 120 seconds. Use `0` to wait indefinitely. |
 | `--no-probe` | Skip volume content inspection. Uninspected volumes cannot be Safe. |
 | `--container-probe` | Always inspect volume contents through a temporary container. |
@@ -442,7 +456,7 @@ inspection, so no volume can qualify as Safe on the basis of its contents.
 | `--waivers` | List waivers and exit. |
 | `--waive SELECTOR` | Protect matching resources. Requires `--reason`. |
 | `--unwaive SELECTOR` | Remove a waiver. |
-| `--reason TEXT` | Reason for adding a waiver or deleting a vault copy; at least 12 characters. |
+| `--reason TEXT` | Reason for adding a waiver, deleting a vault copy, or allowing `--remote`; at least 12 characters. |
 | `--check-update` | Ask now whether a newer release exists. Exits 0 up to date, 1 update available, 5 could not check. |
 | `--update` | Install the newest release. Refused when a package manager owns the binary, which then names the command to run instead. |
 | `--update-check on\|off` | Turn the automatic once-a-day check on or off and remember the answer. |
@@ -464,9 +478,10 @@ reports and JSON events go to stdout.
 prune-juice --no-tui > report.txt
 
 # Show Safe resources and their known sizes from streaming JSON events.
+# `exclusive_size` is the field to add up; `size` is the whole layer stack.
 prune-juice --json | jq -r '
   select(.event == "classified" and .tier == "free")
-  | [.kind, .name, (.size // "unknown")] | @tsv'
+  | [.kind, .name, (.exclusive_size // .size // "unknown")] | @tsv'
 
 # Preview cleanup restricted to a project's label.
 prune-juice --no-tui --only-label com.docker.compose.project=example
@@ -482,10 +497,12 @@ prune-juice --no-tui --only-label com.docker.compose.project=example
 | `5` | Partial failure: an operation was refused or failed. |
 | `130` | Cancelled. |
 
-Handle exit `1` explicitly in scripts that use `set -e`. Cancellation from the
-interactive scan can return `130`. Interrupting a one-shot cleanup may prevent a
-complete receipt from being printed; allow it to finish before starting another
-operation.
+Handle exit `1` explicitly in scripts that use `set -e`. Cancellation returns
+`130`, from the interactive scan and from `Ctrl-C` or `SIGTERM` during a one-shot
+run. An interrupted cleanup stops at an item boundary, never inside one, then
+prints the receipt for what it did and skips the build cache; the host
+measurement is reported as unavailable rather than waited for. A second `Ctrl-C`
+exits immediately without that report.
 
 ## Local data
 
@@ -526,14 +543,17 @@ by an existing project, have unreadable or non-reconstructible contents, lack
 sufficient ownership evidence, or need another observation to confirm an absent
 project. Check that your project folders are included in the scan.
 
-**A scan seems slow or incomplete.** Volume sizing can be slow. Activity shows the
+**A scan seems slow or incomplete.** Volume sizing is the slow part, and it runs
+alongside the rest of the scan rather than in front of it. Activity shows the
 current phase in the Mac app. The default scan deadline is 120 seconds; use
 `--deadline 30` for a shorter scan. `--no-sizes` skips sizing, but also hides and
-excludes build cache. Missing measurements are not proof that no space is reclaimable.
+excludes build cache and keeps containers out of Safe. Missing measurements are
+not proof that no space is reclaimable.
 
-**The host gained less space than expected.** Images can share layers, and
-VM-backed runtimes may not immediately return freed blocks to the host. The
-selection total is an estimate. Read Docker-reported and host-measured results
+**The host gained less space than expected.** VM-backed runtimes may not
+immediately return freed blocks to the host, and the selection total is an
+estimate — a floor, since images share layers and each image is counted only for
+the layers it alone holds. Read Docker-reported and host-measured results
 separately; an unavailable host measurement is shown as unavailable.
 
 **A vault restore is refused.** Check the entry ID, archive verification result,

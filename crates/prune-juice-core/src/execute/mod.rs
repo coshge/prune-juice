@@ -134,6 +134,14 @@ pub struct Receipt {
     /// `None` means unmeasurable — never quietly filled in with the Docker
     /// figure, because conflating the two is the whole mistake.
     pub reclamation: Option<Reclamation>,
+    /// The run stopped at a checkpoint because it was interrupted.
+    ///
+    /// A receipt is still returned, and this is why: a Ctrl-C that discarded
+    /// the record would leave a user knowing that some things were deleted and
+    /// not which. Items already attempted are listed exactly as in a run that
+    /// finished; everything after the interruption is simply absent.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 impl Receipt {
@@ -167,7 +175,9 @@ impl Receipt {
     /// is told 12 GB and gets nothing has no reason to believe the next
     /// number either. Reported rather than smoothed over.
     pub fn shortfall(&self) -> Option<(Bytes, Bytes)> {
-        if self.simulated || self.predicted == Bytes::ZERO {
+        // A run the user stopped under-delivers by definition, and saying so
+        // would blame the tool for doing what it was told.
+        if self.simulated || self.cancelled || self.predicted == Bytes::ZERO {
             return None;
         }
         let got = self.docker_reported.get();
@@ -240,6 +250,7 @@ impl<'a> Executor<'a> {
         let simulated = opts.mode == Mode::DryRun || self.mutate.is_none();
         let mut items = Vec::new();
         let mut freed = Bytes::ZERO;
+        let mut cancelled = false;
 
         // Measure the host *before* touching anything. A dry run measures too,
         // so the reporting path is exercised identically.
@@ -300,7 +311,13 @@ impl<'a> Executor<'a> {
                     continue;
                 }
             }
-            cancel.check()?;
+            if cancel.is_cancelled() {
+                // Stop between items, never inside one, and keep everything
+                // recorded so far. The executor works one item at a time, so
+                // this is always a clean boundary.
+                cancelled = true;
+                break;
+            }
 
             let Some(witness) = item.take_witness() else {
                 continue;
@@ -318,7 +335,7 @@ impl<'a> Executor<'a> {
                 kind: item.kind,
                 name: item.name.clone(),
                 tier: item.verdict.tier,
-                size: item.size,
+                size: item.reclaimable_size(),
                 evidence_hash: hash.clone(),
                 outcome,
             };
@@ -363,7 +380,7 @@ impl<'a> Executor<'a> {
 
             if simulated {
                 items.push(record(ItemOutcome::WouldDelete));
-                freed = freed + item.size.unwrap_or(Bytes::ZERO);
+                freed = freed + item.reclaimable_size().unwrap_or(Bytes::ZERO);
                 done += 1;
                 progress(
                     ApplyStage::WouldRemove,
@@ -470,7 +487,7 @@ impl<'a> Executor<'a> {
 
             match res {
                 Ok(()) => {
-                    freed = freed + item.size.unwrap_or(Bytes::ZERO);
+                    freed = freed + item.reclaimable_size().unwrap_or(Bytes::ZERO);
                     match &preserved {
                         Some(e) => items.push(record(ItemOutcome::Preserved(e.id.clone()))),
                         None => items.push(record(ItemOutcome::Deleted)),
@@ -506,7 +523,8 @@ impl<'a> Executor<'a> {
         // labels, so there is no way to honour the fence, and silently pruning
         // it anyway would break the promise the flag makes.
         let mut cache_freed = Bytes::ZERO;
-        if opts.only_label.is_none()
+        if !cancelled
+            && opts.only_label.is_none()
             && opts.only_names.is_none()
             && opts.tiers.contains(&Tier::Free)
             && plan.build_cache_reclaimable > Bytes::ZERO
@@ -563,6 +581,11 @@ impl<'a> Executor<'a> {
         // needs a moment to catch up. Poll until it stops moving rather than
         // reading it once and reporting a lie.
         let reclamation = match (self.disk, before) {
+            // An interrupted run does not stand around waiting for the host
+            // figure to settle — the person pressing Ctrl-C wants the process
+            // back. "Could not be measured" is the honest answer, and it is
+            // the same answer this field carries everywhere else it is unknown.
+            _ if cancelled => None,
             (Some(store), Some(before)) if !simulated => {
                 progress(ApplyStage::MeasuringHost, None, None, done);
                 let after = settle(store, now_unix, &sink);
@@ -591,7 +614,7 @@ impl<'a> Executor<'a> {
                 .sum();
             items + plan.build_cache_reclaimable
         };
-        if !simulated {
+        if !simulated && !cancelled {
             let got = freed + cache_freed;
             if got.get() * 2 <= predicted.get()
                 && predicted.get().saturating_sub(got.get()) > 1_000_000
@@ -609,8 +632,21 @@ impl<'a> Executor<'a> {
             }
         }
 
+        if cancelled {
+            sink.emit(Event::Warning {
+                code: "cancelled".into(),
+                message: format!(
+                    "interrupted after {} of {} items — nothing was left \
+                     half-deleted, and what was done is in the receipt",
+                    done, total
+                ),
+                resource: None,
+            });
+        }
+
         sink.flush();
         Ok(Receipt {
+            cancelled,
             predicted,
             reclamation,
             daemon: plan.daemon.clone(),
@@ -1385,17 +1421,55 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_stops_before_the_next_delete() {
+    fn an_interrupt_mid_run_keeps_the_receipt_for_what_was_deleted() {
+        // The reason a receipt is returned rather than an error: Ctrl-C in the
+        // middle of an apply must not leave a user knowing that some things
+        // were deleted and not which.
+        struct CancelsAfterFirst {
+            cancel: Cancel,
+            calls: Mutex<Vec<String>>,
+        }
+        impl DockerMutate for CancelsAfterFirst {
+            fn remove_network(&self, id: &str) -> Result<()> {
+                self.calls.lock().unwrap().push(id.to_string());
+                self.cancel.cancel();
+                Ok(())
+            }
+            fn remove_volume(&self, _: &str) -> Result<()> {
+                unreachable!("the fixture only has networks")
+            }
+            fn remove_image(&self, _: &str) -> Result<()> {
+                unreachable!("the fixture only has networks")
+            }
+            fn remove_container(&self, _: &str) -> Result<()> {
+                unreachable!("the fixture only has networks")
+            }
+            fn restore_volume(
+                &self,
+                _: &str,
+                _: &std::collections::BTreeMap<String, String>,
+                _: Vec<u8>,
+            ) -> Result<()> {
+                unreachable!("not a restore")
+            }
+            fn prune_build_cache(&self, _: u64) -> Result<Bytes> {
+                panic!("an interrupted run must not go on to prune the cache");
+            }
+        }
+
         let rep = report(vec![
             attributed(network("a_default")),
             attributed(network("b_default")),
+            attributed(network("c_default")),
         ]);
         let plan = Planner::plan(&rep, NOW);
-        let spy = SpyMutate::default();
         let cancel = Cancel::new();
-        cancel.cancel();
+        let mutate = CancelsAfterFirst {
+            cancel: cancel.clone(),
+            calls: Mutex::new(Vec::new()),
+        };
 
-        let err = Executor::applying(&spy)
+        let receipt = Executor::applying(&mutate)
             .run(
                 plan,
                 &rep,
@@ -1407,9 +1481,48 @@ mod tests {
                 Arc::new(NullSink),
                 &cancel,
             )
-            .unwrap_err();
+            .expect("an interrupted run still reports what it did");
 
-        assert!(matches!(err, crate::Error::Cancelled));
+        assert!(receipt.cancelled);
+        assert_eq!(mutate.calls.lock().unwrap().len(), 1);
+        assert_eq!(receipt.deleted(), 1, "{:?}", receipt.items);
+        assert!(
+            receipt.reclamation.is_none(),
+            "a stopped run does not wait for the host figure to settle"
+        );
+    }
+
+    #[test]
+    fn cancellation_stops_before_the_next_delete() {
+        let rep = report(vec![
+            attributed(network("a_default")),
+            attributed(network("b_default")),
+        ]);
+        let plan = Planner::plan(&rep, NOW);
+        let spy = SpyMutate::default();
+        let cancel = Cancel::new();
+        cancel.cancel();
+
+        let receipt = Executor::applying(&spy)
+            .run(
+                plan,
+                &rep,
+                NOW,
+                &ExecuteOptions {
+                    mode: Mode::Apply,
+                    ..Default::default()
+                },
+                Arc::new(NullSink),
+                &cancel,
+            )
+            .expect("an interrupted run still reports what it did");
+
+        assert!(receipt.cancelled);
+        assert_eq!(receipt.deleted(), 0);
         assert!(spy.calls().is_empty());
+        assert!(
+            receipt.shortfall().is_none(),
+            "a stopped run must not be accused of under-delivering"
+        );
     }
 }

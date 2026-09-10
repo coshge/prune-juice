@@ -22,9 +22,25 @@ use crate::error::Result;
 use crate::model::{Bytes, DaemonId, ResourceSummary, RuntimeFlavor};
 
 /// The result of one `/system/df`.
+///
+/// `df` is the only call that returns *exclusive* sizes, and it is already
+/// being made, so every figure here is one the scan would otherwise have to
+/// guess at: an image's shared layers, and a container's writable layer.
 #[derive(Clone, Debug, Default)]
 pub struct DataUsage {
     pub volume_sizes: BTreeMap<String, Bytes>,
+    /// Bytes of an image's layer stack that some *other* image also holds, by
+    /// image ID. Removing the image reclaims `size - shared`, so a naive sum
+    /// over images counts a shared base layer once per image that sits on it.
+    pub image_shared_sizes: BTreeMap<String, Bytes>,
+    /// `LayersSize`: what every image layer on the daemon occupies in total,
+    /// each shared layer counted once. The daemon's own arithmetic, and the
+    /// only correct answer to "how much disk do the images use".
+    pub image_layers_size: Option<Bytes>,
+    /// Writable-layer size per container ID. Present for every container `df`
+    /// reported, **including zero** — a measured zero is what licenses a
+    /// container into the safe tier, and an absent entry means unmeasured.
+    pub container_rw_sizes: BTreeMap<String, Bytes>,
     pub build_cache_records: u32,
     /// Only records that are neither in use nor shared with a live build.
     /// Deliberately the conservative figure: `docker buildx du` reports the
@@ -88,6 +104,16 @@ pub trait DockerClient: Send + Sync {
     /// Expensive regardless — it `du`s every volume directory, and is reported
     /// at minutes on some setups. Must never sit on a first-paint path.
     fn data_usage(&self) -> Result<DataUsage>;
+
+    /// Start the `df` early, if this client can run it in the background.
+    ///
+    /// `df` costs about a second and a half on the reference machine, and the
+    /// listing, probing and attribution that follow it need nothing from it.
+    /// A client that can overlap the two says so by implementing this; the
+    /// following [`Self::data_usage`] then collects the answer instead of
+    /// waiting for it. Default is a no-op, so a client that cannot overlap is
+    /// unaffected and the call sequence is identical either way.
+    fn start_data_usage(&self) {}
 }
 
 /// What a probe container reports back about one volume.

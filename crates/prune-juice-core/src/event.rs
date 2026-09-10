@@ -79,6 +79,11 @@ pub enum Event {
         tier: String,
         because: String,
         size: Option<Bytes>,
+        /// What removing this alone reclaims. Equal to `size` except for an
+        /// image, where the layers another image also holds are excluded — so
+        /// this is the field to sum, and `size` is the one to compare against
+        /// `docker images`.
+        exclusive_size: Option<Bytes>,
         owner: Option<String>,
         provenance: Vec<String>,
     },
@@ -213,6 +218,19 @@ impl Cancel {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+
+    /// A `&'static` view of the flag, for a caller that must set it from a
+    /// context where nothing may be allocated, locked or dropped — a signal
+    /// handler is the only such caller here.
+    ///
+    /// Leaks one `Arc` clone on purpose: the handler outlives every scope in
+    /// the process, and a dangling flag read from inside a handler is not a
+    /// bug anyone can debug. Called once per process.
+    pub fn leak_static(&self) -> &'static AtomicBool {
+        // SAFETY: `into_raw` gives up one strong reference, so the allocation
+        // is never freed and the reference is genuinely `'static`.
+        unsafe { &*Arc::into_raw(self.0.clone()) }
     }
 
     /// Call between units of work.

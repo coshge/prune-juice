@@ -10,7 +10,7 @@ model strong enough that the headline action needs no confirmation. Free MIT
 Rust CLI; a free macOS app comes later, architected so a one-time paid tier
 could be added without rework.
 
-## Status: M7 — automatic updates
+## Status: M8 — known-gap cleanup
 
 | milestone | state |
 |---|---|
@@ -23,9 +23,10 @@ could be added without rework.
 | M6 macOS app — window, scan, review; unsigned | done |
 | M7 updates — GitHub Releases, Sparkle, CLI self-update, CI | done |
 | README tutorial | done |
+| M8 known-gap cleanup — exclusive image sizes, measured writable layers, SIGINT, remote gate, size cache | done |
 
 ```
-cargo test --workspace                  # 276 tests
+cargo test --workspace                  # 285 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -36,6 +37,8 @@ cargo build -p prune-juice-cli
 ./target/debug/prune-juice --vault-dump VOL   # preserve one now, delete nothing
 ./target/debug/prune-juice --vault-verify     # re-read every copy
 ./target/debug/prune-juice --vault-restore ID # put a volume back
+./target/debug/prune-juice --no-sizes          # skip df; remembered volume sizes
+./target/debug/prune-juice --remote --reason "..."   # allow a tcp:// or ssh:// daemon
 ./target/debug/prune-juice --waivers          # what is being held back by hand
 ./target/debug/prune-juice --waive SEL --reason "..."   # hold something back
 
@@ -154,6 +157,29 @@ PRUNE_JUICE_UPDATE_URL=https://…/update-manifest.json \
 - **`--only-label` skips the build cache entirely.** Build cache records carry
   no labels, so the fence cannot be honoured for them; pruning it anyway would
   break the promise the flag makes.
+- **An unmeasured writable layer is not an empty one.** `size_rw` used to be
+  taken as zero when absent, and absent is what it always was — the container
+  listing does not ask for sizes, because that is the expensive per-container
+  path. So every container was treated as holding nothing, and one holding a
+  database dump could reach the tier that deletes without asking. The figure
+  now comes from `/system/df`, which is already being called for volumes, and
+  `None` means "cannot be proven empty" and stays out of the safe tier with
+  that as its stated reason. This is why `--no-sizes` offers no containers.
+- **A remote daemon is refused unless it is asked for by name.** `--remote`
+  plus a `--reason` of twelve characters or more, the same rule a waiver
+  follows. A remote engine's disk is not this machine's disk, its projects are
+  not the directories being searched, and host reclamation cannot be measured
+  at all — so scanning one is a deliberate act, not a default. Each excluded
+  context is named in the output; a remote daemon dropped in silence looks
+  exactly like a daemon that is not there. Vault preserve and restore stay
+  local-only regardless, because pulling a volume across a network to back it
+  up is a different operation from the one that flag authorises.
+- **An interrupted apply returns its receipt, not an error.** Ctrl-C sets the
+  same `Cancel` the scan already consulted; the executor stops between items —
+  never inside one — skips the build cache, and reports what it did. A run
+  that deleted eleven things and told you about none of them is worse than the
+  interruption. A second Ctrl-C `_exit`s immediately, because the second press
+  is not a request to be patient.
 
 ## Invariants that must not be broken
 
@@ -315,6 +341,33 @@ All have regression tests — if you break one, a test will tell you.
     anything is built. The updater compares against the version compiled into
     the binary, so a release tagged `v0.2.0` built from `0.1.0` sources is a
     release nobody is ever offered.
+44. **Every total is summed over exclusive size, never over `size`.**
+    `ResourceSummary::reclaimable_size` and `PlanItem::reclaimable_size` are
+    the only figures that may be added up. An image's `size` is its whole
+    layer stack, and fifteen project images standing on one 145 MB WordPress
+    base each report that base — 82.5 GB of "images" on the reference machine
+    that only ever occupied 59.3 GB, and an opt-in tier promising a third more
+    than it could deliver. Exclusive size comes from `df`'s `SharedSize`; the
+    headline image figure is the daemon's own `LayersSize`, not a sum of ours,
+    because only the daemon knows which layers two images share. Where the
+    overlap was not computed the fallback is `size`, which over-estimates —
+    the honest direction to be wrong in, since the run reports what it
+    actually freed.
+45. **A remembered size may be reported only for a volume nothing mounts.** An
+    unreferenced volume's bytes cannot change, so last run's measurement is
+    still true and `--no-sizes` need not report nothing. A mounted volume is
+    being written to as we speak, and giving last week's figure for it would
+    be inventing a measurement. Labelled `SizeSource::Cache` so the interface
+    can say "remembered" rather than implying it just looked, and the report
+    stays `stale` either way. Nothing size-derived licenses a deletion, so a
+    remembered figure can never widen what is offered.
+46. **`df` runs alongside the scan, never in front of it.** `start_data_usage`
+    puts it on the runtime's worker threads before the listing, and
+    `data_usage` collects it at the sizing phase. It is the slowest call the
+    scan makes (~1.4 s here) and nothing between the two points needs its
+    answer. Default no-op on the trait, so a client that cannot overlap is
+    unaffected and the call sequence is identical either way — still exactly
+    one `df`, still degrading to a warning on failure.
 
 ## The acceptance gate
 
@@ -378,8 +431,6 @@ checkouts "derivative" because they contained a `vendor` directory.
 
 ## Known gaps worth picking up
 
-- Image sizes are summed naively, so shared base layers are counted more than
-  once (82.5 GB reported vs ~80.5 GB actual). Needs exclusive-size accounting.
 - Waivers still live in a JSON file rather than the index. Harmless, but they
   could move now that the index exists.
 - **No release has been cut yet, so one link is unexercised.** Every piece of
@@ -394,26 +445,36 @@ checkouts "derivative" because they contained a `vendor` directory.
   `brew upgrade prune-juice` hint are correct and tested, but nothing is in a
   tap yet, so that branch is currently unreachable in practice. It costs
   nothing to have ready and is wrong to remove.
-- **There is no SIGINT handler.** `Error::Cancelled`/exit 130 is only reachable
-  by quitting the TUI mid-scan; Ctrl-C during a one-shot `--apply` kills the
-  process wherever it happens to be. Harmless for a read-only scan, and the
-  executor is item-at-a-time so it cannot tear one item in half, but the
-  receipt is not written. `Cancel` already exists in core and is threaded
-  through the scan — this is wiring a handler to it, not new machinery.
-- The plan called for refusing non-unix-socket daemons unless `--remote
-  --reason` (F5). Not implemented: `RuntimeFlavor::Remote` is detected but only
-  ever consulted by `disk/mod.rs` to report that the host cannot be measured. A
-  `tcp://` context is scanned like any other.
-- Warm scan is ~3–6 s, over the sub-2 s target. The fix is the size cache: an
-  orphaned volume's size is immutable, so its cache entry is valid forever, and
-  the expensive `df` is only needed for in-use volumes — exactly the ones that
-  will never be deleted.
+- **Warm scan is ~1.6 s per scan, and a dry run does two of them.** Measured
+  on the reference machine with `--json` phase timestamps: listing images
+  0.6 s, sizing 0.4 s (the rest of `df` having already run alongside the
+  listing), probing 160 volumes 0.05 s, attribution 0.05 s. One scan is now
+  inside the sub-2 s target; the ~3.3 s a dry run takes is two scans, because
+  the executor revalidates every witness against a *fresh* report and that is
+  the property that makes dry-run an oracle for the apply path. Reusing the
+  planning report would halve the time and make the preview rosier than the
+  real thing — a preview that can never report a stale witness. What is left
+  to win is the second `df` inside that re-scan, which cannot be skipped for
+  the same reason: `size_rw` is part of the evidence a witness rests on, so a
+  size-less re-scan would make every witness stale.
+- **A remembered volume size is never used when `df` succeeded**, even for a
+  volume `df` did not mention. That case means the daemon dropped a volume it
+  had previously reported, which is more interesting than a missing number and
+  should not be papered over with an old figure.
+- **The interrupt handler is unix-only.** `install` is a no-op elsewhere and
+  Ctrl-C keeps its default behaviour, which is what it did before. Windows'
+  CRT supports `signal(SIGINT, …)` and would need the console-handler path for
+  anything more; nothing here is tested on Windows, so it is left honest
+  rather than half-claimed.
 - bollard cannot encode `?type=` on `/system/df` (`serde_urlencoded` rejects a
   `Vec`), so the planned filter optimisation is unavailable. One unfiltered call
   returns volumes and build cache together, which is what `data_usage()` does.
   **This makes `--no-sizes` sharper than it looks:** it hides the build cache
   as well, so the safe tier reads 0 B and `--apply` prunes none of it (the
-  prune is gated on `plan.build_cache_reclaimable > 0` at `execute/mod.rs:414`).
+  prune is gated on `plan.build_cache_reclaimable > 0` in `execute/mod.rs`).
+  It also takes every container out of the safe tier, since a writable layer
+  nobody measured cannot be proven empty. Volume sizes are the one thing that
+  survives the flag, remembered from an earlier run.
   Documented in the help and the tutorial. The available fix is to prune the
   cache under `--no-sizes` anyway and report what the daemon says it freed —
   `/build/prune` needs no `df` — but that means deleting without a

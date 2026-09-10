@@ -387,7 +387,7 @@ impl App {
                 p.items
                     .iter()
                     .filter(|i| group.includes(i.verdict.tier))
-                    .filter_map(|i| i.size)
+                    .filter_map(|i| i.reclaimable_size())
                     .sum()
             })
             .unwrap_or(Bytes::ZERO)
@@ -642,7 +642,9 @@ fn build_review_rows(plan: &Plan, group: ReviewGroup) -> Vec<ReviewRow> {
         .map(|i| ReviewRow {
             kind: i.kind,
             name: i.name.clone(),
-            size: i.size,
+            // The exclusive figure, so a group total is what removing the
+            // group frees rather than a sum that counts shared layers twice.
+            size: i.reclaimable_size(),
             tier: i.verdict.tier,
             owner: i.owner.clone(),
             because: i.verdict.because.clone(),
@@ -724,6 +726,9 @@ mod tests {
         r.created_unix = Some(OLD);
         r.state = Some(prune_juice_core::model::ContainerState::Exited);
         r.image_id = Some(image.resource.id.clone());
+        // Measured empty, as `/system/df` reports a container holding
+        // nothing. Leaving it unmeasured keeps it out of the safe tier.
+        r.size_rw = Some(Bytes::ZERO);
         attributed(r, false)
     }
 

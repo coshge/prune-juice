@@ -142,6 +142,36 @@ final class AppTests: XCTestCase {
         XCTAssertEqual(model.selectedBytes, 0)
     }
 
+    @MainActor func testReclaimEstimateCountsASharedImageLayerOnce() {
+        // Two 1 GB images, 800 MB of it the same base layer. Adding the stack
+        // sizes promises 2 GB where removing both frees 1.2 GB.
+        let model = AppModel(service: StubService())
+        model.byTier["repullable"] = [
+            Classified(kind: "image", name: "one", tier: "repullable", because: "fixture",
+                       size: 1_000_000_000, exclusiveSize: 200_000_000, owner: nil, provenance: []),
+            Classified(kind: "image", name: "two", tier: "repullable", because: "fixture",
+                       size: 1_000_000_000, exclusiveSize: 200_000_000, owner: nil, provenance: []),
+        ]
+        model.selectedTiers = ["repullable"]
+        XCTAssertEqual(model.selectedBytes, 400_000_000)
+
+        // Where the daemon did not compute the overlap there is one figure,
+        // and over-estimating is the honest direction to be wrong in.
+        model.byTier["repullable"] = [
+            Classified(kind: "image", name: "one", tier: "repullable", because: "fixture",
+                       size: 1_000_000_000, owner: nil, provenance: []),
+        ]
+        XCTAssertEqual(model.selectedBytes, 1_000_000_000)
+    }
+
+    @MainActor func testImageMetricPrefersTheLayerFigure() {
+        let model = AppModel(service: StubService())
+        model.totals.imageBytes = 82_500_000_000
+        XCTAssertEqual(model.totals.imageDiskBytes, 82_500_000_000)
+        model.totals.imageUniqueBytes = 59_300_000_000
+        XCTAssertEqual(model.totals.imageDiskBytes, 59_300_000_000)
+    }
+
     func testProtocolProgressAndForwardCompatibility() throws {
         let line = Data(#"{"v":1,"seq":1,"event":"apply_progress","stage":"removing","name":"test","done":1,"total":2}"#.utf8)
         guard case .progress(let stage, let name, let done, let total) = try Envelope.decode(line: line)?.event else { return XCTFail("Missing progress") }

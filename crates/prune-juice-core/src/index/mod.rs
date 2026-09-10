@@ -21,9 +21,9 @@ use std::collections::BTreeMap;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{Error, Result};
-use crate::model::{DaemonId, ResourceKind, ResourceSummary};
+use crate::model::{Bytes, DaemonId, ResourceKind, ResourceSummary};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub struct Index {
     conn: Connection,
@@ -145,6 +145,19 @@ impl Index {
             );
             CREATE INDEX IF NOT EXISTS edge_volume ON edge(daemon_id, volume);
 
+            -- Measured volume sizes. `/system/df` is the slowest call the scan
+            -- makes (~1.4 s on the reference machine, minutes on some setups),
+            -- and an *unreferenced* volume's size cannot change while nothing
+            -- is mounting it — so a run that skips the call still has a
+            -- figure, clearly labelled as remembered rather than measured.
+            CREATE TABLE IF NOT EXISTS volume_size (
+                daemon_id    TEXT NOT NULL,
+                name         TEXT NOT NULL,
+                bytes        INTEGER NOT NULL,
+                measured_at  INTEGER NOT NULL,
+                PRIMARY KEY (daemon_id, name)
+            );
+
             CREATE TABLE IF NOT EXISTS project (
                 daemon_id      TEXT NOT NULL,
                 path           TEXT NOT NULL,
@@ -237,6 +250,57 @@ impl Index {
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Remember the sizes a `df` just measured.
+    ///
+    /// Written as soon as the figures arrive, before anything is judged with
+    /// them, for the same reason [`Self::record_scan`] is.
+    pub fn record_volume_sizes(
+        &self,
+        daemon: &DaemonId,
+        sizes: &BTreeMap<String, Bytes>,
+        now_unix: i64,
+    ) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (name, bytes) in sizes {
+            tx.execute(
+                "INSERT INTO volume_size(daemon_id, name, bytes, measured_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(daemon_id, name) DO UPDATE SET
+                    bytes = ?3, measured_at = ?4",
+                params![daemon.as_str(), name, bytes.get() as i64, now_unix],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Sizes measured on a previous run, with when each was measured.
+    ///
+    /// A remembered size is only usable for a volume nothing is mounting: an
+    /// in-use volume is being written to as we speak, and reporting last
+    /// week's figure for it would be inventing a measurement. The caller
+    /// enforces that; this call just hands over what is remembered.
+    pub fn volume_sizes(&self, daemon: &DaemonId) -> Result<BTreeMap<String, (Bytes, i64)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, bytes, measured_at FROM volume_size WHERE daemon_id = ?1")?;
+        let rows = stmt.query_map(params![daemon.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                (
+                    Bytes(r.get::<_, i64>(1)?.max(0) as u64),
+                    r.get::<_, i64>(2)?,
+                ),
+            ))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (name, v) = row?;
+            out.insert(name, v);
+        }
+        Ok(out)
     }
 
     /// Record whether each known project directory was present this scan.
@@ -513,6 +577,30 @@ mod tests {
         let h = idx.project_history(&daemon(), &p).unwrap().unwrap();
         assert_eq!(h.absent_scans, 0, "a sighting must reset the count");
         assert!(h.absent_since_unix.is_none());
+    }
+
+    #[test]
+    fn measured_volume_sizes_are_remembered_and_keyed_by_daemon() {
+        let ix = Index::in_memory().unwrap();
+        let mut sizes = BTreeMap::new();
+        sizes.insert("oak_mysql".to_string(), Bytes(1_200_000_000));
+        ix.record_volume_sizes(&daemon(), &sizes, 1000).unwrap();
+
+        let back = ix.volume_sizes(&daemon()).unwrap();
+        assert_eq!(back.get("oak_mysql"), Some(&(Bytes(1_200_000_000), 1000)));
+
+        // A re-measurement replaces the figure rather than accumulating rows.
+        sizes.insert("oak_mysql".to_string(), Bytes(900_000_000));
+        ix.record_volume_sizes(&daemon(), &sizes, 2000).unwrap();
+        let back = ix.volume_sizes(&daemon()).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back.get("oak_mysql"), Some(&(Bytes(900_000_000), 2000)));
+
+        // Another engine's measurement is not this engine's.
+        assert!(ix
+            .volume_sizes(&DaemonId("OTHER".into()))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

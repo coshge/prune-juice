@@ -23,10 +23,18 @@ use super::{
     detect_runtime, DaemonIdentity, DataUsage, DockerClient, DockerMutate, DockerProbe, RawProbe,
 };
 
+/// A `df` already in flight on the runtime's worker threads.
+type PendingUsage = tokio::task::JoinHandle<
+    std::result::Result<bollard::models::SystemDataUsageResponse, bollard::errors::Error>,
+>;
+
 pub struct BollardClient {
     docker: Docker,
     runtime: tokio::runtime::Runtime,
     endpoint: String,
+    /// Set by [`DockerClient::start_data_usage`] and taken by `data_usage`.
+    /// A `Mutex` because the trait is `&self` — one slot, at most one task.
+    pending_usage: std::sync::Mutex<Option<PendingUsage>>,
 }
 
 impl BollardClient {
@@ -51,6 +59,7 @@ impl BollardClient {
             docker,
             runtime,
             endpoint: endpoint.to_string(),
+            pending_usage: std::sync::Mutex::new(None),
         })
     }
 
@@ -277,7 +286,13 @@ impl DockerClient for BollardClient {
                 r.in_use = state.is_live();
                 r.state = Some(state);
                 r.image_id = c.image_id.map(ResourceId);
-                r.size_rw = c.size_rw.filter(|v| *v > 0).map(|v| Bytes(v as u64));
+                // Deliberately NOT taken from the listing: `size` was not
+                // requested, so a daemon that answers `0` here is answering
+                // "not computed", and a fabricated zero is exactly what would
+                // walk a container holding data into the safe tier. `df`
+                // fills this in, and until it does the honest value is
+                // "unmeasured".
+                r.size_rw = None;
                 r.mounts = c
                     .mounts
                     .unwrap_or_default()
@@ -385,18 +400,65 @@ impl DockerClient for BollardClient {
             .collect())
     }
 
+    fn start_data_usage(&self) {
+        // `df` needs nothing from the listing, probing or attribution that
+        // follows it, so it runs on a worker thread while those happen. The
+        // task is fire-and-forget from here: if nobody collects it the handle
+        // is dropped and the request is cancelled with it.
+        let docker = self.docker.clone();
+        let handle = self
+            .runtime
+            .spawn(async move { docker.df(None::<DataUsageOptions>).await });
+        if let Ok(mut slot) = self.pending_usage.lock() {
+            // A second start before the first is collected replaces it; the
+            // dropped handle cancels the earlier request.
+            *slot = Some(handle);
+        }
+    }
+
     fn data_usage(&self) -> Result<DataUsage> {
         // `None` rather than a `type` filter: see the trait doc. bollard cannot
         // encode the filter, and one unfiltered call returns both halves.
-        let usage = self
-            .block(self.docker.df(None::<DataUsageOptions>))
-            .map_err(|e| map_err(e, &self.endpoint))?;
+        let started = self.pending_usage.lock().ok().and_then(|mut s| s.take());
+        let usage = match started {
+            // A task that panicked is a bug, not a daemon problem, so it is
+            // allowed to propagate as a panic rather than becoming "no sizes".
+            Some(handle) => self
+                .block(handle)
+                .expect("the df task must not panic")
+                .map_err(|e| map_err(e, &self.endpoint))?,
+            None => self
+                .block(self.docker.df(None::<DataUsageOptions>))
+                .map_err(|e| map_err(e, &self.endpoint))?,
+        };
 
         let mut volume_sizes = BTreeMap::new();
         for v in usage.volumes.unwrap_or_default() {
             if let Some(u) = v.usage_data {
                 if u.size >= 0 {
                     volume_sizes.insert(v.name, Bytes(u.size as u64));
+                }
+            }
+        }
+
+        // `SharedSize` is `-1` when the daemon did not compute it, which is
+        // "unknown" and must not be read as "shares nothing" — that would
+        // inflate the exclusive figure back to the total.
+        let mut image_shared_sizes = BTreeMap::new();
+        for i in usage.images.unwrap_or_default() {
+            if i.shared_size >= 0 {
+                image_shared_sizes.insert(i.id, Bytes(i.shared_size as u64));
+            }
+        }
+
+        // A writable-layer size of zero is a *fact*, and the only fact that
+        // lets a container into the safe tier, so it is recorded rather than
+        // filtered out. Absent means unmeasured.
+        let mut container_rw_sizes = BTreeMap::new();
+        for c in usage.containers.unwrap_or_default() {
+            if let (Some(id), Some(rw)) = (c.id, c.size_rw) {
+                if rw >= 0 {
+                    container_rw_sizes.insert(id, Bytes(rw as u64));
                 }
             }
         }
@@ -410,6 +472,12 @@ impl DockerClient for BollardClient {
 
         Ok(DataUsage {
             volume_sizes,
+            image_shared_sizes,
+            image_layers_size: usage
+                .layers_size
+                .filter(|s| *s >= 0)
+                .map(|s| Bytes(s as u64)),
+            container_rw_sizes,
             build_cache_records: records.len() as u32,
             build_cache_reclaimable: Bytes(reclaimable),
         })

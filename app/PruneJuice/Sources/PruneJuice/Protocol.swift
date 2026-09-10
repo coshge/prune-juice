@@ -19,14 +19,24 @@ struct Totals: Decodable, Sendable {
     var networks: UInt32 = 0
     var buildCacheRecords: UInt32 = 0
     var volumeBytes: UInt64 = 0
+    /// Sum over image stack sizes — what `docker images` adds up to. Larger
+    /// than the disk the images occupy, because stacks overlap.
     var imageBytes: UInt64 = 0
+    /// What the image layers actually occupy, each shared layer counted once,
+    /// as the daemon computes it. `nil` when sizes were not measured — never
+    /// filled in with `imageBytes`, which is a different number.
+    var imageUniqueBytes: UInt64?
     var buildCacheBytes: UInt64 = 0
+
+    /// The figure to show for images: the layer total where it is known.
+    var imageDiskBytes: UInt64 { imageUniqueBytes ?? imageBytes }
 
     enum CodingKeys: String, CodingKey {
         case containers, images, volumes, networks
         case buildCacheRecords = "build_cache_records"
         case volumeBytes = "volume_bytes"
         case imageBytes = "image_bytes"
+        case imageUniqueBytes = "image_unique_bytes"
         case buildCacheBytes = "build_cache_bytes"
     }
 }
@@ -38,11 +48,24 @@ struct Classified: Decodable, Sendable, Identifiable {
     let tier: String
     let because: String
     let size: UInt64?
+    /// What removing this one thing reclaims. Equal to `size` except for an
+    /// image, where layers another image also holds are excluded. Sums are
+    /// taken over this: a shared base layer counted once per image that sits
+    /// on it inflated the reference machine's images from 59.3 GB to 82.5 GB.
+    /// A `var`, so it defaults to `nil` and an older helper's output — or a
+    /// test fixture — still constructs.
+    var exclusiveSize: UInt64?
     let owner: String?
     let provenance: [String]
 
     var context: String = ""
-    enum CodingKeys: String, CodingKey { case kind, name, tier, because, size, owner, provenance }
+    /// The figure to add up, falling back to the stack size where the daemon
+    /// did not compute the overlap.
+    var reclaimable: UInt64? { exclusiveSize ?? size }
+    enum CodingKeys: String, CodingKey {
+        case kind, name, tier, because, size, owner, provenance
+        case exclusiveSize = "exclusive_size"
+    }
     var id: String { "\(context):\(kind):\(name)" }
 }
 

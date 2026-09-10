@@ -24,6 +24,8 @@ use prune_juice_core::waiver::Waivers;
 use prune_juice_core::Error;
 use prune_juice_tui::TuiOptions;
 
+mod interrupt;
+
 const USAGE: &str = "\
 prune-juice — reclaim Docker disk with provenance
 
@@ -51,6 +53,11 @@ OPTIONS:
                         not before an --apply.
     --roots <PATHS>     Colon-separated dirs to search for projects
     --context <NAME>    Scan only this context
+    --remote            Allow a daemon that is not a local socket (tcp://,
+                        ssh://). Needs --reason. Off by default: a remote
+                        engine's disk is not this machine's disk, its projects
+                        are not these projects, and the provenance recorded
+                        here would be about someone else's resources.
     --no-tui            Force the one-shot report even on a terminal
     --deadline SECS     Give up after this long and report what was gathered
                         (default 120, 0 to wait indefinitely)
@@ -118,6 +125,9 @@ struct Args {
     only_label: Option<(String, String)>,
     roots: Vec<PathBuf>,
     only_context: Option<String>,
+    /// Consent to talk to a daemon that is not a local socket. Paired with a
+    /// written reason, like every other exception this tool makes.
+    remote: bool,
     no_tui: bool,
     no_probe: bool,
     force_container_probe: bool,
@@ -165,6 +175,7 @@ fn parse_args() -> Result<Args, String> {
         only_label: None,
         roots: default_roots(),
         only_context: None,
+        remote: false,
         no_tui: false,
         no_probe: false,
         force_container_probe: false,
@@ -189,6 +200,7 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|_| "--deadline needs a number of seconds")?;
                 a.deadline = (secs > 0).then(|| std::time::Duration::from_secs(secs));
             }
+            "--remote" => a.remote = true,
             "--no-probe" => a.no_probe = true,
             "--container-probe" => a.force_container_probe = true,
             "--no-vault" => a.no_vault = true,
@@ -281,6 +293,29 @@ fn parse_args() -> Result<Args, String> {
     Ok(a)
 }
 
+/// Whether this run may talk to a daemon that is not a local socket, and why.
+///
+/// `--remote` on its own is not enough, for the same reason a waiver needs a
+/// sentence: an exception nobody can explain later is worse than none. A
+/// remote engine's disk is not this machine's disk, so nothing it reports can
+/// be cross-checked against the filesystem here, host reclamation cannot be
+/// measured at all, and the projects the scan looks for are local
+/// directories that have nothing to do with the resources being judged.
+fn remote_authorisation(args: &Args) -> Result<Option<String>, Error> {
+    if !args.remote {
+        return Ok(None);
+    }
+    let reason = args.reason.as_deref().unwrap_or("").trim().to_string();
+    if reason.chars().count() < 12 {
+        return Err(Error::Config(
+            "--remote needs --reason \"…\" saying why this run should judge a daemon whose \
+             disk and projects are not this machine's (12 characters or more)"
+                .into(),
+        ));
+    }
+    Ok(Some(reason))
+}
+
 fn default_roots() -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(h) = std::env::var("HOME") {
@@ -333,6 +368,11 @@ fn main() {
 
     match run(&args) {
         Ok(code) => std::process::exit(code),
+        // A Ctrl-C is not a fault to report back to the person who pressed it.
+        Err(Error::Cancelled) if interrupt::interrupted() => {
+            eprintln!("interrupted — the scan stopped and nothing was changed");
+            std::process::exit(Error::Cancelled.exit_code());
+        }
         Err(e) => {
             eprintln!("error: {e}");
             if let Some(h) = e.hint() {
@@ -675,14 +715,35 @@ fn run(args: &Args) -> Result<i32, Error> {
         return run_update(cmd);
     }
     let cancel = Cancel::new();
+    // From here on Ctrl-C stops the run at its next checkpoint and reports
+    // what it did, rather than killing the process between two deletions.
+    interrupt::install(&cancel);
 
     // Contexts are candidate endpoints, not identities. Two can be the same
     // engine, so we connect, ask each daemon for its own /info ID, and dedupe.
-    let contexts: Vec<_> = context::discover()
+    let named: Vec<_> = context::discover()
         .into_iter()
         .filter(|c| args.only_context.as_deref().is_none_or(|n| c.name == n))
-        .filter(|c| c.is_local())
         .collect();
+    let remote_allowed = remote_authorisation(args)?;
+    let (contexts, refused): (Vec<_>, Vec<_>) = named
+        .into_iter()
+        .partition(|c| c.is_local() || remote_allowed.is_some());
+
+    // Said out loud, per context. A remote daemon dropped in silence looks
+    // exactly like a daemon that is not there.
+    for c in &refused {
+        eprintln!(
+            "  skipping {} ({}) — not a local socket. Re-run with \
+             --remote --reason \"…\" to include it.",
+            c.name, c.endpoint
+        );
+    }
+    if let Some(reason) = &remote_allowed {
+        if contexts.iter().any(|c| !c.is_local()) {
+            eprintln!("  remote daemons included by request: {reason}");
+        }
+    }
     if contexts.is_empty() {
         return Err(Error::NoContext);
     }
@@ -783,6 +844,7 @@ fn run(args: &Args) -> Result<i32, Error> {
                     tier: i.verdict.tier.as_str().to_string(),
                     because: i.verdict.because.clone(),
                     size: i.size,
+                    exclusive_size: i.reclaimable_size(),
                     owner: i.owner.clone(),
                     provenance: i.provenance.clone(),
                 });
@@ -841,6 +903,16 @@ fn run(args: &Args) -> Result<i32, Error> {
         if !args.json {
             render_receipt(&receipt);
         }
+        if receipt.cancelled {
+            // The record of what was done has been printed; now leave with the
+            // documented cancellation code rather than pretending the run
+            // finished. Remaining contexts are not scanned.
+            if !args.json {
+                eprintln!("  interrupted — stopped at an item boundary, nothing was half-done");
+            }
+            report_update(update.as_ref());
+            return Ok(130);
+        }
         if receipt.problems() > 0 {
             exit = exit.max(5);
         }
@@ -874,11 +946,24 @@ fn render(r: &ScanReport, plan: &Plan) {
 
     let t = &r.totals;
     println!();
+    // Two image figures, never one and never summed: the stack total is what
+    // `docker images` adds up to, and the layer figure is what the images
+    // actually occupy once a shared base layer is counted once.
+    let image_size = match t.image_unique_bytes {
+        Some(unique) if unique < t.image_bytes => {
+            format!(
+                "{} on disk, {} of stacks",
+                unique.human(),
+                t.image_bytes.human()
+            )
+        }
+        _ => t.image_bytes.human(),
+    };
     println!(
         "  {:>5} containers   {:>5} images ({})   {:>5} volumes ({})",
         t.containers,
         t.images,
-        t.image_bytes.human(),
+        image_size,
         t.volumes,
         t.volume_bytes.human()
     );
@@ -900,7 +985,7 @@ fn render(r: &ScanReport, plan: &Plan) {
     println!("  SAFE TO RECLAIM — {}", free.human());
     let (mut rebuildable, mut restorable) = (Bytes::ZERO, Bytes::ZERO);
     for i in plan.of_tier(Tier::Free) {
-        let b = i.size.unwrap_or(Bytes::ZERO);
+        let b = i.reclaimable_size().unwrap_or(Bytes::ZERO);
         match i.reversibility() {
             Reversibility::Rebuildable(_) => rebuildable = rebuildable + b,
             Reversibility::Restorable(_) => restorable = restorable + b,
@@ -925,15 +1010,15 @@ fn render(r: &ScanReport, plan: &Plan) {
     println!();
     println!(
         "  IF YOU KNOW YOU CAN REBUILD — opt in with --tiers <name>
-    (image sizes are summed, so shared layers count twice — the real figure is
-     lower, and a run reports what it actually freed)"
+    (an image counts only the layers no other image holds, so these figures are
+     what removing the whole group frees, not what `docker images` adds up to)"
     );
     for t in Tier::OPT_IN {
         let items: Vec<_> = plan.of_tier(t).collect();
         if items.is_empty() {
             continue;
         }
-        let bytes: Bytes = items.iter().filter_map(|i| i.size).sum();
+        let bytes: Bytes = items.iter().filter_map(|i| i.reclaimable_size()).sum();
         println!(
             "    {:<12} {:>4} items {:>9}   {}",
             t.as_str(),
@@ -959,7 +1044,7 @@ fn render(r: &ScanReport, plan: &Plan) {
     }
 
     let mut orphans: Vec<_> = plan.of_tier(Tier::Orphan).collect();
-    orphans.sort_by_key(|i| std::cmp::Reverse(i.size.unwrap_or(Bytes::ZERO).get()));
+    orphans.sort_by_key(|i| std::cmp::Reverse(i.reclaimable_size().unwrap_or(Bytes::ZERO).get()));
 
     println!();
     println!(
@@ -972,7 +1057,9 @@ fn render(r: &ScanReport, plan: &Plan) {
         println!(
             "    {:<40} {:>9}  {}",
             truncate(&i.name, 40),
-            i.size.map(|b| b.human()).unwrap_or_else(|| "—".into()),
+            i.reclaimable_size()
+                .map(|b| b.human())
+                .unwrap_or_else(|| "—".into()),
             i.verdict.because
         );
     }
@@ -1156,5 +1243,77 @@ fn truncate(s: &str, n: usize) -> String {
     } else {
         let head: String = s.chars().take(n.saturating_sub(1)).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plain scan, as `parse_args` would produce with no flags at all.
+    fn args() -> Args {
+        Args {
+            json: false,
+            with_sizes: true,
+            apply: false,
+            tiers: vec![Tier::Free],
+            only_label: None,
+            roots: Vec::new(),
+            only_context: None,
+            remote: false,
+            no_tui: true,
+            no_probe: false,
+            force_container_probe: false,
+            deadline: None,
+            no_vault: false,
+            vault_cmd: None,
+            waiver_cmd: None,
+            reason: None,
+            update_cmd: None,
+            no_update_check: true,
+        }
+    }
+
+    #[test]
+    fn a_remote_daemon_is_refused_by_default() {
+        assert!(remote_authorisation(&args()).unwrap().is_none());
+    }
+
+    #[test]
+    fn remote_without_a_reason_is_a_usage_error() {
+        let a = Args {
+            remote: true,
+            ..args()
+        };
+        let err = remote_authorisation(&a).unwrap_err();
+        // Exit 2, the house code for "you asked for this wrongly", not 3.
+        assert_eq!(err.exit_code(), 2);
+
+        // A gesture is not a reason, and neither is a blank one.
+        for weak in ["", "   ", "because", "yes please"] {
+            let a = Args {
+                remote: true,
+                reason: Some(weak.into()),
+                ..args()
+            };
+            assert!(
+                remote_authorisation(&a).is_err(),
+                "{weak:?} must not authorise a remote daemon"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_with_a_written_reason_is_allowed_and_kept() {
+        let a = Args {
+            remote: true,
+            reason: Some("  staging box, disk full, approved by ops  ".into()),
+            ..args()
+        };
+        assert_eq!(
+            remote_authorisation(&a).unwrap().as_deref(),
+            Some("staging box, disk full, approved by ops"),
+            "the reason is kept, trimmed, so the run can state it"
+        );
     }
 }

@@ -55,6 +55,12 @@ eligible build cache is included only when Safe is checked. **Preview cleanup**
 does not delete resources. **Review cleanup** shows the costs and scope before
 you confirm removal.
 
+Every size the app adds up is exclusive: an image counts only the layers no
+other image holds, and the Images metric shows what the layers occupy rather
+than the sum of stack sizes. Fifteen project images on one base layer occupy
+that base once, not fifteen times, so the estimate is a floor and never a
+promise the cleanup cannot keep.
+
 Cleanup applies to whole selected tiers, including newly eligible resources found
 during its fresh scan. Selecting a row in Resources only opens its details.
 Changing settings requires another scan before cleanup. A new scan resets the
