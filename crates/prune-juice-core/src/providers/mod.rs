@@ -246,21 +246,24 @@ fn has_compose_file(dir: &Path) -> bool {
     .any(|f| dir.join(f).is_file())
 }
 
-/// Volume names a project's compose file declares.
+/// Volume names a project's compose files declare.
 ///
-/// A deliberately shallow parse: we want the keys under a top-level `volumes:`
-/// block, not a full YAML implementation. Being wrong here is safe in one
-/// direction only — a missed declaration can produce a false orphan, so when in
-/// doubt we include rather than exclude.
+/// Reads every file the project actually uses, not just `docker-compose.yml`.
+/// These stacks routinely split services across overrides — `fen` declares
+/// `webroot` and `tmp` in the base file and `mysql`, `s3` and `opensearch` in
+/// `docker-compose.local.yml`, listed via `COMPOSE_FILE` in `.env`. Parsing
+/// only the base file would leave the database volume undeclared, and
+/// "a declaration is a reference" is what protects a volume belonging to a
+/// project nobody has started today.
+///
+/// A deliberately shallow parse: the keys under a top-level `volumes:` block,
+/// not a YAML implementation. Being wrong is safe in one direction only — a
+/// missed declaration can produce a false orphan — so when in doubt this
+/// includes rather than excludes.
 fn declared_volumes(dir: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    for f in [
-        "docker-compose.yml",
-        "docker-compose.yaml",
-        "compose.yml",
-        "compose.yaml",
-    ] {
-        let Ok(text) = std::fs::read_to_string(dir.join(f)) else {
+    for f in compose_files(dir) {
+        let Ok(text) = std::fs::read_to_string(dir.join(&f)) else {
             continue;
         };
         let mut in_volumes = false;
@@ -284,6 +287,42 @@ fn declared_volumes(dir: &Path) -> BTreeSet<String> {
         }
     }
     out
+}
+
+/// Every compose file a project uses.
+///
+/// `COMPOSE_FILE` in `.env` is authoritative when present — it is what the
+/// user's own `docker compose` reads. Otherwise fall back to the conventional
+/// names.
+fn compose_files(dir: &Path) -> Vec<String> {
+    if let Ok(env) = std::fs::read_to_string(dir.join(".env")) {
+        for line in env.lines() {
+            let line = line.trim();
+            if let Some(v) = line.strip_prefix("COMPOSE_FILE=") {
+                let v = v.trim().trim_matches('"').trim_matches('\'');
+                // Docker's separator is ':' on unix, ';' on Windows.
+                let files: Vec<String> = v
+                    .split([':', ';'])
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                if !files.is_empty() {
+                    return files;
+                }
+            }
+        }
+    }
+    [
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .filter(|f| dir.join(f).is_file())
+    .collect()
 }
 
 /// Does this project directory currently exist?
@@ -818,6 +857,59 @@ mod tests {
         let set = [tie, strong];
         let picked = best_claim(&set).unwrap();
         assert_eq!(picked.provider, ProviderKind::Compose);
+    }
+
+    #[test]
+    fn declarations_are_read_from_every_compose_file_the_project_uses() {
+        // Found while explaining a cleanup: `fen` declares webroot and tmp in
+        // the base file and mysql, s3 and opensearch in a local override listed
+        // via COMPOSE_FILE. Parsing only the base file leaves the database
+        // volume undeclared, and a declaration is what protects a volume
+        // belonging to a project nobody has started today.
+        let d = std::env::temp_dir().join(format!(
+            "pj-compose-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join(".env"),
+            "COMPOSE_FILE=docker-compose.yml:docker-compose.local.yml\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("docker-compose.yml"),
+            "services:\n  nginx:\n    image: x\nvolumes:\n  webroot:\n  tmp:\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("docker-compose.local.yml"),
+            "services:\n  mysql:\n    image: y\nvolumes:\n  mysql:\n  s3:\n",
+        )
+        .unwrap();
+
+        let got = declared_volumes(&d);
+        for want in ["webroot", "tmp", "mysql", "s3"] {
+            assert!(got.contains(want), "missing {want} from {got:?}");
+        }
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn without_compose_file_the_conventional_names_are_used() {
+        let d = std::env::temp_dir().join(format!(
+            "pj-compose-plain-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("compose.yaml"), "volumes:\n  data:\n").unwrap();
+        assert!(declared_volumes(&d).contains("data"));
+        std::fs::remove_dir_all(&d).ok();
     }
 
     #[test]
