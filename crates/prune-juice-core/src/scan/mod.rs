@@ -1240,20 +1240,49 @@ mod tests {
         );
     }
 
+    /// A prober that reports an image and then is never asked for anything.
+    ///
+    /// Enough to reach the batched probe loop, which is where the deadline is
+    /// consulted. `probe_volumes` panics on purpose: an expired deadline must
+    /// mean no volume is read at all, so a call here is the test failing.
+    struct FakeProber;
+
+    impl crate::docker::DockerProbe for FakeProber {
+        fn probe_image(&self) -> Option<String> {
+            Some("alpine:latest".into())
+        }
+        fn probe_volumes(
+            &self,
+            _volumes: &[String],
+        ) -> Result<BTreeMap<String, crate::docker::RawProbe>> {
+            unreachable!("the deadline had already expired; nothing should be read")
+        }
+        fn dump_volume(&self, _name: &str, _out: &mut dyn std::io::Write) -> Result<u64> {
+            unreachable!("not part of a scan")
+        }
+    }
+
     #[test]
     fn a_deadline_degrades_the_scan_rather_than_hanging() {
         // "Slow" and "hung" look identical to a user, and a GUI cannot tell
         // them apart either. A deadline turns an unbounded wait into a partial
         // answer that says it is partial.
+        //
+        // `force_container_probe` is not incidental. Without it the path taken
+        // depends on whether the machine running the test happens to have a
+        // readable Docker data root — which is why this passed on the author's
+        // machine and failed on a CI runner, where there is no data root, the
+        // host loop is skipped and the deadline was never consulted.
         let client = FakeDocker {
             containers: vec![],
             volumes: vec![volume("v", &[])],
         };
-        let report = Scanner::new(&client)
+        let report = Scanner::with_probe(&client, &FakeProber)
             .scan(
                 "test",
                 &ScanOptions {
                     deadline: Some(std::time::Duration::ZERO),
+                    force_container_probe: true,
                     ..Default::default()
                 },
                 Arc::new(NullSink),

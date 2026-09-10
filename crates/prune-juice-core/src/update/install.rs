@@ -234,14 +234,11 @@ fn write_executable(path: &Path, bytes: &[u8], model: &Path) -> Result<()> {
 /// here". A signature says who made a file; only executing it says the
 /// platform will accept it.
 fn version_of(path: &Path) -> Result<String> {
-    let out = std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .map_err(|e| {
-            Error::Config(format!(
-                "the downloaded binary would not run ({e}) — the working copy has been left alone"
-            ))
-        })?;
+    let out = run_version(path).map_err(|e| {
+        Error::Config(format!(
+            "the downloaded binary would not run ({e}) — the working copy has been left alone"
+        ))
+    })?;
     if !out.status.success() {
         return Err(Error::Config(format!(
             "the downloaded binary exited {} when asked for its version — \
@@ -256,6 +253,31 @@ fn version_of(path: &Path) -> Result<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| Error::Config("the downloaded binary reported no version".into()))
+}
+
+/// Execute `path --version`, retrying briefly on `ETXTBSY`.
+///
+/// The retry is not superstition. A file cannot be executed while any process
+/// holds it open for writing, and on Linux a *concurrent* `fork` elsewhere can
+/// hold a duplicate of our own write descriptor for the instant between fork
+/// and exec — so a file we have written and closed can still be briefly busy.
+/// The same window is open to anything else on the machine that watches new
+/// files: an indexer, a backup agent, an endpoint scanner.
+///
+/// A few milliseconds of patience turns that into a non-event. Every other
+/// error is returned immediately, because "will not run" is a verdict worth
+/// reaching quickly.
+fn run_version(path: &Path) -> std::io::Result<std::process::Output> {
+    const ATTEMPTS: u32 = 5;
+    for attempt in 1..=ATTEMPTS {
+        match std::process::Command::new(path).arg("--version").output() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < ATTEMPTS => {
+                std::thread::sleep(std::time::Duration::from_millis(20 * attempt as u64));
+            }
+            other => return other,
+        }
+    }
+    unreachable!("the loop returns on its last attempt")
 }
 
 #[cfg(test)]
