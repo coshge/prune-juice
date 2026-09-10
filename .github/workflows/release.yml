@@ -162,7 +162,8 @@ jobs:
           TEAM_ID: ${{ secrets.NOTARY_TEAM_ID }}
           PASSWORD: ${{ secrets.NOTARY_PASSWORD }}
         run: |
-          zip="$(ls dist/PruneJuice-*.zip)"
+          set -- dist/PruneJuice-*.zip
+          zip="$1"
           xcrun notarytool submit "$zip" \
             --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$PASSWORD" --wait
           xcrun stapler staple dist/PruneJuice.app
@@ -176,13 +177,46 @@ jobs:
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: |
-          tool="$(find .build/artifacts -type f -name sign_update | head -1)"
-          zip="$(ls dist/PruneJuice-*.zip)"
-          # `--ed-key-file -` reads the key from stdin, so it never reaches
-          # the keychain, the filesystem, or a process argument list.
-          sig="$(printf '%s' "$SPARKLE_PRIVATE_KEY" | "$tool" -p --ed-key-file - "$zip")"
-          [ -n "$sig" ] || { echo "sign_update produced no signature" >&2; exit 1; }
-          echo "$sig" > dist/ed-signature.txt
+          # Sparkle ships TWO files called sign_update, and the second is
+          # `bin/old_dsa_scripts/sign_update` — a legacy DSA shell script that
+          # does not understand --ed-key-file. `find | head -1` takes whichever
+          # the filesystem hands back first: the right one locally, the legacy
+          # one on this runner. It printed its usage to *stdout*, where the
+          # command substitution below captured it as the "signature", and the
+          # step failed in 80 ms with nothing in the log at all. Excluded by
+          # path, and required to exist.
+          tool="$(find .build/artifacts -type f -name sign_update \
+                    -not -path '*old_dsa_scripts*' | head -1)"
+          [ -n "$tool" ] || {
+            echo "no EdDSA sign_update under .build/artifacts" >&2
+            find .build/artifacts -type f -name sign_update >&2
+            exit 1
+          }
+          # A glob, not `ls`: one filename, no parsing, and nothing a shell
+          # that colourises `ls` can inject into it.
+          set -- dist/PruneJuice-*.zip
+          zip="$1"
+          [ -f "$zip" ] || { echo "no update archive in dist/" >&2; exit 1; }
+
+          # Straight to a file rather than through `$(…)`: whatever the tool
+          # says when it fails then reaches the log instead of being swallowed
+          # as output. `--ed-key-file -` reads the key from stdin, so it never
+          # touches the keychain, the filesystem, or an argument list.
+          printf '%s' "$SPARKLE_PRIVATE_KEY" \
+            | "$tool" -p --ed-key-file - "$zip" > dist/ed-signature.txt
+          sig="$(cat dist/ed-signature.txt)"
+          case "$sig" in
+            "" | *Usage* | *" "*)
+              echo "sign_update produced no signature, but: $sig" >&2
+              exit 1 ;;
+          esac
+
+          # A signature that verifies is a signature. Checked here, because the
+          # alternative place to discover it is an installed app that quietly
+          # refuses every update.
+          printf '%s' "$SPARKLE_PRIVATE_KEY" \
+            | "$tool" --verify --ed-key-file - "$zip" "$sig"
+          echo "signed and verified $zip"
 
       - uses: actions/upload-artifact@v4
         with:
