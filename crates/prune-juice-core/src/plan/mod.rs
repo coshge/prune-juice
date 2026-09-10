@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use crate::model::{Bytes, DaemonId, ResourceId, ResourceKind};
 use crate::providers::best_claim;
 use crate::scan::ScanReport;
+use crate::waiver::Waivers;
 
 use evidence::ReadSet;
 use graph::RefGraph;
@@ -250,12 +251,47 @@ impl Planner {
     /// Pure: no IO, no clock, no daemon calls. Everything it needs is in the
     /// report, which is what makes the invariants property-testable.
     pub fn plan(report: &ScanReport, now_unix: i64) -> Plan {
+        Self::plan_with_waivers(report, now_unix, None)
+    }
+
+    /// As [`Self::plan`], but honouring the user's waivers.
+    ///
+    /// A waived resource becomes `Protected`, and a `Protected` item never gets
+    /// a witness — so a waiver does not merely deprioritise something, it makes
+    /// it unreachable by any deletion path.
+    pub fn plan_with_waivers(
+        report: &ScanReport,
+        now_unix: i64,
+        waivers: Option<&Waivers>,
+    ) -> Plan {
         let graph = RefGraph::build(report);
         let mut items = Vec::with_capacity(report.resources.len());
 
         for a in &report.resources {
             let mut rs = ReadSet::new();
-            let verdict = classify(a, &graph, now_unix, &mut rs);
+            let mut verdict = classify(a, &graph, now_unix, &mut rs);
+
+            // A waiver is the user's explicit instruction, so it outranks
+            // whatever the classifier concluded — in the safe direction only.
+            let mut provenance: Vec<String> = best_claim(&a.claims)
+                .map(|c| {
+                    c.evidence
+                        .iter()
+                        .map(|e| format!("[{}] {}", e.source.tag(), e.detail))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if let Some(w) = waivers.and_then(|w| w.covering(a.resource.kind, &a.resource.name)) {
+                rs.record(
+                    format!("{}:{}", a.resource.kind.as_str(), a.resource.name),
+                    "waived_by",
+                    &w.selector,
+                );
+                provenance.push(format!("[waiver] {} — {}", w.selector, w.reason));
+                verdict.tier = Tier::Protected;
+                verdict.because = format!("waived: {}", w.reason);
+            }
 
             // A witness exists only for tiers that may be acted on, and only
             // the planner can mint one.
@@ -283,14 +319,7 @@ impl Planner {
                     crate::probe::ContentClass::Database(e) => Some(*e),
                     _ => None,
                 }),
-                provenance: best_claim(&a.claims)
-                    .map(|c| {
-                        c.evidence
-                            .iter()
-                            .map(|e| format!("[{}] {}", e.source.tag(), e.detail))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                provenance,
                 verdict,
                 evidence: rs,
                 witness,
@@ -460,6 +489,47 @@ mod tests {
             b.items[0].evidence.hash(),
             "the same world must yield the same evidence"
         );
+    }
+
+    #[test]
+    fn a_waived_resource_becomes_protected_and_loses_its_witness() {
+        // A waiver must not merely deprioritise something. Protected items get
+        // no witness, so there is no path by which it can be deleted.
+        let rep = report_with(vec![attributed(network("proj_default"))], "D");
+        let unwaived = Planner::plan(&rep, NOW);
+        assert_eq!(unwaived.items[0].tier(), Tier::Free);
+        assert!(unwaived.items[0].witness().is_some());
+
+        let path = std::env::temp_dir().join(format!(
+            "pj-plan-waivers-{}.json",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut w = Waivers::at(path.clone());
+        w.add(
+            "network:proj_default",
+            "compose recreates it but the team relies on the id",
+            None,
+            NOW,
+        )
+        .unwrap();
+
+        let waived = Planner::plan_with_waivers(&rep, NOW, Some(&w));
+        assert_eq!(waived.items[0].tier(), Tier::Protected);
+        assert!(
+            waived.items[0].witness().is_none(),
+            "a waived resource must be unreachable, not merely deprioritised"
+        );
+        assert!(waived.items[0].verdict.because.starts_with("waived:"));
+        assert!(waived.items[0]
+            .provenance
+            .iter()
+            .any(|p| p.starts_with("[waiver]")));
+        assert_eq!(waived.bytes_of_tier(Tier::Free), Bytes::ZERO);
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

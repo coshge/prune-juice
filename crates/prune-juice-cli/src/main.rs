@@ -18,6 +18,7 @@ use prune_juice_core::plan::tier::{Reversibility, Tier};
 use prune_juice_core::plan::{Plan, Planner};
 use prune_juice_core::scan::{ScanOptions, ScanReport, Scanner};
 use prune_juice_core::vault::Vault;
+use prune_juice_core::waiver::Waivers;
 use prune_juice_core::Error;
 use prune_juice_tui::TuiOptions;
 
@@ -44,6 +45,11 @@ OPTIONS:
     --no-vault          Do not preserve a copy before an irreversible delete.
                         Irreversible items are then REFUSED, not deleted —
                         declining a backup is not consent to lose data.
+
+    --waivers           List resources you have told the tool to leave alone
+    --waive SELECTOR    Leave a resource alone. Needs --reason.
+    --unwaive SELECTOR  Remove a waiver
+    --reason TEXT       Why. Required with --waive, and it has to say something.
 
     --vault             List preserved copies and exit
     --vault-dump VOL    Preserve a volume now, without deleting anything
@@ -81,6 +87,15 @@ struct Args {
     force_container_probe: bool,
     no_vault: bool,
     vault_cmd: Option<VaultCmd>,
+    waiver_cmd: Option<WaiverCmd>,
+    reason: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum WaiverCmd {
+    List,
+    Add(String),
+    Remove(String),
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -105,6 +120,8 @@ fn parse_args() -> Result<Args, String> {
         force_container_probe: false,
         no_vault: false,
         vault_cmd: None,
+        waiver_cmd: None,
+        reason: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -115,6 +132,19 @@ fn parse_args() -> Result<Args, String> {
             "--no-probe" => a.no_probe = true,
             "--container-probe" => a.force_container_probe = true,
             "--no-vault" => a.no_vault = true,
+            "--waivers" => a.waiver_cmd = Some(WaiverCmd::List),
+            "--waive" => {
+                a.waiver_cmd = Some(WaiverCmd::Add(
+                    it.next()
+                        .ok_or("--waive needs a selector, e.g. volume:oak_mysql")?,
+                ))
+            }
+            "--unwaive" => {
+                a.waiver_cmd = Some(WaiverCmd::Remove(
+                    it.next().ok_or("--unwaive needs a selector")?,
+                ))
+            }
+            "--reason" => a.reason = Some(it.next().ok_or("--reason needs text")?),
             "--vault" => a.vault_cmd = Some(VaultCmd::List),
             "--vault-verify" => a.vault_cmd = Some(VaultCmd::Verify),
             "--vault-dump" => {
@@ -329,7 +359,48 @@ fn run_vault(cmd: &VaultCmd) -> Result<i32, Error> {
     }
 }
 
+fn run_waivers(cmd: &WaiverCmd, reason: Option<&str>) -> Result<i32, Error> {
+    let mut w = Waivers::open()?;
+    match cmd {
+        WaiverCmd::List => {
+            println!();
+            println!("  waivers: {}", w.path().display());
+            if w.is_empty() {
+                println!("  none — nothing is being held back by hand");
+            }
+            for x in w.all() {
+                println!("    {:<32} {}", x.selector, x.reason);
+            }
+            println!();
+            Ok(0)
+        }
+        WaiverCmd::Add(selector) => {
+            let Some(reason) = reason else {
+                return Err(Error::Config(
+                    "--waive needs --reason: an exclusion nobody can explain later is worse \
+                     than none"
+                        .into(),
+                ));
+            };
+            w.add(selector, reason, None, now_unix())?;
+            println!("  {selector} will be left alone: {reason}");
+            Ok(0)
+        }
+        WaiverCmd::Remove(selector) => {
+            if w.remove(selector)? {
+                println!("  {selector} is no longer waived");
+                Ok(0)
+            } else {
+                Err(Error::Config(format!("no waiver matching {selector}")))
+            }
+        }
+    }
+}
+
 fn run(args: &Args) -> Result<i32, Error> {
+    if let Some(cmd) = &args.waiver_cmd {
+        return run_waivers(cmd, args.reason.as_deref());
+    }
     if let Some(cmd) = &args.vault_cmd {
         return run_vault(cmd);
     }
@@ -410,7 +481,8 @@ fn run(args: &Args) -> Result<i32, Error> {
             eprintln!("{} ms", report.duration_ms);
         }
 
-        let plan = Planner::plan(&report, now_unix());
+        let waivers = Waivers::open().ok();
+        let plan = Planner::plan_with_waivers(&report, now_unix(), waivers.as_ref());
         if args.json {
             for i in &plan.items {
                 sink.emit(prune_juice_core::Event::Classified {
