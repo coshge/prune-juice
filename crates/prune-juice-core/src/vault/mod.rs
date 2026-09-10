@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::disk::free_space;
 use crate::docker::{DockerMutate, DockerProbe};
 use crate::error::{Error, Result};
 use crate::model::Bytes;
@@ -326,23 +327,6 @@ fn sanitise(s: &str) -> String {
         .collect::<String>()
         .trim_start_matches('.')
         .to_string()
-}
-
-/// Free bytes on the filesystem holding `path`, if it can be determined.
-///
-/// Best-effort: a missing answer skips the precheck, and the safety property
-/// still holds because a failed write deletes its partial archive and refuses
-/// the deletion.
-fn free_space(path: &Path) -> Option<u64> {
-    let out = std::process::Command::new("df")
-        .arg("-Pk")
-        .arg(path)
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let line = text.lines().nth(1)?;
-    let avail_kb: u64 = line.split_whitespace().nth(3)?.parse().ok()?;
-    Some(avail_kb.saturating_mul(1024))
 }
 
 #[cfg(test)]

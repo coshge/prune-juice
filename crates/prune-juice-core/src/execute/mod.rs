@@ -11,6 +11,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::disk::{reconcile, BackingStore, Reclamation};
 use crate::docker::{DockerMutate, DockerProbe};
 use crate::error::Result;
 use crate::event::{Cancel, Event, EventSink};
@@ -114,6 +115,10 @@ pub struct Receipt {
     /// What the daemon told us we freed. Host-measured reclamation is a
     /// separate, and different, number.
     pub docker_reported: Bytes,
+    /// What the host actually gave back, where that could be measured.
+    /// `None` means unmeasurable — never quietly filled in with the Docker
+    /// figure, because conflating the two is the whole mistake.
+    pub reclamation: Option<Reclamation>,
 }
 
 impl Receipt {
@@ -147,6 +152,9 @@ pub struct Executor<'a> {
     /// Needed to read a volume out before deleting it.
     prober: Option<&'a dyn DockerProbe>,
     vault: Option<&'a Vault>,
+    /// Where the daemon's bytes physically live, so real host reclamation can
+    /// be measured rather than inferred from Docker's logical figures.
+    disk: Option<&'a BackingStore>,
 }
 
 impl<'a> Executor<'a> {
@@ -157,6 +165,7 @@ impl<'a> Executor<'a> {
             mutate: None,
             prober: None,
             vault: None,
+            disk: None,
         }
     }
 
@@ -165,6 +174,7 @@ impl<'a> Executor<'a> {
             mutate: Some(mutate),
             prober: None,
             vault: None,
+            disk: None,
         }
     }
 
@@ -173,6 +183,12 @@ impl<'a> Executor<'a> {
     pub fn with_vault(mut self, prober: &'a dyn DockerProbe, vault: &'a Vault) -> Self {
         self.prober = Some(prober);
         self.vault = Some(vault);
+        self
+    }
+
+    /// Measure real host reclamation around the run.
+    pub fn with_disk(mut self, disk: &'a BackingStore) -> Self {
+        self.disk = Some(disk);
         self
     }
 
@@ -192,6 +208,18 @@ impl<'a> Executor<'a> {
         let simulated = opts.mode == Mode::DryRun || self.mutate.is_none();
         let mut items = Vec::new();
         let mut freed = Bytes::ZERO;
+
+        // Measure the host *before* touching anything. A dry run measures too,
+        // so the reporting path is exercised identically.
+        let before = self.disk.map(|d| {
+            let u = d.measure(now_unix);
+            sink.emit(Event::HostMeasured {
+                phase: "before".into(),
+                physical: u.physical,
+                fs_free: u.fs_free,
+            });
+            u
+        });
 
         let mut plan = plan;
         for item in plan.items.iter_mut() {
@@ -361,8 +389,34 @@ impl<'a> Executor<'a> {
             }
         }
 
+        // Settle, then reconcile.
+        //
+        // Deleting inside the guest does not shrink a sparse host image until
+        // the guest issues discard and the runtime punches holes, so the number
+        // needs a moment to catch up. Poll until it stops moving rather than
+        // reading it once and reporting a lie.
+        let reclamation = match (self.disk, before) {
+            (Some(store), Some(before)) if !simulated => {
+                let after = settle(store, now_unix, &sink);
+                let r = reconcile(&before, &after, freed + cache_freed, store);
+                sink.emit(Event::HostReclaim {
+                    docker_reported: r.docker_reported,
+                    host_measured: r.host_measured,
+                    confidence: format!("{:?}", r.confidence).to_lowercase(),
+                });
+                Some(r)
+            }
+            (Some(store), Some(before)) => {
+                // Dry run: nothing moved, so report the shape without claiming
+                // a measurement.
+                Some(reconcile(&before, &before, freed + cache_freed, store))
+            }
+            _ => None,
+        };
+
         sink.flush();
         Ok(Receipt {
+            reclamation,
             daemon: plan.daemon.clone(),
             started_unix: now_unix,
             simulated,
@@ -371,6 +425,45 @@ impl<'a> Executor<'a> {
             docker_reported: freed + cache_freed,
         })
     }
+}
+
+/// Poll the host measurement until it stops changing.
+///
+/// Two consecutive identical readings, or `MAX_SETTLE` elapsed. Capped because
+/// some runtimes never shrink on their own and waiting forever would look like
+/// a hang.
+fn settle(
+    store: &BackingStore,
+    now_unix: i64,
+    sink: &Arc<dyn EventSink>,
+) -> crate::disk::HostUsage {
+    use std::time::{Duration, Instant};
+    const MAX_SETTLE: Duration = Duration::from_secs(15);
+    const STEP: Duration = Duration::from_millis(500);
+
+    let start = Instant::now();
+    let mut last = store.measure(now_unix);
+    let mut stable = 0;
+
+    while start.elapsed() < MAX_SETTLE {
+        std::thread::sleep(STEP);
+        let next = store.measure(now_unix);
+        if next.physical == last.physical && next.fs_free == last.fs_free {
+            stable += 1;
+            if stable >= 2 {
+                return next;
+            }
+        } else {
+            stable = 0;
+        }
+        last = next;
+    }
+    sink.emit(Event::Warning {
+        code: "host_measurement_unsettled".into(),
+        message: "the host figure was still moving after 15s; it is a snapshot, not a total".into(),
+        resource: None,
+    });
+    last
 }
 
 #[cfg(test)]

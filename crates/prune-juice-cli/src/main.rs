@@ -8,6 +8,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use prune_juice_core::disk::{self, CompactionCapability};
 use prune_juice_core::docker::bollard_client::BollardClient;
 use prune_juice_core::docker::{context, DockerClient};
 use prune_juice_core::event::{Cancel, JsonlSink, NullSink};
@@ -295,14 +296,7 @@ fn run_vault(cmd: &VaultCmd) -> Result<i32, Error> {
             };
 
             eprintln!("preserving {volume}…");
-            let entry = vault.store(
-                &client,
-                volume,
-                &v.labels,
-                None,
-                v.size,
-                now_unix(),
-            )?;
+            let entry = vault.store(&client, volume, &v.labels, None, v.size, now_unix())?;
             println!(
                 "  preserved {} as {} ({} on disk, {} entries, verified)",
                 entry.volume,
@@ -460,14 +454,23 @@ fn run(args: &Args) -> Result<i32, Error> {
             vault: !args.no_vault,
         };
         let vault = Vault::open()?;
+        let store = disk::detect(ident.runtime, ident.data_root.as_deref(), &ctx.endpoint);
         let receipt = if args.apply {
             Executor::applying(&client)
                 .with_vault(&client, &vault)
+                .with_disk(&store)
                 .run(plan, &fresh, now_unix(), &exec_opts, sink, &cancel)?
         } else {
             // No mutating client at all: dry-run is unable to delete, not
             // merely disinclined to.
-            Executor::dry_run().run(plan, &fresh, now_unix(), &exec_opts, sink, &cancel)?
+            Executor::dry_run().with_disk(&store).run(
+                plan,
+                &fresh,
+                now_unix(),
+                &exec_opts,
+                sink,
+                &cancel,
+            )?
         };
 
         if !args.json {
@@ -682,9 +685,52 @@ fn render_receipt(r: &Receipt) {
             _ => {}
         }
     }
-    println!();
-    println!("  Note: Docker's figure is logical. Actual host reclamation can differ,");
-    println!("  especially on a VM-backed runtime. Host measurement is a later milestone.");
+    // Docker-reported and host-measured are different questions, so they are
+    // shown as different lines and never added together.
+    if let Some(rec) = &r.reclamation {
+        println!();
+        if r.simulated {
+            // A dry run moved nothing, so there is nothing to have measured.
+            // Saying "gave back 0 B" here would read as a failure.
+            println!(
+                "  host disk would be measured before and after a real run ({})",
+                match &rec.compaction {
+                    CompactionCapability::NotNeeded => "native filesystem — reclaims immediately",
+                    CompactionCapability::Automatic(_) => "sparse image — reclaims on its own",
+                    CompactionCapability::Triggerable { .. } =>
+                        "sparse image — may need compacting",
+                    CompactionCapability::ManualOnly { .. } =>
+                        "virtual disk — compaction is manual",
+                    CompactionCapability::Unavailable(_) => "not measurable on this setup",
+                }
+            );
+        } else if let Some(m) = rec.host_measured {
+            println!(
+                "  host actually gave back {}  (confidence: {:?})",
+                m.human(),
+                rec.confidence
+            );
+        } else {
+            println!("  host reclamation could not be measured on this setup");
+        }
+        if !r.simulated && rec.shortfall_worth_mentioning() {
+            println!("  The host gave back much less than Docker reported. That is normal on a");
+            println!("  VM-backed runtime: the guest has to discard the blocks first.");
+            match &rec.compaction {
+                CompactionCapability::Automatic(note) => println!("    {note}"),
+                CompactionCapability::Triggerable { how, warning } => {
+                    println!("    to reclaim it now:  {how}");
+                    println!("    ({warning})");
+                }
+                CompactionCapability::ManualOnly { instructions } => {
+                    for i in instructions {
+                        println!("    {i}");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     println!();
 }
 

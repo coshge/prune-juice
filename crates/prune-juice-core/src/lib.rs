@@ -9,6 +9,7 @@
 
 #![deny(clippy::print_stdout, clippy::print_stderr)]
 
+pub mod disk;
 pub mod docker;
 pub mod error;
 pub mod event;

@@ -58,6 +58,18 @@ pub enum Event {
         duration_ms: u64,
         stale: bool,
     },
+    /// A host disk measurement, before or after a run.
+    HostMeasured {
+        phase: String,
+        physical: Option<Bytes>,
+        fs_free: Option<Bytes>,
+    },
+    /// What the host actually gave back, versus what Docker claimed.
+    HostReclaim {
+        docker_reported: Bytes,
+        host_measured: Option<Bytes>,
+        confidence: String,
+    },
     /// One resource's verdict. Emitted after planning so a machine consumer —
     /// or an audit — can see exactly what was decided and why.
     Classified {
