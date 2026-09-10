@@ -11,13 +11,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::docker::DockerMutate;
+use crate::docker::{DockerMutate, DockerProbe};
 use crate::error::Result;
 use crate::event::{Cancel, Event, EventSink};
 use crate::model::{Bytes, DaemonId, ResourceKind};
 use crate::plan::tier::Tier;
 use crate::plan::{Plan, Staleness};
 use crate::scan::ScanReport;
+use crate::vault::{Vault, VaultEntry};
 
 use std::sync::Arc;
 
@@ -39,6 +40,12 @@ pub struct ExecuteOptions {
     /// feature because it is genuinely useful, and used as the integration-test
     /// harness so a real-daemon test cannot escape its own sandbox.
     pub only_label: Option<(String, String)>,
+    /// Preserve a verified copy before any irreversible deletion.
+    ///
+    /// On by default, and turning it off is what `--no-vault` is for. With it
+    /// off, an irreversible item is **refused** rather than deleted unpreserved:
+    /// declining to take a backup is not the same as consenting to lose data.
+    pub vault: bool,
 }
 
 impl Default for ExecuteOptions {
@@ -47,6 +54,7 @@ impl Default for ExecuteOptions {
             mode: Mode::DryRun,
             tiers: vec![Tier::Free],
             only_label: None,
+            vault: true,
         }
     }
 }
@@ -64,11 +72,24 @@ pub enum ItemOutcome {
     /// The daemon refused. The last line of defence working as intended.
     Refused(String),
     Failed(String),
+    /// Preserved to the vault and then removed. Carries the entry id, which is
+    /// what `restore` needs.
+    Preserved(String),
+    /// Could not be preserved, so it was left alone. The difference between a
+    /// backup and the appearance of one.
+    PreserveFailed(String),
 }
 
 impl ItemOutcome {
     pub fn is_problem(&self) -> bool {
-        matches!(self, ItemOutcome::Refused(_) | ItemOutcome::Failed(_))
+        matches!(
+            self,
+            ItemOutcome::Refused(_) | ItemOutcome::Failed(_) | ItemOutcome::PreserveFailed(_)
+        )
+    }
+
+    pub fn removed(&self) -> bool {
+        matches!(self, ItemOutcome::Deleted | ItemOutcome::Preserved(_))
     }
 }
 
@@ -97,10 +118,18 @@ pub struct Receipt {
 
 impl Receipt {
     pub fn deleted(&self) -> usize {
+        self.items.iter().filter(|i| i.outcome.removed()).count()
+    }
+
+    /// Entries written to the vault by this run, in order.
+    pub fn preserved(&self) -> Vec<&str> {
         self.items
             .iter()
-            .filter(|i| i.outcome == ItemOutcome::Deleted)
-            .count()
+            .filter_map(|i| match &i.outcome {
+                ItemOutcome::Preserved(id) => Some(id.as_str()),
+                _ => None,
+            })
+            .collect()
     }
     pub fn skipped(&self) -> usize {
         self.items
@@ -115,19 +144,36 @@ impl Receipt {
 
 pub struct Executor<'a> {
     mutate: Option<&'a dyn DockerMutate>,
+    /// Needed to read a volume out before deleting it.
+    prober: Option<&'a dyn DockerProbe>,
+    vault: Option<&'a Vault>,
 }
 
 impl<'a> Executor<'a> {
     /// A dry-run executor has no mutating client at all — it is not merely
     /// discouraged from deleting, it is unable to.
     pub fn dry_run() -> Self {
-        Self { mutate: None }
+        Self {
+            mutate: None,
+            prober: None,
+            vault: None,
+        }
     }
 
     pub fn applying(mutate: &'a dyn DockerMutate) -> Self {
         Self {
             mutate: Some(mutate),
+            prober: None,
+            vault: None,
         }
+    }
+
+    /// Give the executor what it needs to preserve a volume before removing it.
+    /// Without this, an irreversible item can only ever be refused.
+    pub fn with_vault(mut self, prober: &'a dyn DockerProbe, vault: &'a Vault) -> Self {
+        self.prober = Some(prober);
+        self.vault = Some(vault);
+        self
     }
 
     /// Apply `plan`, revalidating every item against `now` first.
@@ -209,6 +255,56 @@ impl<'a> Executor<'a> {
 
             let w = fresh.into_inner();
             let mutate = self.mutate.expect("checked by `simulated` above");
+
+            // Anything irreversible gets preserved first, or is not touched.
+            //
+            // The order here is the whole safety property: dump, fsync, re-read
+            // and confirm the digest and entry count, and only then delete. A
+            // failure at any step leaves the volume exactly where it was.
+            let mut preserved: Option<VaultEntry> = None;
+            if item.verdict.reversibility.is_gone() && item.kind == ResourceKind::Volume {
+                if !opts.vault {
+                    // Declining to take a backup is not consent to lose data.
+                    items.push(record(ItemOutcome::Refused(
+                        "irreversible, and --no-vault was given, so it was left alone".into(),
+                    )));
+                    continue;
+                }
+                let (Some(prober), Some(vault)) = (self.prober, self.vault) else {
+                    items.push(record(ItemOutcome::Refused(
+                        "irreversible, and no vault is configured to preserve it".into(),
+                    )));
+                    continue;
+                };
+                let engine = item.engine;
+                match vault.store(
+                    prober,
+                    &item.name,
+                    &item.labels,
+                    engine,
+                    item.size,
+                    now_unix,
+                ) {
+                    Ok(entry) => {
+                        sink.emit(Event::Warning {
+                            code: "preserved".into(),
+                            message: format!(
+                                "{} preserved to the vault as {} ({})",
+                                item.name,
+                                entry.id,
+                                entry.archive_bytes.human()
+                            ),
+                            resource: None,
+                        });
+                        preserved = Some(entry);
+                    }
+                    Err(e) => {
+                        items.push(record(ItemOutcome::PreserveFailed(e.to_string())));
+                        continue;
+                    }
+                }
+            }
+
             let res = match w.kind() {
                 ResourceKind::Volume => mutate.remove_volume(w.name()),
                 ResourceKind::Image => mutate.remove_image(w.resource().as_str()),
@@ -221,7 +317,10 @@ impl<'a> Executor<'a> {
             match res {
                 Ok(()) => {
                     freed = freed + item.size.unwrap_or(Bytes::ZERO);
-                    items.push(record(ItemOutcome::Deleted));
+                    match &preserved {
+                        Some(e) => items.push(record(ItemOutcome::Preserved(e.id.clone()))),
+                        None => items.push(record(ItemOutcome::Deleted)),
+                    }
                 }
                 Err(e) => {
                     let msg = e.to_string();
@@ -306,6 +405,14 @@ mod tests {
         }
         fn remove_network(&self, id: &str) -> Result<()> {
             self.note(format!("network:{id}"))
+        }
+        fn restore_volume(
+            &self,
+            name: &str,
+            _labels: &std::collections::BTreeMap<String, String>,
+            _tar: Vec<u8>,
+        ) -> Result<()> {
+            self.note(format!("restore:{name}"))
         }
         fn prune_build_cache(&self, _keep: u64) -> Result<Bytes> {
             self.calls.lock().unwrap().push("build_cache".into());
@@ -582,6 +689,226 @@ mod tests {
             !calls.contains(&"build_cache".to_string()),
             "build cache carries no labels, so the fence cannot be honoured for it"
         );
+    }
+
+    /// Produces a real tar stream, or fails, on demand.
+    struct VaultProber {
+        fail: bool,
+    }
+
+    impl DockerProbe for VaultProber {
+        fn probe_image(&self) -> Option<String> {
+            Some("busybox".into())
+        }
+        fn probe_volumes(
+            &self,
+            _v: &[String],
+        ) -> Result<std::collections::BTreeMap<String, crate::docker::RawProbe>> {
+            Ok(Default::default())
+        }
+        fn dump_volume(&self, _name: &str, out: &mut dyn std::io::Write) -> Result<u64> {
+            if self.fail {
+                return Err(crate::Error::Api("volume vanished mid-dump".into()));
+            }
+            let mut b = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_path("data").unwrap();
+            h.set_size(4);
+            h.set_mode(0o644);
+            h.set_cksum();
+            b.append(&h, &b"abcd"[..]).unwrap();
+            let data = b.into_inner().unwrap();
+            out.write_all(&data).map_err(crate::Error::Io)?;
+            Ok(data.len() as u64)
+        }
+    }
+
+    fn tmp_vault(tag: &str) -> (Vault, std::path::PathBuf) {
+        let d = std::env::temp_dir().join(format!(
+            "pj-exec-vault-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        (Vault::at(d.clone()), d)
+    }
+
+    /// An unreferenced volume the probe says holds a database: irreversible,
+    /// and therefore the vault's whole reason for existing.
+    fn precious_volume(name: &str) -> Attributed {
+        let mut r = ResourceSummary::new(ResourceKind::Volume, name, name);
+        r.created_unix = Some(OLD);
+        r.size = Some(Bytes(4096));
+        let mut a = attributed(r);
+        a.orphan_candidate = true;
+        a.owner = Some("gone".into());
+        a.content = Some(crate::probe::ContentReport {
+            class: crate::probe::ContentClass::Database(crate::probe::Engine::MariaDb),
+            method: crate::probe::ProbeMethod::Container,
+            entries: vec!["ibdata1".into()],
+            file_count: 1,
+            truncated: false,
+            bytes: Bytes(4096),
+            newest_mtime: Some(OLD),
+        });
+        a
+    }
+
+    fn orphan_opts() -> ExecuteOptions {
+        ExecuteOptions {
+            mode: Mode::Apply,
+            tiers: vec![Tier::Orphan],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_irreversible_volume_is_preserved_before_it_is_removed() {
+        let (vault, dir) = tmp_vault("ok");
+        let rep = report(vec![precious_volume("nbk_mysql")]);
+        let plan = Planner::plan(&rep, NOW);
+        let spy = SpyMutate::default();
+        let prober = VaultProber { fail: false };
+
+        let receipt = Executor::applying(&spy)
+            .with_vault(&prober, &vault)
+            .run(
+                plan,
+                &rep,
+                NOW,
+                &orphan_opts(),
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        assert_eq!(receipt.deleted(), 1);
+        assert_eq!(receipt.problems(), 0);
+        assert_eq!(receipt.preserved().len(), 1, "{:?}", receipt.items);
+
+        // The copy must actually be on disk and verify.
+        let entries = vault.entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].volume, "nbk_mysql");
+        assert_eq!(entries[0].engine, Some(crate::probe::Engine::MariaDb));
+        assert!(vault.verify(&entries[0]).is_ok());
+        assert!(spy.calls().iter().any(|c| c == "volume:nbk_mysql"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_dump_means_the_volume_is_not_deleted() {
+        // The difference between a backup and the appearance of one. If the
+        // copy cannot be made, the original stays.
+        let (vault, dir) = tmp_vault("fail");
+        let rep = report(vec![precious_volume("precious")]);
+        let plan = Planner::plan(&rep, NOW);
+        let spy = SpyMutate::default();
+        let prober = VaultProber { fail: true };
+
+        let receipt = Executor::applying(&spy)
+            .with_vault(&prober, &vault)
+            .run(
+                plan,
+                &rep,
+                NOW,
+                &orphan_opts(),
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        assert_eq!(receipt.deleted(), 0);
+        assert_eq!(receipt.problems(), 1);
+        assert!(matches!(
+            receipt.items[0].outcome,
+            ItemOutcome::PreserveFailed(_)
+        ));
+        assert!(
+            !spy.calls().iter().any(|c| c.starts_with("volume:")),
+            "the daemon must never be asked to delete something we failed to preserve"
+        );
+        assert!(vault.entries().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn no_vault_configured_refuses_rather_than_deleting_unpreserved() {
+        let rep = report(vec![precious_volume("unprotected")]);
+        let plan = Planner::plan(&rep, NOW);
+        let spy = SpyMutate::default();
+
+        let receipt = Executor::applying(&spy)
+            .run(
+                plan,
+                &rep,
+                NOW,
+                &orphan_opts(),
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        assert_eq!(receipt.deleted(), 0);
+        assert!(matches!(receipt.items[0].outcome, ItemOutcome::Refused(_)));
+        assert!(!spy.calls().iter().any(|c| c.starts_with("volume:")));
+    }
+
+    #[test]
+    fn opting_out_of_the_vault_is_not_consent_to_lose_data() {
+        let (vault, dir) = tmp_vault("optout");
+        let rep = report(vec![precious_volume("optout")]);
+        let plan = Planner::plan(&rep, NOW);
+        let spy = SpyMutate::default();
+        let prober = VaultProber { fail: false };
+
+        let receipt = Executor::applying(&spy)
+            .with_vault(&prober, &vault)
+            .run(
+                plan,
+                &rep,
+                NOW,
+                &ExecuteOptions {
+                    vault: false,
+                    ..orphan_opts()
+                },
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        assert_eq!(receipt.deleted(), 0);
+        assert!(matches!(receipt.items[0].outcome, ItemOutcome::Refused(_)));
+        assert!(!spy.calls().iter().any(|c| c.starts_with("volume:")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_reversible_item_needs_no_vault_at_all() {
+        // Only irreversible items pay the cost. A network is recreated by the
+        // next compose up.
+        let rep = report(vec![attributed(network("proj_default"))]);
+        let plan = Planner::plan(&rep, NOW);
+        let spy = SpyMutate::default();
+
+        let receipt = Executor::applying(&spy)
+            .run(
+                plan,
+                &rep,
+                NOW,
+                &ExecuteOptions {
+                    mode: Mode::Apply,
+                    ..Default::default()
+                },
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+        assert_eq!(receipt.deleted(), 1);
+        assert!(receipt.preserved().is_empty());
     }
 
     #[test]

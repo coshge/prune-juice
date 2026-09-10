@@ -124,6 +124,17 @@ pub trait DockerProbe: Send + Sync {
     /// Read several volumes in one container. Batching matters: a container per
     /// volume would mean hundreds of spawns per scan.
     fn probe_volumes(&self, volumes: &[String]) -> Result<BTreeMap<String, RawProbe>>;
+
+    /// Stream a volume's entire contents out as a tar archive.
+    ///
+    /// **The container is created but never started.** Booting an engine
+    /// against a real data directory triggers crash recovery and catalog
+    /// writes — mutating the very thing being preserved. A stopped container is
+    /// only a mount holder, and `GET /containers/{id}/archive` reads through it
+    /// without executing anything.
+    ///
+    /// Returns the number of bytes written to `out`.
+    fn dump_volume(&self, name: &str, out: &mut dyn std::io::Write) -> Result<u64>;
 }
 
 /// Destructive operations, quarantined behind their own trait.
@@ -136,6 +147,17 @@ pub trait DockerMutate: Send + Sync {
     fn remove_container(&self, id: &str) -> Result<()>;
     fn remove_network(&self, id: &str) -> Result<()>;
     fn prune_build_cache(&self, keep_newer_than_secs: u64) -> Result<Bytes>;
+
+    /// Recreate a volume from a tar archive, restoring its labels too.
+    ///
+    /// Refuses if a volume of that name already exists: a restore must never
+    /// silently merge into live data.
+    fn restore_volume(
+        &self,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+        tar: Vec<u8>,
+    ) -> Result<()>;
 }
 
 /// Infer the runtime from `/info` plus a couple of filesystem probes.

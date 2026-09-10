@@ -27,10 +27,15 @@ $ prune-juice
     nbk_default                                      —  belongs to "nbk", whose directory is gone
 ```
 
-**Status: M4a.** `prune-juice` on a terminal opens an interactive interface;
+**Status: M4.** `prune-juice` on a terminal opens an interactive interface;
 piped or under CI it prints a one-shot report. Dry-run by default. The content
 probe now lets *empty* and *derivative* volumes be reclaimed; everything else
 stays irreversible until the vault lands.
+
+Irreversible items are now preserved before removal, not merely inspected: the
+volume is dumped, fsynced, re-read, and deleted only once its digest and tar
+entry count both match. Verified end-to-end — a volume dumped, deleted and
+restored comes back byte-for-byte, labels included.
 
 Works on Docker Desktop as well as OrbStack and native Linux. Where the data
 root can be read from the host it is; where it cannot — every VM-backed runtime

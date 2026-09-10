@@ -19,6 +19,7 @@ pub mod plan;
 pub mod probe;
 pub mod providers;
 pub mod scan;
+pub mod vault;
 
 pub use error::{Error, Result};
 pub use event::{Cancel, Event, EventSink};

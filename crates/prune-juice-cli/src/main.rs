@@ -16,6 +16,7 @@ use prune_juice_core::model::{Bytes, Confidence, Liveness, ResourceKind};
 use prune_juice_core::plan::tier::{Reversibility, Tier};
 use prune_juice_core::plan::{Plan, Planner};
 use prune_juice_core::scan::{ScanOptions, ScanReport, Scanner};
+use prune_juice_core::vault::Vault;
 use prune_juice_core::Error;
 use prune_juice_tui::TuiOptions;
 
@@ -39,6 +40,14 @@ OPTIONS:
     --container-probe   Always read volume contents through a container, even
                         where the host could read them directly. This is the
                         only path available on Docker Desktop.
+    --no-vault          Do not preserve a copy before an irreversible delete.
+                        Irreversible items are then REFUSED, not deleted —
+                        declining a backup is not consent to lose data.
+
+    --vault             List preserved copies and exit
+    --vault-dump VOL    Preserve a volume now, without deleting anything
+    --vault-verify      Re-read every preserved copy and confirm it is intact
+    --vault-restore ID  Recreate a volume from a preserved copy
     -h, --help          Show this help
 
 With no arguments on a terminal, `prune-juice` opens an interactive
@@ -69,6 +78,16 @@ struct Args {
     no_tui: bool,
     no_probe: bool,
     force_container_probe: bool,
+    no_vault: bool,
+    vault_cmd: Option<VaultCmd>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum VaultCmd {
+    List,
+    Verify,
+    Dump(String),
+    Restore(String),
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -83,6 +102,8 @@ fn parse_args() -> Result<Args, String> {
         no_tui: false,
         no_probe: false,
         force_container_probe: false,
+        no_vault: false,
+        vault_cmd: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -92,6 +113,19 @@ fn parse_args() -> Result<Args, String> {
             "--no-tui" => a.no_tui = true,
             "--no-probe" => a.no_probe = true,
             "--container-probe" => a.force_container_probe = true,
+            "--no-vault" => a.no_vault = true,
+            "--vault" => a.vault_cmd = Some(VaultCmd::List),
+            "--vault-verify" => a.vault_cmd = Some(VaultCmd::Verify),
+            "--vault-dump" => {
+                a.vault_cmd = Some(VaultCmd::Dump(
+                    it.next().ok_or("--vault-dump needs a volume name")?,
+                ))
+            }
+            "--vault-restore" => {
+                a.vault_cmd = Some(VaultCmd::Restore(
+                    it.next().ok_or("--vault-restore needs an entry id")?,
+                ))
+            }
             "--apply" => a.apply = true,
             "--tiers" => {
                 let v = it.next().ok_or("--tiers needs a value")?;
@@ -192,7 +226,119 @@ fn wants_tui(args: &Args) -> bool {
         && std::env::var("CI").is_err()
 }
 
+/// The vault subcommands. Read-only except `restore`, which creates a volume
+/// and refuses to overwrite an existing one.
+fn run_vault(cmd: &VaultCmd) -> Result<i32, Error> {
+    let vault = Vault::open()?;
+    let entries = vault.entries()?;
+
+    match cmd {
+        VaultCmd::List => {
+            println!();
+            println!("  vault: {}", vault.root().display());
+            if entries.is_empty() {
+                println!("  empty — nothing has been preserved yet");
+                println!();
+                return Ok(0);
+            }
+            println!(
+                "  {} entries, {} on disk",
+                entries.len(),
+                vault.total_bytes().human()
+            );
+            println!();
+            for e in &entries {
+                println!(
+                    "    {:<34} {:<24} {:>9}  {}",
+                    e.id,
+                    e.volume,
+                    e.archive_bytes.human(),
+                    e.engine.map(|x| x.as_str()).unwrap_or("—")
+                );
+            }
+            println!();
+            println!("  restore with:  prune-juice --vault-restore <id>");
+            println!();
+            Ok(0)
+        }
+        VaultCmd::Verify => {
+            let mut bad = 0;
+            println!();
+            for e in &entries {
+                match vault.verify(e) {
+                    Ok(()) => println!("    ok       {}", e.id),
+                    Err(err) => {
+                        bad += 1;
+                        println!("    CORRUPT  {}  {err}", e.id);
+                    }
+                }
+            }
+            if entries.is_empty() {
+                println!("  nothing to verify");
+            }
+            println!();
+            Ok(if bad > 0 { 5 } else { 0 })
+        }
+        VaultCmd::Dump(volume) => {
+            // Useful on its own — "preserve this before I touch it" — and the
+            // only way to exercise the dump path without deleting anything.
+            let ctxs: Vec<_> = context::discover()
+                .into_iter()
+                .filter(|c| c.is_local())
+                .collect();
+            let ctx = ctxs.first().ok_or(Error::NoContext)?;
+            let client = BollardClient::connect(&ctx.endpoint)?;
+
+            let existing = client.list_volumes()?;
+            let Some(v) = existing.iter().find(|v| &v.name == volume) else {
+                return Err(Error::Config(format!("no volume named {volume}")));
+            };
+
+            eprintln!("preserving {volume}…");
+            let entry = vault.store(
+                &client,
+                volume,
+                &v.labels,
+                None,
+                v.size,
+                now_unix(),
+            )?;
+            println!(
+                "  preserved {} as {} ({} on disk, {} entries, verified)",
+                entry.volume,
+                entry.id,
+                entry.archive_bytes.human(),
+                entry.entry_count
+            );
+            println!("  nothing was deleted.");
+            Ok(0)
+        }
+        VaultCmd::Restore(id) => {
+            let Some(entry) = entries.iter().find(|e| e.id == *id) else {
+                return Err(Error::Config(format!(
+                    "no vault entry with id {id}; run --vault to list them"
+                )));
+            };
+            let contexts: Vec<_> = context::discover()
+                .into_iter()
+                .filter(|c| c.is_local())
+                .collect();
+            let ctx = contexts.first().ok_or(Error::NoContext)?;
+            let client = BollardClient::connect(&ctx.endpoint)?;
+
+            eprintln!("restoring {} into volume {}…", entry.id, entry.volume);
+            vault.restore(&client, entry)?;
+            println!("  restored {} from {}", entry.volume, entry.id);
+            println!("  the vault copy was kept; remove it yourself when you are sure");
+            Ok(0)
+        }
+    }
+}
+
 fn run(args: &Args) -> Result<i32, Error> {
+    if let Some(cmd) = &args.vault_cmd {
+        return run_vault(cmd);
+    }
     let cancel = Cancel::new();
 
     // Contexts are candidate endpoints, not identities. Two can be the same
@@ -311,9 +457,13 @@ fn run(args: &Args) -> Result<i32, Error> {
             },
             tiers: args.tiers.clone(),
             only_label: args.only_label.clone(),
+            vault: !args.no_vault,
         };
+        let vault = Vault::open()?;
         let receipt = if args.apply {
-            Executor::applying(&client).run(plan, &fresh, now_unix(), &exec_opts, sink, &cancel)?
+            Executor::applying(&client)
+                .with_vault(&client, &vault)
+                .run(plan, &fresh, now_unix(), &exec_opts, sink, &cancel)?
         } else {
             // No mutating client at all: dry-run is unable to delete, not
             // merely disinclined to.

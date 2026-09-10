@@ -388,6 +388,78 @@ impl DockerMutate for BollardClient {
             .map_err(|e| map_err(e, &self.endpoint))
     }
 
+    fn restore_volume(
+        &self,
+        name: &str,
+        labels: &BTreeMap<String, String>,
+        tar: Vec<u8>,
+    ) -> Result<()> {
+        // Refuse to restore over anything that exists. A restore that merged
+        // into live data would be worse than the deletion it is undoing.
+        let existing = self.list_volumes()?;
+        if existing.iter().any(|v| v.name == name) {
+            return Err(Error::Config(format!(
+                "volume {name} already exists; remove it first or restore under another name"
+            )));
+        }
+
+        let opts = bollard::models::VolumeCreateOptions {
+            name: Some(name.to_string()),
+            labels: Some(labels.clone().into_iter().collect()),
+            ..Default::default()
+        };
+        self.block(self.docker.create_volume(opts))
+            .map_err(|e| map_err(e, &self.endpoint))?;
+
+        let Some(image) = self.find_probe_image() else {
+            return Err(Error::Config(
+                "no local image is available to restore with".into(),
+            ));
+        };
+
+        // Writable mount this time — that is the whole point — but still no
+        // network, and still never started.
+        let config = bollard::models::ContainerCreateBody {
+            image: Some(image),
+            cmd: Some(vec!["/bin/true".to_string()]),
+            network_disabled: Some(true),
+            host_config: Some(bollard::models::HostConfig {
+                binds: Some(vec![format!("{name}:/vault")]),
+                network_mode: Some("none".to_string()),
+                auto_remove: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let created = self
+            .block(self.docker.create_container(
+                None::<bollard::query_parameters::CreateContainerOptions>,
+                config,
+            ))
+            .map_err(|e| map_err(e, &self.endpoint))?;
+        let id = created.id;
+
+        let opts = bollard::query_parameters::UploadToContainerOptionsBuilder::new()
+            .path("/")
+            .build();
+        let result = self
+            .block(
+                self.docker
+                    .upload_to_container(&id, Some(opts), bollard::body_full(tar.into())),
+            )
+            .map_err(|e| map_err(e, &self.endpoint));
+
+        let _ = self.block(self.docker.remove_container(
+            &id,
+            Some(bollard::query_parameters::RemoveContainerOptions {
+                v: false,
+                force: true,
+                link: false,
+            }),
+        ));
+        result
+    }
+
     fn prune_build_cache(&self, keep_newer_than_secs: u64) -> Result<Bytes> {
         // The time guard is what survives a build starting between plan and
         // apply: anything touched inside the window is left alone.
@@ -457,6 +529,69 @@ impl BollardClient {
 impl DockerProbe for BollardClient {
     fn probe_image(&self) -> Option<String> {
         self.find_probe_image()
+    }
+
+    fn dump_volume(&self, name: &str, out: &mut dyn std::io::Write) -> Result<u64> {
+        use futures_util::StreamExt;
+
+        let Some(image) = self.find_probe_image() else {
+            return Err(Error::Config(
+                "no local image is available to read volume contents; try `docker pull alpine`"
+                    .into(),
+            ));
+        };
+
+        // Read-only bind, no network, read-only rootfs. And crucially: this
+        // container is created and never started. It exists solely so the
+        // archive endpoint has a mount namespace to read through.
+        let config = bollard::models::ContainerCreateBody {
+            image: Some(image),
+            cmd: Some(vec!["/bin/true".to_string()]),
+            network_disabled: Some(true),
+            host_config: Some(bollard::models::HostConfig {
+                binds: Some(vec![format!("{name}:/vault:ro")]),
+                network_mode: Some("none".to_string()),
+                readonly_rootfs: Some(true),
+                auto_remove: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let created = self
+            .block(self.docker.create_container(
+                None::<bollard::query_parameters::CreateContainerOptions>,
+                config,
+            ))
+            .map_err(|e| map_err(e, &self.endpoint))?;
+        let id = created.id;
+
+        let opts = bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
+            .path("/vault")
+            .build();
+
+        // Capture the result before cleanup so a failure cannot leak a
+        // container.
+        let result = self.block(async {
+            let mut stream = self.docker.download_from_container(&id, Some(opts));
+            let mut written: u64 = 0;
+            while let Some(chunk) = stream.next().await {
+                let bytes = chunk.map_err(|e| map_err(e, &self.endpoint))?;
+                out.write_all(&bytes).map_err(Error::Io)?;
+                written += bytes.len() as u64;
+            }
+            Ok(written)
+        });
+
+        let _ = self.block(self.docker.remove_container(
+            &id,
+            Some(bollard::query_parameters::RemoveContainerOptions {
+                v: false,
+                force: true,
+                link: false,
+            }),
+        ));
+        result
     }
 
     fn probe_volumes(&self, volumes: &[String]) -> Result<BTreeMap<String, RawProbe>> {

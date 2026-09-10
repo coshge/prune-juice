@@ -19,6 +19,8 @@ rusqlite.workspace   = true
 uuid.workspace       = true
 etcetera.workspace   = true
 sha2.workspace       = true
+flate2.workspace     = true
+tar.workspace        = true
 
 bollard      = { workspace = true, optional = true }
 tokio        = { workspace = true, optional = true }

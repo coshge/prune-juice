@@ -10,7 +10,7 @@ model strong enough that the headline action needs no confirmation. Free MIT
 Rust CLI; a free macOS app comes later, architected so a one-time paid tier
 could be added without rework.
 
-## Status: M4a complete (content probe, both paths)
+## Status: M4 complete (probe + vault)
 
 | milestone | state |
 |---|---|
@@ -18,24 +18,34 @@ could be added without rework.
 | M2 planner, tier classification, apply path | done |
 | M3 interactive ratatui TUI | done |
 | M4a content probe — native **and** container path | done |
-| M4b vault (dump / verify / restore) — unlocks the rest | next |
-| M5 review, waivers, host disk measurement | not started |
+| M4b vault (dump / verify / restore) | done |
+| M5 review UI, waivers, host disk measurement | next |
 | M6 macOS app | not started |
 
 ```
-cargo test --workspace                  # 133 tests
+cargo test --workspace                  # 147 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
 ./target/debug/prune-juice --no-tui     # force the one-shot report
 ./target/debug/prune-juice --apply      # reclaims the safe tier only
 ./target/debug/prune-juice --container-probe   # force the Docker Desktop path
+./target/debug/prune-juice --vault            # list preserved copies
+./target/debug/prune-juice --vault-dump VOL   # preserve one now, delete nothing
+./target/debug/prune-juice --vault-verify     # re-read every copy
+./target/debug/prune-juice --vault-restore ID # put a volume back
 
 cargo run -p prune-juice-tui --example preview   # render every screen, no TTY needed
 ```
 
 ## Deliberately not implemented — do not "fix" these
 
+- **Irreversible items are preserved or refused, never deleted bare.** An
+  orphaned or stale volume is dumped to the vault, fsynced, re-read, and only
+  deleted once the digest and tar entry count both match. A failed dump leaves
+  the volume alone and reports `PreserveFailed`. `--no-vault` does **not** mean
+  "delete without a backup" — it means those items are refused, because
+  declining a backup is not consent to lose data.
 - **Only *empty* and *derivative* volumes can reach the safe tier.** A volume
   holding anything else — a database, user data, or contents we do not
   recognise — stays irreversible until the vault exists. An **unprobed** volume
@@ -122,7 +132,18 @@ All have regression tests — if you break one, a test will tell you.
 17. **The probe container is removed whatever happens.** The result is captured
     before cleanup rather than propagated early, so a failure cannot leak a
     container. Verified by container count before and after a real run.
-18. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
+18. **The vault hashes the file on disk, not the stream.** An early version
+    wrapped a hasher above the gzip encoder: it never called `update`, and even
+    fixed would have digested the uncompressed bytes while `verify` reads the
+    compressed file. Hash what is actually written.
+19. **A dump container is created and never started.** Booting an engine
+    against a real data directory triggers crash recovery and catalog writes —
+    mutating the thing being preserved. `GET /containers/{id}/archive` reads
+    through a stopped container without executing anything.
+20. **The vault lives on the host, outside any cache directory.** A vault inside
+    a Docker volume could be eaten by a later `docker system prune`, making the
+    safety net part of the hazard. There is a test asserting the path.
+21. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
     fields and no public constructor; `Fresh` comes only from `revalidate()` and
     is consumed by the executor. Do not add a public constructor or a `Clone`.
 
@@ -195,7 +216,11 @@ checkouts "derivative" because they contained a `vendor` directory.
 - bollard cannot encode `?type=` on `/system/df` (`serde_urlencoded` rejects a
   `Vec`), so the planned filter optimisation is unavailable. One unfiltered call
   returns volumes and build cache together, which is what `data_usage()` does.
-- `--apply` has never been run against a real daemon. The apply path is covered
+- `--apply` has still never removed anything on a real daemon. The vault's
+  dump/verify/restore path **has** been proven end-to-end against one: a
+  throwaway volume was dumped, deleted, restored, and compared byte-for-byte
+  including labels. What remains unexercised is the delete step itself.
+- Old note, still true: The apply path is covered
   by unit tests with a spy client, and dry-run exercises the identical code path
   including per-item revalidation, but a real end-to-end deletion is unverified.
   **Ask before running it** — it is 89 containers, 20 networks and ~12 GB of

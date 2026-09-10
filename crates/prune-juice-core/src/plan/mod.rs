@@ -176,6 +176,9 @@ pub struct PlanItem {
     /// Carried so `--only-label` can be enforced at apply time rather than
     /// merely documented.
     pub labels: BTreeMap<String, String>,
+    /// Database engine detected by the probe, recorded in the vault manifest so
+    /// a restore knows what it is holding.
+    pub engine: Option<crate::probe::Engine>,
     pub verdict: Verdict,
     /// The facts the verdict rested on. Hashed for staleness detection; not
     /// meant for humans.
@@ -276,6 +279,10 @@ impl Planner {
                 size: a.resource.size,
                 owner: a.owner.clone(),
                 labels: a.resource.labels.clone(),
+                engine: a.content.as_ref().and_then(|c| match &c.class {
+                    crate::probe::ContentClass::Database(e) => Some(*e),
+                    _ => None,
+                }),
                 provenance: best_claim(&a.claims)
                     .map(|c| {
                         c.evidence

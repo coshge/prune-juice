@@ -283,6 +283,10 @@ fn spawn_apply(opts: &TuiOptions, plan: Plan, tx: Sender<Msg>, cancel: Cancel) {
             // keystrokes would be exactly the risk this tool removes.
             tiers: vec![Tier::Free],
             only_label: None,
+            // The interface only ever touches the safe tier, which is
+            // reversible by definition, so no copy is needed. Irreversible
+            // items are inspect-only here.
+            vault: true,
         };
         match Executor::applying(&client).run(plan, &fresh, now_unix(), &exec_opts, sink, &cancel) {
             Ok(r) => {
