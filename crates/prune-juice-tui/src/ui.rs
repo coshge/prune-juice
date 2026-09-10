@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use prune_juice_core::model::Bytes;
+use prune_juice_core::model::{Bytes, ResourceKind};
 use prune_juice_core::plan::tier::{Reversibility, Tier};
 
 use crate::app::{App, MenuItem, Screen};
@@ -31,6 +31,7 @@ pub fn draw(f: &mut Frame, app: &App) {
         Screen::Scanning => scanning(f, rows[1], app),
         Screen::Main => main_screen(f, rows[1], app),
         Screen::Review => review(f, rows[1], app),
+        Screen::Confirm => confirm(f, rows[1], app),
         Screen::Applying => applying(f, rows[1], app),
         Screen::Finished => finished(f, rows[1], app),
     }
@@ -250,7 +251,13 @@ fn review(f: &mut Frame, area: Rect, app: &App) {
 
     for (i, row) in app.review_rows.iter().enumerate().skip(start) {
         let selected = i == app.review_index;
-        let marker = if selected { "❱ " } else { "  " };
+        let ticked = app.selected.contains(&i);
+        let marker = match (selected, ticked) {
+            (true, true) => "❱▪",
+            (true, false) => "❱ ",
+            (false, true) => " ▪",
+            (false, false) => "  ",
+        };
         let tier_style = match row.tier {
             Tier::Orphan => Style::default().fg(WARN),
             _ => Style::default().fg(DIM),
@@ -303,6 +310,84 @@ fn review(f: &mut Frame, area: Rect, app: &App) {
     }
 
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The last look before anything irreversible.
+///
+/// States, in full: how many rows, how much, how many will be copied to the
+/// vault first, and — if any cannot be preserved — that acting would lose them.
+/// Nothing here is a surprise by the time the user presses a key.
+fn confirm(f: &mut Frame, area: Rect, app: &App) {
+    let rows = app.selected_rows();
+    let vaulted = app.selected_needing_vault();
+    let unpreservable = app.selected_unpreservable();
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  about to act on "),
+            Span::styled(
+                format!("{} items", rows.len()),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" · {}", app.selected_bytes().human())),
+        ]),
+        Line::from(""),
+    ];
+
+    for r in rows.iter().take(10) {
+        let tag = if r.reversibility.is_gone() && r.kind == ResourceKind::Volume {
+            Span::styled("  copied to the vault first", Style::default().fg(GOOD))
+        } else if r.reversibility.is_gone() {
+            Span::styled("  CANNOT be preserved", Style::default().fg(BAD))
+        } else {
+            Span::styled("  recreated on next up", Style::default().fg(DIM))
+        };
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::raw(format!("{:<30}", clip(&r.name, 30))),
+            Span::styled(
+                format!(
+                    "{:>10}",
+                    r.size.map(|b| b.human()).unwrap_or_else(|| "—".into())
+                ),
+                Style::default().fg(DIM),
+            ),
+            tag,
+        ]));
+    }
+    if rows.len() > 10 {
+        lines.push(Line::from(format!("    … and {} more", rows.len() - 10)));
+    }
+
+    lines.push(Line::from(""));
+    if vaulted > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("  {vaulted} will be copied to the vault and verified before removal."),
+            Style::default().fg(GOOD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  If a copy cannot be made, that item is left exactly where it is.",
+            Style::default().fg(DIM),
+        )));
+    }
+    if !unpreservable.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "  {} cannot be preserved — acting on those loses them for good.",
+                unpreservable.len()
+            ),
+            Style::default().fg(BAD),
+        )));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  press y to go ahead, anything else to go back",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn applying(f: &mut Frame, area: Rect, app: &App) {
@@ -389,7 +474,8 @@ fn hints(f: &mut Frame, area: Rect, app: &App) {
     let text = match app.screen {
         Screen::Scanning => "q quit",
         Screen::Main => "↑↓ move   ↵ select   q quit",
-        Screen::Review => "↑↓ move   e evidence   esc back   q back",
+        Screen::Review => "↑↓ move   space tick   a all   e evidence   d act on ticked   esc back",
+        Screen::Confirm => "y go ahead   any other key cancels",
         Screen::Applying => "working…",
         Screen::Finished => "r scan again   any other key quits",
     };
@@ -574,6 +660,31 @@ mod tests {
             after.contains("irreversible"),
             "an orphaned volume cannot be undone yet, and must say so:\n{after}"
         );
+    }
+
+    #[test]
+    fn the_confirm_screen_spells_out_what_will_happen() {
+        let mut app = demo_app();
+        app.screen = Screen::Review;
+        app.on_key(Key::Char('a'));
+        app.screen = Screen::Confirm;
+        let out = render_at(&app, 100, 26);
+        assert!(out.contains("about to act on"), "{out}");
+        assert!(
+            out.contains("vault"),
+            "the user must be told a copy is taken first:\n{out}"
+        );
+        assert!(out.contains("press y"), "{out}");
+    }
+
+    #[test]
+    fn ticked_rows_are_visibly_marked() {
+        let mut app = demo_app();
+        app.screen = Screen::Review;
+        let before = render_at(&app, 100, 26);
+        app.on_key(Key::Char(' '));
+        let after = render_at(&app, 100, 26);
+        assert_ne!(before, after, "a tick must be visible");
     }
 
     #[test]

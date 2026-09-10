@@ -18,6 +18,9 @@ pub enum Screen {
     Scanning,
     Main,
     Review,
+    /// Shown before acting on reviewed rows. The last chance to look at what
+    /// is about to happen, stated in full.
+    Confirm,
     Applying,
     Finished,
 }
@@ -32,6 +35,9 @@ pub enum Action {
     /// Reclaim the safe tier. No confirmation dialog — pressing the key on a
     /// row that says "nothing here can be lost" *is* the confirmation.
     ReclaimFree,
+    /// Act on the rows the user ticked. Only reachable from the confirm screen,
+    /// because these are irreversible without the vault.
+    ApplySelected,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +88,8 @@ pub struct App {
     pub review_rows: Vec<ReviewRow>,
     /// Rows whose evidence is expanded inline.
     pub expanded: BTreeSet<usize>,
+    /// Rows the user has ticked for action.
+    pub selected: BTreeSet<usize>,
 
     /// Progressive counts, so the scan screen fills in rather than hanging.
     pub seen_containers: u32,
@@ -110,6 +118,7 @@ impl App {
             review_index: 0,
             review_rows: Vec::new(),
             expanded: BTreeSet::new(),
+            selected: BTreeSet::new(),
             seen_containers: 0,
             seen_images: 0,
             seen_volumes: 0,
@@ -137,6 +146,7 @@ impl App {
         self.menu_index = 0;
         self.review_index = 0;
         self.expanded.clear();
+        self.selected.clear();
         self.status.clear();
     }
 
@@ -211,6 +221,15 @@ impl App {
             },
             Screen::Main => self.on_key_main(key),
             Screen::Review => self.on_key_review(key),
+            Screen::Confirm => match key {
+                // A single deliberate key, on a screen that has just spelled
+                // out what will happen and what will be preserved first.
+                Key::Char('y') | Key::Char('Y') => Action::ApplySelected,
+                _ => {
+                    self.screen = Screen::Review;
+                    Action::None
+                }
+            },
             Screen::Finished => match key {
                 Key::Char('r') => Action::Rescan,
                 _ => {
@@ -277,6 +296,28 @@ impl App {
                 }
                 Action::None
             }
+            Key::Char(' ') => {
+                if !self.selected.remove(&self.review_index) {
+                    self.selected.insert(self.review_index);
+                }
+                Action::None
+            }
+            Key::Char('a') => {
+                if self.selected.len() == self.review_rows.len() {
+                    self.selected.clear();
+                } else {
+                    self.selected = (0..self.review_rows.len()).collect();
+                }
+                Action::None
+            }
+            Key::Char('d') | Key::Char('D') => {
+                if self.selected.is_empty() {
+                    self.status = "nothing ticked — press space to choose rows".into();
+                    return Action::None;
+                }
+                self.screen = Screen::Confirm;
+                Action::None
+            }
             Key::Char('q') | Key::Esc | Key::Left => {
                 self.screen = Screen::Main;
                 Action::None
@@ -287,6 +328,41 @@ impl App {
 
     pub fn current_row(&self) -> Option<&ReviewRow> {
         self.review_rows.get(self.review_index)
+    }
+
+    pub fn selected_rows(&self) -> Vec<&ReviewRow> {
+        self.selected
+            .iter()
+            .filter_map(|i| self.review_rows.get(*i))
+            .collect()
+    }
+
+    pub fn selected_names(&self) -> Vec<String> {
+        self.selected_rows()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect()
+    }
+
+    pub fn selected_bytes(&self) -> Bytes {
+        self.selected_rows().iter().filter_map(|r| r.size).sum()
+    }
+
+    /// How many of the ticked rows need preserving before they can go.
+    pub fn selected_needing_vault(&self) -> usize {
+        self.selected_rows()
+            .iter()
+            .filter(|r| r.reversibility.is_gone() && r.kind == ResourceKind::Volume)
+            .count()
+    }
+
+    /// Ticked rows that are irreversible and cannot be preserved either, so
+    /// acting on them would simply lose data.
+    pub fn selected_unpreservable(&self) -> Vec<&ReviewRow> {
+        self.selected_rows()
+            .into_iter()
+            .filter(|r| r.reversibility.is_gone() && r.kind != ResourceKind::Volume)
+            .collect()
     }
 }
 
@@ -562,6 +638,115 @@ mod tests {
         app.on_key(Key::Esc);
         assert_eq!(app.screen, Screen::Main);
         assert!(!app.should_quit, "back is not quit");
+    }
+
+    fn reviewable_app() -> App {
+        let mut orphan = network("nbk_mysql");
+        orphan.kind = ResourceKind::Volume;
+        orphan.size = Some(Bytes(379_000_000));
+        let mut second = network("nbk_tmp");
+        second.kind = ResourceKind::Volume;
+        second.size = Some(Bytes(10_500_000));
+        ready_app(vec![attributed(orphan, true), attributed(second, true)])
+    }
+
+    #[test]
+    fn space_ticks_a_row_and_ticking_again_unticks_it() {
+        let mut app = reviewable_app();
+        app.screen = Screen::Review;
+        assert!(app.selected.is_empty());
+        app.on_key(Key::Char(' '));
+        assert_eq!(app.selected.len(), 1);
+        app.on_key(Key::Char(' '));
+        assert!(app.selected.is_empty());
+    }
+
+    #[test]
+    fn a_selects_all_then_clears() {
+        let mut app = reviewable_app();
+        app.screen = Screen::Review;
+        app.on_key(Key::Char('a'));
+        assert_eq!(app.selected.len(), app.review_rows.len());
+        app.on_key(Key::Char('a'));
+        assert!(app.selected.is_empty());
+    }
+
+    #[test]
+    fn acting_with_nothing_ticked_does_nothing_and_says_why() {
+        let mut app = reviewable_app();
+        app.screen = Screen::Review;
+        assert_eq!(app.on_key(Key::Char('d')), Action::None);
+        assert_eq!(
+            app.screen,
+            Screen::Review,
+            "must not reach a confirm screen"
+        );
+        assert!(app.status.contains("nothing ticked"), "{}", app.status);
+    }
+
+    #[test]
+    fn acting_on_ticked_rows_goes_via_a_confirm_screen() {
+        // Never straight from a list keypress to a deletion.
+        let mut app = reviewable_app();
+        app.screen = Screen::Review;
+        app.on_key(Key::Char(' '));
+        assert_eq!(app.on_key(Key::Char('d')), Action::None);
+        assert_eq!(app.screen, Screen::Confirm);
+    }
+
+    #[test]
+    fn only_y_confirms_and_anything_else_backs_out() {
+        let mut app = reviewable_app();
+        app.screen = Screen::Review;
+        app.on_key(Key::Char(' '));
+        app.on_key(Key::Char('d'));
+        assert_eq!(app.on_key(Key::Char('y')), Action::ApplySelected);
+
+        // Any other key must cancel, including a stray return.
+        for k in [
+            Key::Enter,
+            Key::Esc,
+            Key::Char('n'),
+            Key::Char('x'),
+            Key::Down,
+        ] {
+            let mut app = reviewable_app();
+            app.screen = Screen::Review;
+            app.on_key(Key::Char(' '));
+            app.on_key(Key::Char('d'));
+            assert_eq!(app.on_key(k), Action::None, "{k:?} must not confirm");
+            assert_eq!(app.screen, Screen::Review, "{k:?} must go back");
+        }
+    }
+
+    #[test]
+    fn the_confirm_screen_knows_what_needs_preserving() {
+        let mut app = reviewable_app();
+        app.screen = Screen::Review;
+        app.on_key(Key::Char('a'));
+        assert_eq!(app.selected_names().len(), 2);
+        assert_eq!(app.selected_bytes(), Bytes(389_500_000));
+        assert_eq!(
+            app.selected_needing_vault(),
+            2,
+            "both are irreversible volumes, so both get copied first"
+        );
+        assert!(app.selected_unpreservable().is_empty());
+    }
+
+    #[test]
+    fn a_rescan_clears_any_ticks() {
+        // Selections index into a list that a rescan replaces. Carrying them
+        // over would act on whatever happened to land at those positions.
+        let mut app = reviewable_app();
+        app.screen = Screen::Review;
+        app.on_key(Key::Char('a'));
+        assert!(!app.selected.is_empty());
+
+        let rep = report(vec![]);
+        let plan = Planner::plan(&rep, NOW);
+        app.ready(rep, plan);
+        assert!(app.selected.is_empty());
     }
 
     #[test]

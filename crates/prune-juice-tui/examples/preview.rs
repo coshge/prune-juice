@@ -102,18 +102,27 @@ fn main() {
     app.ready(report, plan);
 
     let (w, h) = (98u16, 26u16);
-    for (label, screen) in [
-        ("MAIN", Screen::Main),
-        ("REVIEW", Screen::Review),
-        ("REVIEW (evidence expanded)", Screen::Review),
-    ] {
-        app.screen = screen;
-        if label.contains("expanded") {
-            app.on_key(Key::Char('e'));
-        }
-        println!("\n=== {label} ===");
-        print!("{}", render(&app, w, h));
-    }
+
+    app.screen = Screen::Main;
+    println!("\n=== MAIN ===");
+    print!("{}", render(&app, w, h));
+
+    app.screen = Screen::Review;
+    println!("\n=== REVIEW ===");
+    print!("{}", render(&app, w, 12));
+
+    app.on_key(Key::Char('e'));
+    println!("\n=== REVIEW (evidence expanded) ===");
+    print!("{}", render(&app, w, 12));
+
+    app.on_key(Key::Char('e'));
+    app.on_key(Key::Char('a'));
+    println!("\n=== REVIEW (all ticked) ===");
+    print!("{}", render(&app, w, 10));
+
+    app.screen = Screen::Confirm;
+    println!("\n=== CONFIRM ===");
+    print!("{}", render(&app, w, 20));
 
     // And the scanning screen, mid-flight.
     let mut scanning = App::new();

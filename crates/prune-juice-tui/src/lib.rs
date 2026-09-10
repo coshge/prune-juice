@@ -127,7 +127,30 @@ fn event_loop(terminal: &mut Term, opts: TuiOptions) -> Result<i32, Error> {
                             if let Some(plan) = app.plan.take() {
                                 app.screen = Screen::Applying;
                                 app.status = "reclaiming…".into();
-                                spawn_apply(&opts, plan, tx.clone(), cancel.clone());
+                                spawn_apply(
+                                    &opts,
+                                    plan,
+                                    vec![Tier::Free],
+                                    None,
+                                    tx.clone(),
+                                    cancel.clone(),
+                                );
+                            }
+                        }
+                        Action::ApplySelected => {
+                            let names: std::collections::BTreeSet<String> =
+                                app.selected_names().into_iter().collect();
+                            if let Some(plan) = app.plan.take() {
+                                app.screen = Screen::Applying;
+                                app.status = "preserving and removing the items you ticked…".into();
+                                spawn_apply(
+                                    &opts,
+                                    plan,
+                                    vec![Tier::Orphan, Tier::Stale],
+                                    Some(names),
+                                    tx.clone(),
+                                    cancel.clone(),
+                                );
                             }
                         }
                         Action::None => {}
@@ -244,7 +267,14 @@ fn spawn_scan(opts: &TuiOptions, tx: Sender<Msg>, cancel: Cancel) {
     });
 }
 
-fn spawn_apply(opts: &TuiOptions, plan: Plan, tx: Sender<Msg>, cancel: Cancel) {
+fn spawn_apply(
+    opts: &TuiOptions,
+    plan: Plan,
+    tiers: Vec<Tier>,
+    only_names: Option<std::collections::BTreeSet<String>>,
+    tx: Sender<Msg>,
+    cancel: Cancel,
+) {
     let endpoint = opts.endpoint.clone();
     let context = opts.context.clone();
     let scan_opts = opts.scan.clone();
@@ -277,18 +307,32 @@ fn spawn_apply(opts: &TuiOptions, plan: Plan, tx: Sender<Msg>, cancel: Cancel) {
 
         let exec_opts = ExecuteOptions {
             mode: Mode::Apply,
-            // The interface only ever actions the safe tier. Orphaned and stale
-            // items are inspect-only here: deleting an orphaned volume is
-            // irreversible until the vault exists, and putting that behind two
-            // keystrokes would be exactly the risk this tool removes.
-            tiers: vec![Tier::Free],
+            tiers,
             only_label: None,
-            // The interface only ever touches the safe tier, which is
-            // reversible by definition, so no copy is needed. Irreversible
-            // items are inspect-only here.
+            // Reviewed rows are fenced by name: anything the user did not tick
+            // is unreachable by this run, not merely skipped.
+            only_names,
+            // Always on. An irreversible item is copied and verified first, or
+            // it is refused — the interface never offers bare deletion.
             vault: true,
         };
-        match Executor::applying(&client).run(plan, &fresh, now_unix(), &exec_opts, sink, &cancel) {
+        let vault = match prune_juice_core::vault::Vault::open() {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tx.send(Msg::Failed(e.to_string()));
+                return;
+            }
+        };
+        let store = prune_juice_core::disk::detect(
+            fresh.daemon.runtime,
+            fresh.daemon.data_root.as_deref(),
+            &endpoint,
+        );
+        match Executor::applying(&client)
+            .with_vault(&client, &vault)
+            .with_disk(&store)
+            .run(plan, &fresh, now_unix(), &exec_opts, sink, &cancel)
+        {
             Ok(r) => {
                 let _ = tx.send(Msg::Applied(Box::new(r)));
             }

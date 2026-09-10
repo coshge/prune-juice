@@ -41,6 +41,12 @@ pub struct ExecuteOptions {
     /// feature because it is genuinely useful, and used as the integration-test
     /// harness so a real-daemon test cannot escape its own sandbox.
     pub only_label: Option<(String, String)>,
+    /// Act only on these exact resource names.
+    ///
+    /// A fence like `only_label`, for a user who reviewed a list and ticked
+    /// specific rows. Anything not named is unreachable by the run, not merely
+    /// skipped.
+    pub only_names: Option<std::collections::BTreeSet<String>>,
     /// Preserve a verified copy before any irreversible deletion.
     ///
     /// On by default, and turning it off is what `--no-vault` is for. With it
@@ -55,6 +61,7 @@ impl Default for ExecuteOptions {
             mode: Mode::DryRun,
             tiers: vec![Tier::Free],
             only_label: None,
+            only_names: None,
             vault: true,
         }
     }
@@ -235,6 +242,11 @@ impl<'a> Executor<'a> {
                     continue;
                 }
             }
+            if let Some(names) = &opts.only_names {
+                if !names.contains(&item.name) {
+                    continue;
+                }
+            }
             cancel.check()?;
 
             let Some(witness) = item.take_witness() else {
@@ -372,6 +384,7 @@ impl<'a> Executor<'a> {
         // it anyway would break the promise the flag makes.
         let mut cache_freed = Bytes::ZERO;
         if opts.only_label.is_none()
+            && opts.only_names.is_none()
             && opts.tiers.contains(&Tier::Free)
             && plan.build_cache_reclaimable > Bytes::ZERO
         {
@@ -1002,6 +1015,43 @@ mod tests {
             .unwrap();
         assert_eq!(receipt.deleted(), 1);
         assert!(receipt.preserved().is_empty());
+    }
+
+    #[test]
+    fn only_names_is_a_fence_over_individual_rows() {
+        // What the review screen needs: the user ticked one row, so only that
+        // row may be reached — and the build cache, which no name can cover,
+        // is left alone.
+        let rep = report(vec![
+            attributed(network("picked_default")),
+            attributed(network("ignored_default")),
+        ]);
+        let plan = Planner::plan(&rep, NOW);
+        let spy = SpyMutate::default();
+
+        let receipt = Executor::applying(&spy)
+            .run(
+                plan,
+                &rep,
+                NOW,
+                &ExecuteOptions {
+                    mode: Mode::Apply,
+                    only_names: Some(["picked_default".to_string()].into_iter().collect()),
+                    ..Default::default()
+                },
+                Arc::new(NullSink),
+                &Cancel::new(),
+            )
+            .unwrap();
+
+        assert_eq!(receipt.deleted(), 1);
+        let calls = spy.calls();
+        assert!(calls.iter().any(|c| c.contains("picked_default")));
+        assert!(
+            !calls.iter().any(|c| c.contains("ignored_default")),
+            "an unticked row must be unreachable"
+        );
+        assert!(!calls.contains(&"build_cache".to_string()));
     }
 
     #[test]

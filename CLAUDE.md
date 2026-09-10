@@ -10,7 +10,7 @@ model strong enough that the headline action needs no confirmation. Free MIT
 Rust CLI; a free macOS app comes later, architected so a one-time paid tier
 could be added without rework.
 
-## Status: M4 complete (probe + vault)
+## Status: M5 complete
 
 | milestone | state |
 |---|---|
@@ -19,11 +19,11 @@ could be added without rework.
 | M3 interactive ratatui TUI | done |
 | M4a content probe — native **and** container path | done |
 | M4b vault (dump / verify / restore) | done |
-| M5 review UI, waivers, host disk measurement | next |
-| M6 macOS app | not started |
+| M5 review actions, waivers, host disk measurement | done |
+| M6 macOS app | next |
 
 ```
-cargo test --workspace                  # 147 tests
+cargo test --workspace                  # 177 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -34,6 +34,8 @@ cargo build -p prune-juice-cli
 ./target/debug/prune-juice --vault-dump VOL   # preserve one now, delete nothing
 ./target/debug/prune-juice --vault-verify     # re-read every copy
 ./target/debug/prune-juice --vault-restore ID # put a volume back
+./target/debug/prune-juice --waivers          # what is being held back by hand
+./target/debug/prune-juice --waive SEL --reason "..."   # hold something back
 
 cargo run -p prune-juice-tui --example preview   # render every screen, no TTY needed
 ```
@@ -70,10 +72,10 @@ cargo run -p prune-juice-tui --example preview   # render every screen, no TTY n
   only if profiling demands it.
 - **No SQLite index yet.** Tier 1 deliberately does not depend on it, so this is
   a missing feature rather than a broken one. Attribution is cold-start only.
-- **The TUI only ever actions the safe tier.** Orphaned and stale items are
-  inspect-only there. Deleting an orphaned volume is irreversible until the
-  vault exists, and two keystrokes is the wrong amount of friction for that.
-  The CLI still permits it via `--tiers orphan --apply` for someone explicit.
+- **The TUI can now act on reviewed rows**, because the vault makes them
+  recoverable. Tick with space, `d` to act, and it goes via a confirm screen
+  that states how many will be copied to the vault first. Only `y` proceeds;
+  every other key backs out. Never straight from a list keypress to a deletion.
 - **`--only-label` skips the build cache entirely.** Build cache records carry
   no labels, so the fence cannot be honoured for them; pruning it anyway would
   break the promise the flag makes.
@@ -143,7 +145,16 @@ All have regression tests — if you break one, a test will tell you.
 20. **The vault lives on the host, outside any cache directory.** A vault inside
     a Docker volume could be eaten by a later `docker system prune`, making the
     safety net part of the hazard. There is a test asserting the path.
-21. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
+21. **Selections must not survive a rescan.** They index into a list a rescan
+    replaces, so carrying them over would act on whatever landed at those
+    positions. `App::ready` clears them; there is a test.
+22. **A waiver needs a reason of at least 12 characters, and `*` is refused.**
+    An exclusion nobody can explain later is worse than none, and a blanket
+    waiver is not a waiver.
+23. **Docker-reported and host-measured are different numbers.** Shown on
+    separate lines, never summed, and where the host cannot be measured the
+    answer is "could not be measured" — not the Docker figure in disguise.
+24. **Permission to delete is a value, not a flag.** `SafeToDelete` has private
     fields and no public constructor; `Fresh` comes only from `revalidate()` and
     is consumed by the executor. Do not add a public constructor or a `Clone`.
 
@@ -209,6 +220,8 @@ checkouts "derivative" because they contained a `vendor` directory.
 
 - Image sizes are summed naively, so shared base layers are counted more than
   once (82.5 GB reported vs ~80.5 GB actual). Needs exclusive-size accounting.
+- No SQLite index yet; waivers live in a JSON file instead. That is the
+  remaining piece of the original plan's storage design.
 - Warm scan is ~3–6 s, over the sub-2 s target. The fix is the size cache: an
   orphaned volume's size is immutable, so its cache entry is valid forever, and
   the expensive `df` is only needed for in-use volumes — exactly the ones that

@@ -523,6 +523,7 @@ fn run(args: &Args) -> Result<i32, Error> {
             },
             tiers: args.tiers.clone(),
             only_label: args.only_label.clone(),
+            only_names: None,
             vault: !args.no_vault,
         };
         let vault = Vault::open()?;

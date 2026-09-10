@@ -27,7 +27,7 @@ $ prune-juice
     nbk_default                                      —  belongs to "nbk", whose directory is gone
 ```
 
-**Status: M4.** `prune-juice` on a terminal opens an interactive interface;
+**Status: M5.** `prune-juice` on a terminal opens an interactive interface;
 piped or under CI it prints a one-shot report. Dry-run by default. The content
 probe now lets *empty* and *derivative* volumes be reclaimed; everything else
 stays irreversible until the vault lands.
@@ -165,6 +165,13 @@ prune-juice --json             # NDJSON on stdout, progress on stderr
 prune-juice --no-sizes         # skip the expensive `system df`
 prune-juice --roots a:b        # where to look for projects
 prune-juice --context NAME     # one context only
+
+prune-juice --vault            # list preserved copies
+prune-juice --vault-dump VOL   # preserve one now, delete nothing
+prune-juice --vault-verify     # re-read every copy and confirm it
+prune-juice --vault-restore ID # put a volume back
+prune-juice --waivers          # what is being held back by hand
+prune-juice --waive volume:x --reason "..."   # hold something back
 ```
 
 The executor always runs; without `--apply` it runs in dry-run mode, which
@@ -203,8 +210,9 @@ Rust 1.85+. No system libraries — SQLite is bundled. `cargo build --workspace`
 
 ## Roadmap
 
-M1 read-only scan (done) · M2 planner and safe tier (done) · M3 interactive TUI
-(done) · M4 content probe and vault, which is what unlocks volumes · M5 review,
-waivers, host disk measurement · M6 macOS app.
+M1 read-only scan · M2 planner and safe tier · M3 interactive TUI · M4 content
+probe and vault · M5 review actions, waivers, host disk measurement — all done.
+M6 macOS app is next. The SQLite provenance index from the original plan is
+still outstanding; waivers currently live in a JSON file.
 
 MIT.
