@@ -12,7 +12,7 @@ With Rust and a Swift 6 toolchain installed, run from this directory:
 
 ```sh
 ./scripts/bundle.sh
-open dist/PruneJuice.app
+open "dist/Prune Juice.app"
 ```
 
 To rebuild the app *and* update the `prune-juice` on your `PATH` from the same
@@ -33,7 +33,7 @@ open /tmp/PruneJuice.iconset
 ```
 
 The app includes its command-line helper. The default build is signed for local
-use, not notarized for redistribution. Move the complete `PruneJuice.app` bundle
+use, not notarized for redistribution. Move the complete `Prune Juice.app` bundle
 to Applications if you want to keep it there.
 
 A build with no `SPARKLE_PUBLIC_KEY` in its environment has no update

@@ -62,12 +62,12 @@ From the repository root:
 ```sh
 cd app/PruneJuice
 ./scripts/bundle.sh
-open dist/PruneJuice.app
+open "dist/Prune Juice.app"
 ```
 
 The bundle includes the CLI helper, so the app does not need a separate CLI
 installation. The default build is signed for local use, not notarized for
-redistribution. You can move the completed `PruneJuice.app` to Applications.
+redistribution. You can move the completed `Prune Juice.app` to Applications.
 
 ### Updating a local build
 
@@ -374,7 +374,7 @@ manager understands:
 | `cargo install` | `cargo install prune-juice-cli --force` |
 | MacPorts | `sudo port upgrade prune-juice` |
 | Nix | `nix profile upgrade prune-juice` |
-| Inside `PruneJuice.app` | nothing — the app updates it |
+| Inside `Prune Juice.app` | nothing — the app updates it |
 
 A build with no release key compiled in — which includes a plain `cargo build`
 from this repository — has no update system at all and says so, rather than

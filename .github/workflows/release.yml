@@ -166,11 +166,11 @@ jobs:
           zip="$1"
           xcrun notarytool submit "$zip" \
             --apple-id "$APPLE_ID" --team-id "$TEAM_ID" --password "$PASSWORD" --wait
-          xcrun stapler staple dist/PruneJuice.app
+          xcrun stapler staple "dist/Prune Juice.app"
           # Re-archive: the ticket is stapled into the bundle, so the archive
           # made before stapling does not contain it.
           rm -f dist/PruneJuice-*.zip
-          ditto -c -k --keepParent dist/PruneJuice.app "$zip"
+          ditto -c -k --keepParent "dist/Prune Juice.app" "$zip"
 
       - name: sign the update archive
         working-directory: app/PruneJuice

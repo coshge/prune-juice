@@ -23,7 +23,7 @@ export PATH="$HOME/.cargo/bin:$PATH"
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="$HERE/app/PruneJuice"
-APP="$APP_DIR/dist/PruneJuice.app"
+APP="$APP_DIR/dist/Prune Juice.app"
 
 DO_CLI=1
 DO_APP=1
@@ -119,7 +119,11 @@ fi
 if [ "$DO_APP" = 1 ]; then
   say "app bundle $APP"
   # An older copy elsewhere is the thing that quietly wastes an afternoon.
-  for other in "/Applications/PruneJuice.app" "$HOME/Applications/PruneJuice.app"; do
+  # `PruneJuice.app` is the pre-0.3.2 name: a build from before the bundle was
+  # renamed is exactly such a copy, and is worth naming for that reason.
+  for other in \
+    "/Applications/Prune Juice.app" "$HOME/Applications/Prune Juice.app" \
+    "/Applications/PruneJuice.app" "$HOME/Applications/PruneJuice.app"; do
     [ -d "$other" ] || continue
     say "note: $other is a separate, now older copy — replace it with:"
     say "      ditto '$APP' '$other'"

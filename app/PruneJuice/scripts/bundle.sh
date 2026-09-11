@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Assemble PruneJuice.app.
+# Assemble "Prune Juice.app".
 #
 # Runs identically here and in CI, so the release is one reproducible command
 # rather than a sequence someone remembers.
@@ -25,7 +25,12 @@ export PATH="$HOME/.cargo/bin:$PATH"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 OUT="$HERE/dist"
-APP="$OUT/PruneJuice.app"
+# The bundle's file name, space and all, is what Finder, the Dock and the
+# app switcher actually show — CFBundleDisplayName is consulted only when a
+# bundle carries a localized InfoPlist.strings, which a hand-assembled one
+# does not. So the name on disk is the name, the way "Google Chrome.app" is.
+# Every use of $APP from here down is quoted for that reason.
+APP="$OUT/Prune Juice.app"
 NOTARIZE=0
 [ "${1:-}" = "--notarize" ] && NOTARIZE=1
 

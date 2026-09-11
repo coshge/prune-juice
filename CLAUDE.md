@@ -55,11 +55,11 @@ cargo run -p xtask -- appcast                   # the document Sparkle reads
 ./scripts/install-local.sh                      # rebuild CLI + app from this tree
 ./scripts/install-local.sh --cli               # just the CLI, onto the PATH
 
-cd app/PruneJuice && ./scripts/bundle.sh        # assemble PruneJuice.app (ad-hoc signed)
+cd app/PruneJuice && ./scripts/bundle.sh        # assemble Prune Juice.app (ad-hoc signed)
 swift app/PruneJuice/scripts/make-icon.swift out.iconset   # the icon, on its own
 SPARKLE_PUBLIC_KEY=… ./scripts/bundle.sh        # …with updates enabled
 SIGN_ID="Developer ID Application: …" ./scripts/bundle.sh --notarize
-open app/PruneJuice/dist/PruneJuice.app
+open "app/PruneJuice/dist/Prune Juice.app"
 ```
 
 App diagnostics land in `~/Library/Logs/prune-juice-app.log`. A GUI launch has

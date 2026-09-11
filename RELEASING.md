@@ -163,7 +163,7 @@ the once-a-day refresh can hold anything up. Two lines, on stderr:
 
 The second line changes with how that copy was installed: a Homebrew install
 is told `brew upgrade prune-juice`, a `cargo install` is told `cargo install
-prune-juice-cli --force`, and the helper inside `PruneJuice.app` is told
+prune-juice-cli --force`, and the helper inside `Prune Juice.app` is told
 nothing to run, because the app updates it. `--update` refuses to overwrite a
 binary a package manager owns.
 
@@ -277,6 +277,16 @@ itself once it has verified the signature.
 this pipeline has no Sparkle in it and cannot be offered anything. Everyone on
 an older build installs one updater-enabled version by hand; from there
 updates are offered automatically.
+
+**An install from before 0.3.2 keeps the old file name.** The bundle is now
+`Prune Juice.app` — the name on disk is what Finder, the Dock and the app
+switcher display, `CFBundleDisplayName` being consulted only for a bundle
+carrying a localized `InfoPlist.strings`, which a hand-assembled one does
+not. Sparkle installs an update at the *host* bundle's path, so a copy
+already installed as `PruneJuice.app` stays spelled that way however many
+times it updates. Everything inside it reads "Prune Juice"; only the file
+name lags, and renaming it in Finder is the whole fix. Not worth breaking an
+install over, and worth knowing before it looks like a bug.
 
 Getting a Developer ID changes only the first of those, and the workflow is
 already written to pick the certificate up when the secrets appear.

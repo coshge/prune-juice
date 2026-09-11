@@ -83,7 +83,7 @@ jobs:
       - name: the bundle carries Sparkle and its helper
         working-directory: app/PruneJuice
         run: |
-          test -x dist/PruneJuice.app/Contents/MacOS/prune-juice
-          test -d dist/PruneJuice.app/Contents/Frameworks/Sparkle.framework
-          test -f dist/PruneJuice.app/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate
-          codesign --verify --strict --verbose=2 dist/PruneJuice.app
+          test -x "dist/Prune Juice.app"/Contents/MacOS/prune-juice
+          test -d "dist/Prune Juice.app"/Contents/Frameworks/Sparkle.framework
+          test -f "dist/Prune Juice.app"/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate
+          codesign --verify --strict --verbose=2 "dist/Prune Juice.app"

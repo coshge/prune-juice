@@ -7,7 +7,7 @@
 //! the update. So the check still runs and still reports the new version; only
 //! the *action* changes, to the command that manager understands.
 //!
-//! The same rule covers the Mac app: the helper inside `PruneJuice.app` is
+//! The same rule covers the Mac app: the helper inside `Prune Juice.app` is
 //! sealed into a signed bundle, and replacing one file inside it breaks the
 //! bundle's signature. Sparkle updates the whole bundle instead.
 
@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Origin {
-    /// The helper inside `PruneJuice.app`. Sparkle updates the bundle whole,
+    /// The helper inside `Prune Juice.app`. Sparkle updates the bundle whole,
     /// which is what keeps the app and its helper the same version.
     AppBundle,
     /// Homebrew, with the prefix it lives under.
@@ -146,7 +146,7 @@ mod tests {
 
     #[test]
     fn the_bundled_helper_is_never_self_replaced() {
-        let o = classify("/Applications/PruneJuice.app/Contents/MacOS/prune-juice");
+        let o = classify("/Applications/Prune Juice.app/Contents/MacOS/prune-juice");
         assert_eq!(o, Origin::AppBundle);
         assert!(!o.self_replace_allowed());
         assert!(o.why_not().is_some());
@@ -159,7 +159,7 @@ mod tests {
         // The order of the checks is the point. A .app copied under a
         // Homebrew prefix must not be offered `brew upgrade`.
         assert_eq!(
-            classify("/opt/homebrew/Cellar/x/1/PruneJuice.app/Contents/MacOS/prune-juice"),
+            classify("/opt/homebrew/Cellar/x/1/Prune Juice.app/Contents/MacOS/prune-juice"),
             Origin::AppBundle
         );
     }
