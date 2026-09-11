@@ -413,8 +413,11 @@ All have regression tests — if you break one, a test will tell you.
 
 ## The acceptance gate
 
-Run `./target/debug/prune-juice --json` against the author's machine and read
-the `classified` events. Two distinct properties, easy to conflate:
+Run `./target/debug/prune-juice --json` against a machine carrying real project
+stacks and read the `classified` events. The project names below are the
+anonymised fixtures this repository uses throughout; substitute whatever that
+machine's projects are actually called. Two distinct properties, easy to
+conflate:
 
 **Must never be `orphan`** — the project exists, so an orphan verdict would be a
 false positive:
