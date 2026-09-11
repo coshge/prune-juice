@@ -55,7 +55,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         NSApp.activate(ignoringOtherApps: true)
-        model.scan()
+
+        // The release check goes before the first scan, not alongside it. A
+        // scan makes the app busy and a background check arriving during one
+        // is declined, so the two started together meant the check always
+        // lost. A bundle with no updater scans straight away, as it always
+        // did.
+        if let sparkle {
+            sparkle.checkOnLaunch { [weak self] in self?.model.scan() }
+        } else {
+            model.scan()
+        }
     }
 
     nonisolated func applicationShouldHandleReopen(

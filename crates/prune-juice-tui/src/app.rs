@@ -174,6 +174,14 @@ impl App {
         }
     }
 
+    /// The moment before the scan starts, while the release check is being
+    /// waited on. It gets its own status line because "starting…" held for
+    /// several seconds reads as a hang, and the honest answer is that we are
+    /// asking whether there is a newer version first.
+    pub fn await_update(&mut self) {
+        self.status = "checking for a new release…".into();
+    }
+
     pub fn note_update(&mut self, notice: prune_juice_core::update::Notice) {
         self.update = Some(notice);
     }

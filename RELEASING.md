@@ -148,10 +148,12 @@ it the tag name.
 
 ## What updates look like to a user
 
-**The CLI** checks in the background, at most once a day, only on a terminal,
-never under `CI`, and never in `--json`. It never delays a scan and never fails
-one — an unreachable release server produces silence. When there is something
-newer it prints two lines to stderr after the report:
+**The CLI** checks at most once a day, only on a terminal, never under `CI`,
+and never in `--json`. It never fails a scan — an unreachable release server
+produces silence — and it goes *before* the scan, not after the report: a
+release worth installing is worth hearing about instead of scanning. The wait
+is bounded at six seconds and a remembered answer returns instantly, so only
+the once-a-day refresh can hold anything up. Two lines, on stderr:
 
 ```
   Prune Juice 0.2.0 is available. You have 0.1.0.
@@ -164,10 +166,14 @@ prune-juice-cli --force`, and the helper inside `PruneJuice.app` is told
 nothing to run, because the app updates it. `--update` refuses to overwrite a
 binary a package manager owns.
 
-**The app** checks on launch, at most once a day. If it finds something while
-a scan, cleanup or vault operation is running — or while the app is in the
-background — it does not interrupt: a line appears in the window and a badge
-on the Dock icon, and the update is presented when the user asks for it.
+**The app** checks on launch, before its first scan — a scan makes it busy,
+and a background check arriving during one is declined, so the check has to go
+first to happen at all. The first scan starts when that check finishes, or six
+seconds later if the feed does not answer; if an update is found the scan
+waits for the dialog rather than starting behind it. If one is found *later*,
+while a scan, cleanup or vault operation is running — or while the app is in
+the background — it does not interrupt: a line appears in the window and a
+badge on the Dock icon, and the update is presented when the user asks for it.
 Installing is postponed until the helper has stopped, so an update can never
 relaunch the app between two deletions.
 

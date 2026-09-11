@@ -549,6 +549,32 @@ impl<'a> Checker<'a> {
     }
 }
 
+/// How long a run will wait for the check before getting on with the scan.
+///
+/// A bound, not a promise of speed. The check's own request timeouts are
+/// [`MANIFEST_TIMEOUT`] each for the manifest and its signature, so an
+/// answer that is coming arrives well inside this; what this protects
+/// against is a server that accepts a connection and then says nothing.
+pub const NOTICE_WAIT: Duration = Duration::from_secs(6);
+
+/// Wait for the background check, and return only news.
+///
+/// This is the deliberate exception to "never delay a scan": a release worth
+/// installing is worth hearing about before the work starts rather than as a
+/// footnote under a report that has already scrolled past. The cost is paid
+/// at most once a day, because a cached answer returns from this in about a
+/// millisecond — the thread reads the cache before it reaches for the
+/// network.
+///
+/// `UpToDate`, `Failed` and `Off` all read as `None`. A check that found
+/// nothing, or could not run, is not something to put in front of anyone.
+pub fn await_notice(rx: &std::sync::mpsc::Receiver<Decision>, wait: Duration) -> Option<Notice> {
+    match rx.recv_timeout(wait) {
+        Ok(Decision::Available(n)) => Some(n),
+        _ => None,
+    }
+}
+
 /// Run a check on a background thread.
 ///
 /// This is rule 1 made concrete. The caller reads the receiver whenever it
@@ -761,6 +787,100 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&cache).unwrap()).unwrap();
         assert_eq!(stored.latest.as_deref(), Some("0.2.0"));
         let _ = std::fs::remove_file(cache);
+    }
+
+    /// What `cached_notice` rests on: an answer already on disk can be turned
+    /// into a notice with a fetcher that cannot make a request at all. That is
+    /// the property that lets the CLI say it before the scan instead of after
+    /// the report — there is no network in this path to delay anything.
+    #[test]
+    fn a_remembered_answer_becomes_a_notice_with_no_request_at_all() {
+        let cache = tmp("cached-notice");
+        std::fs::write(
+            &cache,
+            serde_json::json!({"checked_unix": 1000, "latest": "0.2.0"}).to_string(),
+        )
+        .unwrap();
+
+        let read = |now: i64, current: &str| {
+            // OfflineFetcher fails every request, so anything this returns
+            // came from the file and nothing else.
+            Checker::new(&OfflineFetcher, now)
+                .with_cache(Some(cache.clone()))
+                .with_current_version(current)
+                .with_release_key(None)
+                .cached()
+        };
+
+        let d = read(1000, "0.1.0").expect("the entry is fresh");
+        assert_eq!(d.notice().expect("0.2.0 is newer").latest, "0.2.0");
+
+        // Already on it: an answer, but not news.
+        assert_eq!(read(1000, "0.2.0"), Some(Decision::UpToDate));
+
+        // Past the day it is trusted for, so there is nothing to say and the
+        // caller falls back to the background check.
+        assert_eq!(read(1000 + CACHE_TTL.as_secs() as i64, "0.1.0"), None);
+
+        let _ = std::fs::remove_file(&cache);
+    }
+
+    /// A cache recording a *failed* check is not news either. It exists to
+    /// stop the tool retrying for an hour, not to be shown to anyone.
+    #[test]
+    fn a_remembered_failure_is_never_put_in_front_of_a_scan() {
+        let cache = tmp("cached-failure");
+        std::fs::write(
+            &cache,
+            serde_json::json!({"checked_unix": 1000, "latest": null}).to_string(),
+        )
+        .unwrap();
+        let d = Checker::new(&OfflineFetcher, 1000)
+            .with_cache(Some(cache.clone()))
+            .with_current_version("0.1.0")
+            .with_release_key(None)
+            .cached();
+        assert!(matches!(d, Some(Decision::Failed(_))), "{d:?}");
+        assert!(d.unwrap().notice().is_none(), "a failure is not a notice");
+        let _ = std::fs::remove_file(&cache);
+    }
+
+    /// The wait a run performs before scanning. News comes back; everything
+    /// else is silence, and a check that never answers costs the bound and
+    /// nothing more.
+    #[test]
+    fn the_pre_scan_wait_returns_news_and_never_anything_else() {
+        let notice = Notice {
+            current: "0.1.0".into(),
+            latest: "0.2.0".into(),
+            notes_url: None,
+            origin: Origin::Standalone,
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Decision::Available(notice.clone())).unwrap();
+        assert_eq!(await_notice(&rx, NOTICE_WAIT), Some(notice));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Decision::UpToDate).unwrap();
+        assert_eq!(await_notice(&rx, NOTICE_WAIT), None);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(Decision::Failed("no".into())).unwrap();
+        assert_eq!(await_notice(&rx, NOTICE_WAIT), None);
+
+        // Nobody is going to send, and the sender is gone: this must return
+        // rather than hold the scan open.
+        let (tx, rx) = std::sync::mpsc::channel::<Decision>();
+        drop(tx);
+        assert_eq!(await_notice(&rx, NOTICE_WAIT), None);
+
+        // A sender that never sends costs the bound, once.
+        let (_tx, rx) = std::sync::mpsc::channel::<Decision>();
+        let began = std::time::Instant::now();
+        let short = Duration::from_millis(60);
+        assert_eq!(await_notice(&rx, short), None);
+        assert!(began.elapsed() < NOTICE_WAIT, "waited past the bound");
     }
 
     #[test]

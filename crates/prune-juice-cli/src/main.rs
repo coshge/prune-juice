@@ -689,8 +689,13 @@ fn wants_update_notice(args: &Args) -> bool {
 /// would lose it to a race for no benefit. It is not a wait on the network —
 /// the check has had the whole scan to finish, and if it has not, the answer
 /// is already in the cache for next time.
-fn report_update(rx: Option<&std::sync::mpsc::Receiver<Decision>>) {
+fn report_update(rx: Option<&std::sync::mpsc::Receiver<Decision>>, announced: bool) {
     let Some(rx) = rx else { return };
+    // Already said before the scan. Saying it again at the bottom would be
+    // the same news twice in one run.
+    if announced {
+        return;
+    }
     let Ok(decision) = rx.recv_timeout(std::time::Duration::from_millis(250)) else {
         return;
     };
@@ -698,10 +703,16 @@ fn report_update(rx: Option<&std::sync::mpsc::Receiver<Decision>>) {
     // check is not news, and telling someone their update check failed while
     // they were reclaiming disk is noise.
     if let Decision::Available(notice) = decision {
-        eprintln!();
-        for line in notice.lines() {
-            eprintln!("  {line}");
-        }
+        print_notice(&notice);
+    }
+}
+
+/// The notice itself, wherever in the run it is reached from. stderr, because
+/// it is not part of the payload.
+fn print_notice(notice: &update::Notice) {
+    eprintln!();
+    for line in notice.lines() {
+        eprintln!("  {line}");
     }
 }
 
@@ -786,6 +797,17 @@ fn run(args: &Args) -> Result<i32, Error> {
     // the time the report is rendered the answer is either here or it is not,
     // and either way the scan ran at full speed.
     let update = wants_update_notice(args).then(|| update::spawn_check(now_unix()));
+
+    // Waited for, before the scan. A new release is the one thing a run can
+    // say that is worth acting on *instead* of scanning, so it is said first
+    // rather than under a report that has already scrolled past. A cached
+    // answer returns from this immediately; only the once-a-day refresh can
+    // actually hold anything up, and it is bounded.
+    let announced = update
+        .as_ref()
+        .and_then(|rx| update::await_notice(rx, update::NOTICE_WAIT))
+        .inspect(print_notice)
+        .is_some();
 
     // One index for the whole run. A failure to open it degrades the scan
     // rather than stopping it: attribution gets worse, nothing gets unsafe.
@@ -918,7 +940,7 @@ fn run(args: &Args) -> Result<i32, Error> {
             if !args.json {
                 eprintln!("  interrupted — stopped at an item boundary, nothing was half-done");
             }
-            report_update(update.as_ref());
+            report_update(update.as_ref(), announced);
             return Ok(130);
         }
         if receipt.problems() > 0 {
@@ -934,7 +956,7 @@ fn run(args: &Args) -> Result<i32, Error> {
     }
     // Last, after the report and the receipt: an update notice is the least
     // important thing on the screen and should read as a footnote.
-    report_update(update.as_ref());
+    report_update(update.as_ref(), announced);
     Ok(exit)
 }
 

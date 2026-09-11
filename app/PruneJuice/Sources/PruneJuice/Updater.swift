@@ -127,9 +127,22 @@ final class SparkleUpdater: NSObject {
         return SparkleUpdater(status: status, isBusy: isBusy)
     }
 
+    /// How long the first scan will wait for the launch check before going
+    /// ahead without it. Matches the CLI's `NOTICE_WAIT`, and for the same
+    /// reason: a feed that accepts a connection and then says nothing must
+    /// not cost someone their scan.
+    private static let launchCheckBound: TimeInterval = 6
+
     private let status: UpdateStatus
     private let isBusy: @MainActor () -> Bool
     private var controller: SPUStandardUpdaterController!
+    /// The first scan, held until the launch check has had its turn. Cleared
+    /// by whichever of the two releases it, so it runs exactly once.
+    private var launchContinuation: (@MainActor () -> Void)?
+    /// Set once Sparkle has something to show. The bound above then stops
+    /// applying: an update being presented is not a reason to start scanning
+    /// underneath the dialog offering it.
+    private var presenting = false
 
     private init(status: UpdateStatus, isBusy: @escaping @MainActor () -> Bool) {
         self.status = status
@@ -155,6 +168,35 @@ final class SparkleUpdater: NSObject {
             "updater started; feed=\(controller.updater.feedURL?.absoluteString ?? "?") "
                 + "automatic=\(controller.updater.automaticallyChecksForUpdates) "
                 + "interval=\(Int(controller.updater.updateCheckInterval))s")
+    }
+
+    /// The launch check, run *before* the first scan.
+    ///
+    /// This is rule 1 read the other way round. A scan makes the app busy and
+    /// a background check landing during one is declined — so a check started
+    /// alongside the launch scan was always going to lose the race. Going
+    /// first is what makes an available release something the user is told
+    /// about on opening the app, rather than after a scan they would not have
+    /// asked for had they known.
+    ///
+    /// `start` runs exactly once: when the update cycle finishes, or when the
+    /// bound passes with nothing found, whichever comes first.
+    func checkOnLaunch(then start: @escaping @MainActor () -> Void) {
+        launchContinuation = start
+        Diagnostics.log("checking for a new release before the first scan")
+        controller.updater.checkForUpdatesInBackground()
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.launchCheckBound) { [weak self] in
+            guard let self, !self.presenting else { return }
+            self.releaseFirstScan(because: "the update check did not answer in time")
+        }
+    }
+
+    /// Let the held scan go, if it has not gone already.
+    private func releaseFirstScan(because why: String) {
+        guard let go = launchContinuation else { return }
+        launchContinuation = nil
+        Diagnostics.log("starting the first scan: \(why)")
+        go()
     }
 
     private func check() {
@@ -203,11 +245,23 @@ extension SparkleUpdater: SPUUpdaterDelegate {
         }
     }
 
+    /// Something to show. Recorded so the launch bound stops applying: the
+    /// scan waits for the dialog to be answered rather than starting behind
+    /// it.
+    nonisolated func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        MainActor.assumeIsolated {
+            presenting = true
+            Diagnostics.log("found \(item.displayVersionString); holding the first scan")
+        }
+    }
+
     nonisolated func updater(
         _ updater: SPUUpdater, didFinishUpdateCycleFor updateCheck: SPUUpdateCheck, error: Error?
     ) {
         MainActor.assumeIsolated {
             status.checkCompleted(at: controller.updater.lastUpdateCheckDate)
+            presenting = false
+            releaseFirstScan(because: "the update check finished")
         }
         if let error {
             // Never surfaced in the interface. Someone reclaiming disk space

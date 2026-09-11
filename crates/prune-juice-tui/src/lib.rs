@@ -128,14 +128,23 @@ fn event_loop(terminal: &mut Term, opts: TuiOptions) -> Result<i32, Error> {
     let mut app = App::new();
     let cancel = Cancel::new();
 
-    let (tx, rx) = mpsc::channel::<Msg>();
-    spawn_scan(&opts, tx.clone(), cancel.clone());
-
-    // Its own thread and its own channel, never joined and never waited on.
-    // The scan is what the user is here for; if the check has not finished by
-    // the time they quit, the answer is in the cache for next time.
+    // Started, and waited for, before the scan is. A release worth installing
+    // is worth seeing on the first frame rather than appearing partway
+    // through a scan the user is already reading.
     let updates = (opts.update_check && update::automatic_checks().is_ok())
         .then(|| update::spawn_check(now_unix()));
+    if let Some(rx) = &updates {
+        // One frame first, so the bounded wait is a screen that says what it
+        // is doing rather than a terminal that appears to have hung.
+        app.await_update();
+        terminal.draw(|f| ui::draw(f, &app)).map_err(Error::Io)?;
+        if let Some(notice) = update::await_notice(rx, update::NOTICE_WAIT) {
+            app.note_update(notice);
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<Msg>();
+    spawn_scan(&opts, tx.clone(), cancel.clone());
 
     loop {
         // Drain whatever the workers have produced without blocking the
@@ -143,7 +152,9 @@ fn event_loop(terminal: &mut Term, opts: TuiOptions) -> Result<i32, Error> {
         // from progress emitted immediately before a slow Docker call.
         drain(&rx, &mut app);
         if let Some(rx) = &updates {
-            // A poll, not a receive: this must never be able to stall a frame.
+            // Only reachable when the wait above timed out and the answer
+            // arrived late. A poll, not a receive: this must never be able to
+            // stall a frame.
             if let Ok(update::Decision::Available(notice)) = rx.try_recv() {
                 app.note_update(notice);
             }

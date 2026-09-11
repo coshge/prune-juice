@@ -26,7 +26,7 @@ could be added without rework.
 | M8 known-gap cleanup — exclusive image sizes, measured writable layers, SIGINT, remote gate, size cache | done |
 
 ```
-cargo test --workspace                  # 301 tests
+cargo test --workspace                  # 304 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -330,12 +330,23 @@ All have regression tests — if you break one, a test will tell you.
     below it the innermost `io::ErrorKind`. Note that `IOError` is
     `#[error(transparent)]`, so `source()` forwards *past* the wrapped error
     and a chain walk alone cannot see it.
-35. **An update check never delays or fails a scan.** The cache is read
-    synchronously because that is a file read; the network is only ever touched
-    on a detached thread whose result is used if it arrives and dropped if it
-    does not. Every failure — no network, no `curl`, a 404, a bad signature —
-    resolves to "no news". There is a test that a dead server produces
-    `Decision::Failed` and never a propagated error.
+35. **An update check never *fails* a scan, and delays it only to offer a
+    release.** Every failure — no network, no `curl`, a 404, a bad signature —
+    resolves to "no news" and the scan proceeds; there is a test that a dead
+    server produces `Decision::Failed` and never a propagated error. What it
+    may do is go first: `await_notice` waits up to `NOTICE_WAIT` before the
+    scan starts, because a release worth installing is worth hearing about
+    *instead of* scanning, not as a footnote under a report that has already
+    scrolled past. The cost is paid at most once a day — a cached answer
+    returns in about a millisecond, since the thread reads the cache before
+    it reaches for the network — and it is bounded, so a server that accepts
+    a connection and then says nothing costs six seconds, once. All three
+    surfaces do this: the one-shot CLI before its scan, the TUI before
+    `spawn_scan` (with a frame drawn first, so the wait is a screen that says
+    what it is doing), and the app before `model.scan()`. The app's case is
+    rule 1 read backwards — a scan makes it busy, and a background check
+    arriving during one is declined, so the two started together meant the
+    check always lost.
 36. **Nothing in a manifest is read before its signature verifies.** Not the
     version, not a URL, not a digest. `Manifest::parse` is private and
     `Checker::fetch_manifest` is the only way to obtain one, which is the same
@@ -359,7 +370,9 @@ All have regression tests — if you break one, a test will tell you.
 40. **A notice is not payload.** Update notices go to stderr, only when both
     streams are terminals, never under `CI`, never with `--json`. `core` cannot
     break this: it returns `Notice::lines()` and does not know what a terminal
-    is.
+    is. It is said once per run: the pre-scan wait is what normally speaks,
+    and the tail `report_update` stays quiet unless that wait timed out and
+    the answer arrived late.
 41. **The update preference is config and the last check is cache.** Losing the
     cache costs one request; losing the preference would silently turn checking
     back on. Different directories, and a test asserting they are.
