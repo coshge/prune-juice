@@ -744,19 +744,38 @@ fn may_offer(origin: &update::Origin, stdin_is_terminal: bool, already_updated: 
     stdin_is_terminal && !already_updated && origin.self_replace_allowed()
 }
 
-/// Ask. Anything that is not a clear yes is a no.
+/// Ask, with yes as the default.
 ///
-/// Default-no on purpose: a stray keypress, a closed stdin or an EOF all mean
-/// "get on with the scan", because replacing the binary someone just ran is
-/// not a thing to do on an ambiguous answer.
+/// Pressing return takes the update, because that is what someone who has
+/// just been told a newer version exists almost always wants, and because
+/// what is on the other side of the question is a signed artifact this tool
+/// verifies before it moves anything into place.
+///
+/// EOF is the one silence that is *not* a yes. A read returning zero bytes
+/// means the answer was never given — Ctrl-D, or a stdin that went away —
+/// and replacing the binary someone just ran on the strength of a question
+/// nobody answered is not a default, it is an assumption.
 fn ask_to_update() -> bool {
-    eprint!("  Update now? [y/N] ");
+    eprint!("  Update now? [Y/n] ");
     io::stderr().flush().ok();
     let mut line = String::new();
-    if io::stdin().read_line(&mut line).is_err() {
-        return false;
+    let read = io::stdin().read_line(&mut line);
+    accepted(read.ok(), &line)
+}
+
+/// The decision, separated from stdin so it can be tested.
+///
+/// `read` is the byte count the read reported, or `None` if it failed at all.
+/// `Some(0)` is EOF and is the only empty answer that declines; an empty line
+/// is a return keypress, which is the default being taken.
+fn accepted(read: Option<usize>, line: &str) -> bool {
+    match read {
+        None | Some(0) => false,
+        Some(_) => matches!(
+            line.trim().to_ascii_lowercase().as_str(),
+            "" | "y" | "yes"
+        ),
     }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Replace this process with the binary that was just installed.
@@ -1412,6 +1431,27 @@ mod tests {
             // …and every one of them still has something to tell the user.
             assert!(managed.why_not().is_some() || managed == Origin::AppBundle);
         }
+    }
+
+    /// Return takes the update; EOF does not.
+    #[test]
+    fn return_accepts_and_only_eof_declines_without_saying_so() {
+        // The default, taken by pressing return: one byte read, nothing in it.
+        assert!(accepted(Some(1), "\n"));
+        assert!(accepted(Some(3), " \n"));
+        assert!(accepted(Some(2), "y\n"));
+        assert!(accepted(Some(4), "YES\n"));
+
+        assert!(!accepted(Some(2), "n\n"));
+        assert!(!accepted(Some(3), "no\n"));
+        // Not an answer to the question that was asked.
+        assert!(!accepted(Some(6), "later\n"));
+
+        // EOF: zero bytes, so the question was never answered at all. This is
+        // the one empty answer that is not the default being taken.
+        assert!(!accepted(Some(0), ""));
+        // And a read that failed outright.
+        assert!(!accepted(None, ""));
     }
 
     /// A plain scan, as `parse_args` would produce with no flags at all.

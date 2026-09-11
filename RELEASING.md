@@ -172,18 +172,21 @@ A copy this tool *may* replace — one someone downloaded and put on their PATH
 
 ```
   Prune Juice 0.2.0 is available. You have 0.1.0.
-  Run prune-juice --update to install.
-  Update now? [y/N]
+  Update now? [Y/n]
 ```
 
-Only a clear `y` or `yes` proceeds; EOF, an empty line and anything else are
-all a no, and the scan carries on. Answering yes installs exactly what
-`--update` installs — verified against the signed manifest, run once before it
-is moved into place — and then re-executes the new binary with the same
-arguments, so the run the user actually asked for continues on the new
-version. The question is never asked when stdin is not a terminal, and never
-twice in one chain: the re-executed process carries `PRUNE_JUICE_UPDATED` and
-does not offer again.
+Return takes it. `n` or `no` declines and the scan carries on, as does any
+answer that is not a yes. The single exception to the default is EOF — a read
+of zero bytes, meaning Ctrl-D or a stdin that went away — because a question
+nobody answered is not the same as a question answered by pressing return.
+
+Answering yes installs exactly what `--update` installs: verified against the
+signed manifest, and run once before it is moved into place. It then
+re-executes the new binary with the same arguments, so the run that was
+actually asked for continues on the new version rather than dropping the user
+back at a shell prompt. The question is never asked when stdin is not a
+terminal, and never twice in one chain — the re-executed process carries
+`PRUNE_JUICE_UPDATED` and does not offer again.
 
 **The app** checks on launch, before its first scan — a scan makes it busy,
 and a background check arriving during one is declined, so the check has to go

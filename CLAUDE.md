@@ -26,7 +26,7 @@ could be added without rework.
 | M8 known-gap cleanup — exclusive image sizes, measured writable layers, SIGINT, remote gate, size cache | done |
 
 ```
-cargo test --workspace                  # 305 tests
+cargo test --workspace                  # 306 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -367,13 +367,18 @@ All have regression tests — if you break one, a test will tell you.
     found by file name and read into memory; `tar::Archive::unpack` would treat
     the path inside the archive as an instruction. A signature proves who built
     an archive, not that they built it correctly.
-40. **An offer to update is default-no, and only to a copy we may replace.**
-    `may_offer` requires a terminal on *stdin* — a run whose stdin is a pipe
-    would consume that pipe to answer the question — and
-    `Origin::self_replace_allowed()`, because offering to overwrite a Homebrew
-    or Cargo binary is offering to break someone's installation. Anything that
-    is not `y` or `yes` is a no, EOF included: replacing the binary someone
-    just ran is not a thing to do on an ambiguous answer. Accepting re-execs
+40. **An offer to update defaults to yes, but only to a copy we may replace,
+    and never on a question nobody answered.** `may_offer` requires a terminal
+    on *stdin* — a run whose stdin is a pipe would consume that pipe to answer
+    the question — and `Origin::self_replace_allowed()`, because offering to
+    overwrite a Homebrew or Cargo binary is offering to break someone's
+    installation. Return accepts, because that is what someone just told a
+    newer version exists almost always wants and because what is behind the
+    question is a signed artifact verified before anything moves. `accepted`
+    separates the byte count from the text for the one case that matters:
+    `Some(0)` is EOF, not an empty line, and declines. Ctrl-D is the absence
+    of an answer, and installing over the binary someone just ran on the
+    strength of one is an assumption rather than a default. Accepting re-execs
     into the new binary with the same arguments, which is the one thing
     `--update` deliberately does not do — it says "the copy already running is
     unchanged", which is the honest answer when updating is *all* that was
