@@ -16,6 +16,7 @@ unverified binaries.
 - [Cutting a release](#cutting-a-release)
 - [What updates look like to a user](#what-updates-look-like-to-a-user)
 - [Verifying a release by hand](#verifying-a-release-by-hand)
+- [If the repository is ever private again](#if-the-repository-is-ever-private-again)
 - [The Developer ID gap](#the-developer-id-gap)
 - [Re-releasing and rolling back](#re-releasing-and-rolling-back)
 
@@ -215,22 +216,23 @@ it. Deleting the release is not enough on its own: copies that have already
 cached the answer will keep offering it for up to a day, though they will fail
 to download and leave the working binary alone.
 
-## While the repository is private
+## If the repository is ever private again
 
 Release assets on a private repository are not anonymously downloadable: an
 unauthenticated request for one returns **404**, not 403. The updater fetches
-through `curl` with no credentials by design, so while the repository is
-private:
+through `curl` with no credentials by design, so were this repository made
+private again:
 
-- every `--check-update` and every background check resolves to "no news",
-  and exits 5 rather than 0 or 1;
+- every `--check-update` and every background check would resolve to "no
+  news", and exit 5 rather than 0 or 1;
 - `release.yml`'s final step — "an installed copy can see this release" —
-  fails, and correctly: it asserts the one property a private repository
+  would fail, and correctly: it asserts the one property a private repository
   denies. The release itself is still built, signed and published; only that
   assertion fails.
 
-Nothing in the code needs to change. Making the repository public is the fix,
-and the release already published becomes reachable the moment it happens.
+Nothing in the code would need to change either way. The repository is public,
+and `v0.1.0` — published while it was not — became reachable the moment it
+was made so.
 
 ## The Developer ID gap
 

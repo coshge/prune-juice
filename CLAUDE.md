@@ -491,28 +491,14 @@ checkouts "derivative" because they contained a `vendor` directory.
 
 - Waivers still live in a JSON file rather than the index. Harmless, but they
   could move now that the index exists.
-- **`v0.1.0` is released, and unreachable, because the repository is
-  private.** A private repo's release assets require authentication that the
-  updater deliberately does not have — no HTTP client, no tokens, just `curl`
-  — so every unauthenticated request for
-  `/releases/latest/download/update-manifest.json` returns 404. Every update
-  check therefore resolves to "no news", which is the designed failure mode
-  and harms nothing, and `release.yml`'s last step fails on exactly that,
-  which is the step doing its job. **Making the repository public is the whole
-  fix**; nothing in the code changes.
-
-  What the first tag *did* prove, and what is therefore no longer worth
-  re-testing: the release is built, signed and published (8 assets, manifest
-  plus `.minisig`), and the published manifest verifies against the key
-  compiled into the CLI — fetched with an authenticated request and checked
-  with `minisign -V -P` by hand. That pairing between `RELEASE_KEY` in
-  `verify.rs` and `MINISIGN_SECRET_KEY` in the repository secrets was the one
-  thing no test could cover.
-
-  Still unexercised: the notice, the download, and the atomic replace. All
-  three need a published release *newer* than the binary asking, so they need
-  a public repo and a version bump — `is_newer` is `>`, and a 0.1.0 binary
-  offered 0.1.0 is correctly told it is current.
+- **The repository is public and the release feed is live.** `v0.1.0` was
+  published while it was private, when every unauthenticated request for
+  `/releases/latest/download/update-manifest.json` returned 404 and so every
+  check resolved to "no news" — the designed failure mode. Making it public
+  was the whole fix; nothing in the code changed. The published manifest
+  verifies against the key compiled into the CLI, which was the one pairing
+  between `RELEASE_KEY` in `verify.rs` and `MINISIGN_SECRET_KEY` in the
+  repository secrets that no test could cover.
 - **There is no Homebrew formula.** `Origin::Homebrew` detection and the
   `brew upgrade prune-juice` hint are correct and tested, but nothing is in a
   tap yet, so that branch is currently unreachable in practice. It costs
