@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "prune-juice-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "prune-juice-core",
  "prune-juice-tui",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "prune-juice-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bollard",
  "etcetera",
@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "prune-juice-testkit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "prune-juice-core",
  "serde_json",
@@ -1202,7 +1202,7 @@ dependencies = [
 
 [[package]]
 name = "prune-juice-tui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crossterm",
  "prune-juice-core",
@@ -2144,7 +2144,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde_json",
