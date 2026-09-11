@@ -167,6 +167,24 @@ prune-juice-cli --force`, and the helper inside `PruneJuice.app` is told
 nothing to run, because the app updates it. `--update` refuses to overwrite a
 binary a package manager owns.
 
+A copy this tool *may* replace — one someone downloaded and put on their PATH
+— is asked rather than told:
+
+```
+  Prune Juice 0.2.0 is available. You have 0.1.0.
+  Run prune-juice --update to install.
+  Update now? [y/N]
+```
+
+Only a clear `y` or `yes` proceeds; EOF, an empty line and anything else are
+all a no, and the scan carries on. Answering yes installs exactly what
+`--update` installs — verified against the signed manifest, run once before it
+is moved into place — and then re-executes the new binary with the same
+arguments, so the run the user actually asked for continues on the new
+version. The question is never asked when stdin is not a terminal, and never
+twice in one chain: the re-executed process carries `PRUNE_JUICE_UPDATED` and
+does not offer again.
+
 **The app** checks on launch, before its first scan — a scan makes it busy,
 and a background check arriving during one is declined, so the check has to go
 first to happen at all. The first scan starts when that check finishes, or six

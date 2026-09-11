@@ -63,10 +63,12 @@ pub struct TuiOptions {
     pub endpoint: String,
     pub context: String,
     pub scan: ScanOptions,
-    /// Whether the automatic once-a-day update check may run. The CLI has
-    /// already decided; this is only `--no-update-check` reaching the screen
-    /// the user is actually looking at.
-    pub update_check: bool,
+    /// A newer release, if the CLI found one before launching this. The check
+    /// happens once per run, up there, because that is where it can still be
+    /// acted on — an offer to replace the binary has to come before the screen
+    /// it would replace. By the time we are here the answer is a fact to
+    /// display, not a question to ask.
+    pub update: Option<update::Notice>,
 }
 
 fn now_unix() -> i64 {
@@ -128,19 +130,11 @@ fn event_loop(terminal: &mut Term, opts: TuiOptions) -> Result<i32, Error> {
     let mut app = App::new();
     let cancel = Cancel::new();
 
-    // Started, and waited for, before the scan is. A release worth installing
-    // is worth seeing on the first frame rather than appearing partway
-    // through a scan the user is already reading.
-    let updates = (opts.update_check && update::automatic_checks().is_ok())
-        .then(|| update::spawn_check(now_unix()));
-    if let Some(rx) = &updates {
-        // One frame first, so the bounded wait is a screen that says what it
-        // is doing rather than a terminal that appears to have hung.
-        app.await_update();
-        terminal.draw(|f| ui::draw(f, &app)).map_err(Error::Io)?;
-        if let Some(notice) = update::await_notice(rx, update::NOTICE_WAIT) {
-            app.note_update(notice);
-        }
+    // Already known, already shown once on the terminal the interface is
+    // about to paint over. Carried in so it survives that, and so the screen
+    // the user ends up looking at still says a newer release exists.
+    if let Some(notice) = opts.update.clone() {
+        app.note_update(notice);
     }
 
     let (tx, rx) = mpsc::channel::<Msg>();
@@ -151,14 +145,6 @@ fn event_loop(terminal: &mut Term, opts: TuiOptions) -> Result<i32, Error> {
         // redraw. Doing this before drawing removes a full frame of latency
         // from progress emitted immediately before a slow Docker call.
         drain(&rx, &mut app);
-        if let Some(rx) = &updates {
-            // Only reachable when the wait above timed out and the answer
-            // arrived late. A poll, not a receive: this must never be able to
-            // stall a frame.
-            if let Ok(update::Decision::Available(notice)) = rx.try_recv() {
-                app.note_update(notice);
-            }
-        }
 
         terminal.draw(|f| ui::draw(f, &app)).map_err(Error::Io)?;
 

@@ -26,7 +26,7 @@ could be added without rework.
 | M8 known-gap cleanup — exclusive image sizes, measured writable layers, SIGINT, remote gate, size cache | done |
 
 ```
-cargo test --workspace                  # 304 tests
+cargo test --workspace                  # 305 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -367,25 +367,40 @@ All have regression tests — if you break one, a test will tell you.
     found by file name and read into memory; `tar::Archive::unpack` would treat
     the path inside the archive as an instruction. A signature proves who built
     an archive, not that they built it correctly.
-40. **A notice is not payload.** Update notices go to stderr, only when both
+40. **An offer to update is default-no, and only to a copy we may replace.**
+    `may_offer` requires a terminal on *stdin* — a run whose stdin is a pipe
+    would consume that pipe to answer the question — and
+    `Origin::self_replace_allowed()`, because offering to overwrite a Homebrew
+    or Cargo binary is offering to break someone's installation. Anything that
+    is not `y` or `yes` is a no, EOF included: replacing the binary someone
+    just ran is not a thing to do on an ambiguous answer. Accepting re-execs
+    into the new binary with the same arguments, which is the one thing
+    `--update` deliberately does not do — it says "the copy already running is
+    unchanged", which is the honest answer when updating is *all* that was
+    asked for. Here a scan was asked for, so the run continues on the new
+    version. The re-executed process carries `PRUNE_JUICE_UPDATED` so an
+    offer can never happen twice in one chain, which is what stops a binary
+    that still reads as older from installing and re-execing for ever.
+
+41. **A notice is not payload.** Update notices go to stderr, only when both
     streams are terminals, never under `CI`, never with `--json`. `core` cannot
     break this: it returns `Notice::lines()` and does not know what a terminal
     is. It is said once per run: the pre-scan wait is what normally speaks,
     and the tail `report_update` stays quiet unless that wait timed out and
     the answer arrived late.
-41. **The update preference is config and the last check is cache.** Losing the
+42. **The update preference is config and the last check is cache.** Losing the
     cache costs one request; losing the preference would silently turn checking
     back on. Different directories, and a test asserting they are.
-42. **The app never installs over a running helper.** A scheduled check is
+43. **The app never installs over a running helper.** A scheduled check is
     declined while an operation runs, and a relaunch is postponed by holding
     Sparkle's install handler until the helper stops — released on every
     completion, successful or not, and exactly once. Relaunching mid-`--apply`
     would kill the executor between two deletions.
-43. **The tag and the workspace version must agree.** Checked in CI before
+44. **The tag and the workspace version must agree.** Checked in CI before
     anything is built. The updater compares against the version compiled into
     the binary, so a release tagged `v0.2.0` built from `0.1.0` sources is a
     release nobody is ever offered.
-44. **Every total is summed over exclusive size, never over `size`.**
+45. **Every total is summed over exclusive size, never over `size`.**
     `ResourceSummary::reclaimable_size` and `PlanItem::reclaimable_size` are
     the only figures that may be added up. An image's `size` is its whole
     layer stack, and fifteen project images standing on one 145 MB WordPress
@@ -397,7 +412,7 @@ All have regression tests — if you break one, a test will tell you.
     overlap was not computed the fallback is `size`, which over-estimates —
     the honest direction to be wrong in, since the run reports what it
     actually freed.
-45. **A remembered size may be reported only for a volume nothing mounts.** An
+46. **A remembered size may be reported only for a volume nothing mounts.** An
     unreferenced volume's bytes cannot change, so last run's measurement is
     still true and `--no-sizes` need not report nothing. A mounted volume is
     being written to as we speak, and giving last week's figure for it would
@@ -405,14 +420,14 @@ All have regression tests — if you break one, a test will tell you.
     can say "remembered" rather than implying it just looked, and the report
     stays `stale` either way. Nothing size-derived licenses a deletion, so a
     remembered figure can never widen what is offered.
-46. **`df` runs alongside the scan, never in front of it.** `start_data_usage`
+47. **`df` runs alongside the scan, never in front of it.** `start_data_usage`
     puts it on the runtime's worker threads before the listing, and
     `data_usage` collects it at the sizing phase. It is the slowest call the
     scan makes (~1.4 s here) and nothing between the two points needs its
     answer. Default no-op on the trait, so a client that cannot overlap is
     unaffected and the call sequence is identical either way — still exactly
     one `df`, still degrading to a warning on failure.
-47. **Liveness comes from the filesystem; the index only counts.**
+48. **Liveness comes from the filesystem; the index only counts.**
     `project_absences` carries a row for every project with any history, and a
     project that is present reads `absent_scans = 0`. The path-recall branch
     read that stored number as the verdict, so every project whose path was

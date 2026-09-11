@@ -579,7 +579,7 @@ fn run_waivers(cmd: &WaiverCmd, reason: Option<&str>) -> Result<i32, Error> {
 /// These are foreground and synchronous, unlike the automatic check: the user
 /// asked, so waiting a moment and hearing the answer — including a failure —
 /// is the point. The automatic path is the one that must never be felt.
-fn run_update(cmd: UpdateCmd) -> Result<i32, Error> {
+fn run_update(cmd: UpdateCmd, from_offer: bool) -> Result<i32, Error> {
     if let UpdateCmd::Automatic(on) = cmd {
         let path = update::set_automatic_checks(on)?;
         println!(
@@ -634,20 +634,25 @@ fn run_update(cmd: UpdateCmd) -> Result<i32, Error> {
         return Ok(0);
     }
 
-    let notice = update::Notice {
-        current: update::current_version().to_string(),
-        latest: manifest.version.clone(),
-        notes_url: manifest.notes_url.clone(),
-        origin: origin.clone(),
-    };
-    println!();
-    for line in notice.lines() {
-        println!("  {line}");
+    // Skipped when this came from the offer: the notice is what was just
+    // answered, and printing it again under the answer reads as a second
+    // release rather than the same one.
+    if !from_offer {
+        let notice = update::Notice {
+            current: update::current_version().to_string(),
+            latest: manifest.version.clone(),
+            notes_url: manifest.notes_url.clone(),
+            origin: origin.clone(),
+        };
+        println!();
+        for line in notice.lines() {
+            println!("  {line}");
+        }
+        if let Some(url) = &notice.notes_url {
+            println!("  {url}");
+        }
+        println!();
     }
-    if let Some(url) = &notice.notes_url {
-        println!("  {url}");
-    }
-    println!();
 
     if cmd == UpdateCmd::Check {
         // A finding, in the same sense as reclaimable space: something is
@@ -663,7 +668,12 @@ fn run_update(cmd: UpdateCmd) -> Result<i32, Error> {
         done.path.display(),
         Bytes(done.bytes).human()
     );
-    println!("  the copy already running is unchanged; the next invocation is the new one.");
+    // True of `--update`, and *not* true when the offer is about to re-exec
+    // into what was just installed — saying it there would be a promise the
+    // very next line breaks.
+    if !from_offer {
+        println!("  the copy already running is unchanged; the next invocation is the new one.");
+    }
     Ok(0)
 }
 
@@ -707,6 +717,76 @@ fn report_update(rx: Option<&std::sync::mpsc::Receiver<Decision>>, announced: bo
     }
 }
 
+/// Set on the process that replaces this one, so an update can be offered at
+/// most once per invocation chain. Without it a binary that somehow still
+/// reads as older than the feed would offer, install and re-exec for ever.
+const REEXEC_GUARD: &str = "PRUNE_JUICE_UPDATED";
+
+/// May this run *ask*, rather than merely mention?
+///
+/// Stricter than [`wants_update_notice`] by two things. Stdin has to be a
+/// terminal — a question needs somewhere to read the answer from, and a run
+/// whose stdin is a pipe would consume that pipe to answer it. And the copy
+/// has to be one this tool may replace: offering to install over a Homebrew
+/// binary is offering to break someone's installation.
+fn may_offer_update(notice: &update::Notice) -> bool {
+    may_offer(
+        &notice.origin,
+        io::stdin().is_terminal(),
+        std::env::var(REEXEC_GUARD).is_ok(),
+    )
+}
+
+/// The decision, separated from the environment so it can be tested without
+/// a terminal and without setting a variable the rest of this binary's tests
+/// would see.
+fn may_offer(origin: &update::Origin, stdin_is_terminal: bool, already_updated: bool) -> bool {
+    stdin_is_terminal && !already_updated && origin.self_replace_allowed()
+}
+
+/// Ask. Anything that is not a clear yes is a no.
+///
+/// Default-no on purpose: a stray keypress, a closed stdin or an EOF all mean
+/// "get on with the scan", because replacing the binary someone just ran is
+/// not a thing to do on an ambiguous answer.
+fn ask_to_update() -> bool {
+    eprint!("  Update now? [y/N] ");
+    io::stderr().flush().ok();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Replace this process with the binary that was just installed.
+///
+/// `--update` alone cannot do this: it says "the copy already running is
+/// unchanged", which is true and is the honest thing to say when someone
+/// asked only to update. Here they asked for a scan, so the run continues —
+/// on the new version, with the same arguments, which is what puts them on
+/// the start screen rather than back at a shell prompt.
+///
+/// Only returns on failure; on success this process no longer exists.
+#[cfg(unix)]
+fn reexec_into_new_binary() -> Error {
+    use std::os::unix::process::CommandExt;
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => return Error::Io(e),
+    };
+    let err = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(REEXEC_GUARD, "1")
+        .exec();
+    Error::Io(err)
+}
+
+#[cfg(not(unix))]
+fn reexec_into_new_binary() -> Error {
+    Error::Config("this platform cannot restart into the new binary".into())
+}
+
 /// The notice itself, wherever in the run it is reached from. stderr, because
 /// it is not part of the payload.
 fn print_notice(notice: &update::Notice) {
@@ -724,7 +804,7 @@ fn run(args: &Args) -> Result<i32, Error> {
         return run_vault(cmd, args.reason.as_deref());
     }
     if let Some(cmd) = args.update_cmd {
-        return run_update(cmd);
+        return run_update(cmd, false);
     }
     let cancel = Cancel::new();
     // From here on Ctrl-C stops the run at its next checkpoint and reports
@@ -767,6 +847,40 @@ fn run(args: &Args) -> Result<i32, Error> {
         return Err(Error::NoContext);
     }
 
+    // Above the interface dispatch, because both paths need the answer and
+    // because an offer to replace this binary belongs before either of them
+    // has painted anything. One check per run, whichever way the run goes.
+    let update = wants_update_notice(args).then(|| update::spawn_check(now_unix()));
+    let news = update
+        .as_ref()
+        .and_then(|rx| update::await_notice(rx, update::NOTICE_WAIT));
+    // Whether it has been said. A `None` here is not "no update" — it is also
+    // a check that has not answered yet, and that one may still arrive in
+    // time to be a footnote at the end of the run.
+    let announced = news.is_some();
+
+    if let Some(notice) = &news {
+        // Being asked and being told how to do it by hand is the same
+        // sentence twice, so the question replaces the second line rather
+        // than following it.
+        if may_offer_update(notice) {
+            eprintln!();
+            eprintln!("  {}", notice.lines()[0]);
+        } else {
+            print_notice(notice);
+        }
+        if may_offer_update(notice) && ask_to_update() {
+            // The same path `--update` takes, and it prints what it did. A
+            // non-zero code means it did not happen, and is the run's code:
+            // carrying on into a scan would bury the reason.
+            let code = run_update(UpdateCmd::Install, true)?;
+            if code != 0 {
+                return Ok(code);
+            }
+            return Err(reexec_into_new_binary());
+        }
+    }
+
     let opts = ScanOptions {
         project_roots: args.roots.clone(),
         with_sizes: args.with_sizes,
@@ -787,27 +901,13 @@ fn run(args: &Args) -> Result<i32, Error> {
             endpoint: ctx.endpoint.clone(),
             context: ctx.name.clone(),
             scan: opts,
-            // The interface is a terminal by definition, so the only question
-            // left is whether the user asked for silence.
-            update_check: !args.no_update_check,
+            // Carried, not re-fetched: the check ran above, where it could
+            // still be acted on. This is only so the news survives the
+            // interface painting over the terminal that showed it.
+            update: news,
         });
     }
 
-    // Started before the scan and read after it, on a thread of its own. By
-    // the time the report is rendered the answer is either here or it is not,
-    // and either way the scan ran at full speed.
-    let update = wants_update_notice(args).then(|| update::spawn_check(now_unix()));
-
-    // Waited for, before the scan. A new release is the one thing a run can
-    // say that is worth acting on *instead* of scanning, so it is said first
-    // rather than under a report that has already scrolled past. A cached
-    // answer returns from this immediately; only the once-a-day refresh can
-    // actually hold anything up, and it is bounded.
-    let announced = update
-        .as_ref()
-        .and_then(|rx| update::await_notice(rx, update::NOTICE_WAIT))
-        .inspect(print_notice)
-        .is_some();
 
     // One index for the whole run. A failure to open it degrades the scan
     // rather than stopping it: attribution gets worse, nothing gets unsafe.
@@ -1279,6 +1379,40 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Who may be *asked* to update, as opposed to merely told.
+    ///
+    /// The managed origins are the point. Offering to overwrite a Homebrew or
+    /// Cargo binary in place is offering to break someone's installation, and
+    /// the executor would refuse it anyway — so the question is never put.
+    #[test]
+    fn only_a_replaceable_copy_with_a_human_at_the_keyboard_is_asked() {
+        use update::Origin;
+        assert!(may_offer(&Origin::Standalone, true, false));
+
+        // No terminal to read an answer from: a run whose stdin is a pipe
+        // would eat that pipe to answer the question.
+        assert!(!may_offer(&Origin::Standalone, false, false));
+
+        // Already the product of an update this run. Without this an offer
+        // could install and re-exec in a loop.
+        assert!(!may_offer(&Origin::Standalone, true, true));
+
+        for managed in [
+            Origin::Homebrew,
+            Origin::Cargo,
+            Origin::MacPorts,
+            Origin::NixStore,
+            Origin::AppBundle,
+        ] {
+            assert!(
+                !may_offer(&managed, true, false),
+                "{managed:?} is not ours to replace"
+            );
+            // …and every one of them still has something to tell the user.
+            assert!(managed.why_not().is_some() || managed == Origin::AppBundle);
+        }
+    }
 
     /// A plain scan, as `parse_args` would produce with no flags at all.
     fn args() -> Args {
