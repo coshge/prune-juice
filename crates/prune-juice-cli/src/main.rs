@@ -24,6 +24,7 @@ use prune_juice_core::waiver::Waivers;
 use prune_juice_core::Error;
 use prune_juice_tui::TuiOptions;
 
+mod banner;
 mod interrupt;
 
 const USAGE: &str = "\
@@ -718,6 +719,13 @@ fn run(args: &Args) -> Result<i32, Error> {
     // From here on Ctrl-C stops the run at its next checkpoint and reports
     // what it did, rather than killing the process between two deletions.
     interrupt::install(&cancel);
+
+    // A header is decoration, so it is shown to a person and to nobody else:
+    // never under --json, never into a pipe, and not before the interface,
+    // which paints over the screen and would lose it anyway.
+    if !args.json && !wants_tui(args) && io::stdout().is_terminal() {
+        print!("{}", banner::header());
+    }
 
     // Contexts are candidate endpoints, not identities. Two can be the same
     // engine, so we connect, ask each daemon for its own /info ID, and dedupe.

@@ -20,6 +20,18 @@ build, use `./scripts/install-local.sh --open` from the repository root. A
 build from source never updates itself, so that script is how a local install
 keeps up with the tree.
 
+The icon is generated, not stored: `scripts/make-icon.swift` draws the app's
+own half-full droplet in `plum` from `Views.swift` — redrawn rather than taken
+from SF Symbols, whose licence does not cover app icons — and `bundle.sh`
+turns the result into `PruneJuice.icns`. The CLI draws the same droplet in
+half-block glyphs, rasterised from the same curve, from `core::brand`. To
+look at the icon without building the whole app:
+
+```sh
+swift scripts/make-icon.swift /tmp/PruneJuice.iconset
+open /tmp/PruneJuice.iconset
+```
+
 The app includes its command-line helper. The default build is signed for local
 use, not notarized for redistribution. Move the complete `PruneJuice.app` bundle
 to Applications if you want to keep it there.

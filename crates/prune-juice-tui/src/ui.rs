@@ -6,12 +6,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
+use prune_juice_core::brand::{DROP, DROP_FILL_ROW, DROP_WIDTH};
 use prune_juice_core::model::{Bytes, ResourceKind};
 use prune_juice_core::plan::tier::{Reversibility, Tier};
 
 use crate::app::{App, MenuItem, Screen};
 
 const ACCENT: Color = Color::Magenta;
+/// The same hue, lightened: the droplet's empty half.
+const ACCENT_SOFT: Color = Color::LightMagenta;
 const DIM: Color = Color::DarkGray;
 const GOOD: Color = Color::Green;
 const WARN: Color = Color::Yellow;
@@ -55,43 +58,143 @@ fn title(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// The column the droplet occupies, indent and trailing gap included. Anything
+/// set beside it starts here.
+const MARK_COLUMN: usize = 2 + DROP_WIDTH + 4;
+
+/// Rows left clear above the droplet.
+///
+/// Text carries its own optical padding; the droplet's apex is a single hard
+/// pixel, so with the block flush to the top of the body it reads as hanging
+/// off the title rather than standing under it.
+const MARK_TOP: usize = 2;
+
+/// One row of the droplet, tinted by which side of the fill line it is on.
+///
+/// The glyphs already say which half they belong to; the colour only says it
+/// again, which is why a terminal that ignores one of the two still shows a
+/// droplet that is visibly half full.
+fn mark_row(row: usize) -> Span<'static> {
+    let style = Style::default().fg(if row < DROP_FILL_ROW {
+        ACCENT_SOFT
+    } else {
+        ACCENT
+    });
+    Span::styled(format!("  {}", DROP[row]), style)
+}
+
 fn scanning(f: &mut Frame, area: Rect, app: &App) {
-    let lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("  {}", app.status),
-            Style::default().fg(WARN),
-        )),
-        Line::from(""),
-        Line::from(format!(
-            "  {:>5} containers   {:>5} images",
-            app.seen_containers, app.seen_images
-        )),
-        Line::from(format!(
-            "  {:>5} volumes      {:>5} networks",
-            app.seen_volumes, app.seen_networks
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "  Nothing is being changed. This is a read-only scan.",
+    // The four things worth saying while waiting, and the row of the droplet
+    // each one is set against. The gaps are what let the mark breathe.
+    let beside: [(usize, String, Style); 4] = [
+        (1, app.status.clone(), Style::default().fg(WARN)),
+        (
+            4,
+            format!(
+                "{:>5} containers   {:>5} images",
+                app.seen_containers, app.seen_images
+            ),
+            Style::default(),
+        ),
+        (
+            5,
+            format!(
+                "{:>5} volumes      {:>5} networks",
+                app.seen_volumes, app.seen_networks
+            ),
+            Style::default(),
+        ),
+        (
+            7,
+            "Nothing is being changed. This is a read-only scan.".into(),
             Style::default().fg(DIM),
-        )),
+        ),
     ];
+
+    // The droplet costs a fixed column, so it is shown only where there is
+    // room for it *and* for the longest line beside it. A narrow pane gets the
+    // words, which are the part that is actually load-bearing.
+    let widest = beside
+        .iter()
+        .map(|(_, t, _)| t.chars().count())
+        .max()
+        .unwrap_or(0);
+    let room = usize::from(area.width) >= MARK_COLUMN + widest;
+
+    let mut lines = Vec::new();
+    if room {
+        lines.extend((0..MARK_TOP).map(|_| Line::from("")));
+        for row in 0..DROP.len() {
+            let mut spans = vec![mark_row(row)];
+            if let Some((_, text, style)) = beside.iter().find(|(r, _, _)| *r == row) {
+                spans.push(Span::styled(format!("    {text}"), *style));
+            }
+            lines.push(Line::from(spans));
+        }
+    } else {
+        lines.push(Line::from(""));
+        for (row, text, style) in &beside {
+            // The blank row the droplet used to fill, kept so the counters
+            // still read as a group of their own.
+            if *row == 4 {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                clip(&format!("  {text}"), usize::from(area.width)),
+                *style,
+            )));
+        }
+    }
     f.render_widget(Paragraph::new(lines), area);
 }
 
 fn main_screen(f: &mut Frame, area: Rect, app: &App) {
-    let cols = Layout::vertical([
-        Constraint::Length(9), // headline
-        Constraint::Length(7), // menu
-        Constraint::Min(0),    // totals
+    let rows = Layout::vertical([
+        Constraint::Length(16), // the claim, and what can be done about it
+        Constraint::Min(0),     // totals
     ])
     .split(area);
 
-    headline(f, cols[0], app);
-    menu(f, cols[1], app);
-    totals(f, cols[2], app);
+    // The mark stands beside the claim and the menu, which is the block a
+    // person actually looks at. It is shown only where the longest line it
+    // would push right still fits afterwards — the figures and the menu are
+    // the screen, and decoration never gets to clip them.
+    let widest = MenuItem::ALL
+        .iter()
+        .map(|i| app.menu_label(*i).chars().count() + 4)
+        .chain(std::iter::once(HEADLINE_WIDTH))
+        .max()
+        .unwrap_or(0);
+    let mark = usize::from(rows[0].width) >= MARK_COLUMN + widest;
+
+    let body = if mark {
+        let cols = Layout::horizontal([Constraint::Length(MARK_COLUMN as u16), Constraint::Min(0)])
+            .split(rows[0]);
+        let lines: Vec<Line> = (0..MARK_TOP)
+            .map(|_| Line::from(""))
+            .chain((0..DROP.len()).map(|r| Line::from(mark_row(r))))
+            .collect();
+        f.render_widget(Paragraph::new(lines), cols[0]);
+        cols[1]
+    } else {
+        rows[0]
+    };
+
+    let stacked = Layout::vertical([
+        Constraint::Length(9), // headline
+        Constraint::Length(7), // menu
+    ])
+    .split(body);
+
+    headline(f, stacked[0], app);
+    menu(f, stacked[1], app);
+    totals(f, rows[1], app);
 }
+
+/// The longest line `headline` lays out: ten columns of right-aligned size, the
+/// widest of its labels, and the item count beside it. Kept next to the format
+/// strings it describes so the two are changed together.
+const HEADLINE_WIDTH: usize = 4 + 10 + 2 + "rebuildable   (999 items + build cache)".len();
 
 /// The claim, and the arithmetic behind it.
 ///
@@ -810,6 +913,71 @@ mod tests {
         app.screen = Screen::Review;
         for w in [40u16, 60, 80, 98, 140] {
             let out = render_at(&app, w, 20);
+            for line in out.lines() {
+                assert!(
+                    line.chars().count() <= w as usize,
+                    "line of {} chars at width {w}: {line:?}",
+                    line.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_scanning_screen_shows_the_mark_and_still_fits_every_width() {
+        let mut app = demo_app();
+        app.screen = Screen::Scanning;
+        app.status = "measuring volume sizes".into();
+
+        for w in [20u16, 40, 60, 80, 140] {
+            let out = render_at(&app, w, 20);
+            for line in out.lines() {
+                assert!(
+                    line.chars().count() <= w as usize,
+                    "line of {} chars at width {w}: {line:?}",
+                    line.chars().count()
+                );
+            }
+            // Whatever the width, the status survives — clipped at 20
+            // columns like every other line, but never dropped. The droplet
+            // is the part that gives way.
+            assert!(out.contains("measuring"), "at width {w}: {out}");
+        }
+
+        // Wide enough: the droplet is there.
+        let wide = render_at(&app, 100, 20);
+        assert!(wide.contains(DROP[DROP_FILL_ROW]), "{wide}");
+        // Too narrow for the droplet and the longest line beside it: the
+        // droplet goes rather than the line being clipped.
+        let narrow = render_at(&app, 40, 20);
+        assert!(!narrow.contains(DROP[DROP_FILL_ROW]), "{narrow}");
+    }
+
+    #[test]
+    fn the_main_screen_carries_the_mark_beside_the_menu() {
+        let app = demo_app();
+
+        let wide = render_at(&app, 100, 30);
+        assert!(wide.contains(DROP[DROP_FILL_ROW]), "{wide}");
+        // The mark is beside the menu, not instead of it.
+        for item in MenuItem::ALL.iter() {
+            let label = app.menu_label(*item);
+            assert!(wide.contains(label.as_str()), "{label:?} missing:\n{wide}");
+        }
+        assert!(wide.contains("safe to reclaim"), "{wide}");
+
+        // Narrow: the figures and the menu keep the whole width, and the
+        // droplet is what gives way.
+        let narrow = render_at(&app, 60, 30);
+        assert!(!narrow.contains(DROP[DROP_FILL_ROW]), "{narrow}");
+        assert!(narrow.contains("safe to reclaim"), "{narrow}");
+    }
+
+    #[test]
+    fn the_main_screen_fits_every_width_with_the_mark_on_it() {
+        let app = demo_app();
+        for w in [20u16, 40, 60, 80, 100, 140] {
+            let out = render_at(&app, w, 30);
             for line in out.lines() {
                 assert!(
                     line.chars().count() <= w as usize,

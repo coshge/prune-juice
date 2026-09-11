@@ -94,6 +94,24 @@ ditto "$SPARKLE_SRC" "$APP/Contents/Frameworks/Sparkle.framework"
 # two fewer ways for signing to go wrong.
 rm -rf "$APP/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices"
 
+# --- the icon -------------------------------------------------------------
+#
+# Rendered by scripts/make-icon.swift, so the artwork is source rather than a
+# binary blob nobody can diff, and every size is drawn at its own resolution.
+# Cached in .build because recompiling a script to redraw an unchanged icon on
+# every bundle is pure waiting.
+say "rendering the icon"
+ICONSET="$HERE/.build/icon/PruneJuice.iconset"
+ICNS="$HERE/.build/icon/PruneJuice.icns"
+if [ ! -f "$ICNS" ] || [ "$HERE/scripts/make-icon.swift" -nt "$ICNS" ]; then
+  rm -rf "$ICONSET"
+  mkdir -p "$HERE/.build/icon"
+  swift "$HERE/scripts/make-icon.swift" "$ICONSET"
+  iconutil -c icns -o "$ICNS" "$ICONSET"
+fi
+mkdir -p "$APP/Contents/Resources"
+cp "$ICNS" "$APP/Contents/Resources/PruneJuice.icns"
+
 VERSION="$(grep -m1 '^version' "$REPO/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -104,6 +122,11 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key>       <string>Prune Juice</string>
   <key>CFBundleIdentifier</key>        <string>dev.prunejuice.app</string>
   <key>CFBundleExecutable</key>        <string>PruneJuice</string>
+  <!-- Contents/Resources/PruneJuice.icns, named without its extension as
+       LaunchServices expects. CFBundleIconName is deliberately absent: it
+       names an entry in an asset catalog, and a bundle assembled by hand has
+       no catalog to name. -->
+  <key>CFBundleIconFile</key>          <string>PruneJuice</string>
   <key>CFBundlePackageType</key>       <string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundleVersion</key>           <string>${VERSION}</string>

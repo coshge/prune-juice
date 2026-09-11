@@ -26,7 +26,7 @@ could be added without rework.
 | M8 known-gap cleanup — exclusive image sizes, measured writable layers, SIGINT, remote gate, size cache | done |
 
 ```
-cargo test --workspace                  # 287 tests
+cargo test --workspace                  # 301 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -56,6 +56,7 @@ cargo run -p xtask -- appcast                   # the document Sparkle reads
 ./scripts/install-local.sh --cli               # just the CLI, onto the PATH
 
 cd app/PruneJuice && ./scripts/bundle.sh        # assemble PruneJuice.app (ad-hoc signed)
+swift app/PruneJuice/scripts/make-icon.swift out.iconset   # the icon, on its own
 SPARKLE_PUBLIC_KEY=… ./scripts/bundle.sh        # …with updates enabled
 SIGN_ID="Developer ID Application: …" ./scripts/bundle.sh --notarize
 open app/PruneJuice/dist/PruneJuice.app
@@ -101,6 +102,21 @@ PRUNE_JUICE_UPDATE_URL=https://…/update-manifest.json \
   is never assumed empty: on Docker Desktop the data root is hidden inside a VM,
   and the honest answer there is "cannot be proven safe". Enforced in
   `plan/tier.rs::destabilises`.
+- **The icon is drawn in code, not checked in as artwork.**
+  `app/PruneJuice/scripts/make-icon.swift` renders every slot of the iconset
+  with CoreGraphics and `bundle.sh` runs `iconutil` over it, caching the
+  result in `.build/icon` until the script changes. So the shape is reviewable
+  in a diff, each size is drawn at its own resolution rather than downsampled
+  from one master, and nothing binary enters the repository. It is the app's
+  own `drop.halffull` mark in `plum` from `Views.swift`, redrawn rather than
+  taken from SF Symbols, whose licence does not cover app icons. The CLI
+  terminal droplet lives in `core::brand`, rasterised from that same Bézier
+  into half-block cells at eleven columns by eight rows, and is drawn by the CLI header (`banner.rs`), the
+  interface's scanning screen and its main screen — so there is one droplet and
+  not four. Change the icon's curve and the others are now the odd ones out.
+  The empty half is drawn in a lighter glyph than the full half, so it reads as
+  half full with no colour at all; colour only says it again, which is what
+  makes `NO_COLOR` and a monochrome terminal a non-event.
 - **The app is an AppKit shell, not a SwiftUI `App` scene.** A bundle
   assembled by hand does not get the LaunchServices registration SwiftUI's
   scene lifecycle needs: the delegate runs, the activation policy is set, and
