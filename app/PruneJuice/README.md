@@ -106,8 +106,9 @@ The app checks for a newer release on launch, at most once a day, using
   presents it.
 - Installing waits until the helper has stopped. An update can never relaunch
   the app between two deletions.
-- An update replaces the whole bundle, including the CLI helper, so the two are
-  always the same version.
+- An update replaces the whole bundle, including its tested CLI helper. The
+  app and standalone CLI have independent versions; updating the standalone
+  CLI does not change the helper inside the app.
 
 **Check for Updates…** in the Prune Juice menu asks immediately, and is allowed
 even mid-operation — only installing waits. **Settings → Updates** turns

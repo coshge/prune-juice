@@ -1,15 +1,18 @@
 name: release
 
-# Cutting a release is `git tag v0.2.0 && git push --tags`. Everything below
-# is derived from the tag; nothing is typed twice.
+# CLI and app tags release independently.
 on:
   push:
-    tags: ["v*"]
+    tags: ["cli-v*", "app-v*"]
   workflow_dispatch:
     inputs:
       tag:
         description: An existing tag to re-release
         required: true
+
+concurrency:
+  group: release-publication
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -22,40 +25,33 @@ jobs:
   # Nothing is built for a release until the tests pass. A tag is not a
   # promise that the code works, and a published release is.
   verify:
+    outputs:
+      product: ${{ steps.meta.outputs.product }}
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
+      - name: validate release metadata
+        id: meta
+        env:
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: python3 scripts/release.py validate "$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+      - run: python3 -m unittest discover -s scripts -p 'test_release.py'
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.meta.outputs.product == 'cli'
         with: { components: clippy }
-      # save-if is off in every job here, and the reason is worth writing down
-      # rather than rediscovering: GitHub scopes a cache to the ref that wrote
-      # it, a tag gets its own scope, and `ci.yml`'s caches carry a different
-      # job-id key — so every release job reports "No cache found", and the
-      # cache it then spends 5-20s writing can never be read by anything. This
-      # restores one if a matching one ever exists, and stops paying to store
-      # one that cannot.
       - uses: Swatinem/rust-cache@v2
+        if: steps.meta.outputs.product == 'cli'
         with: { save-if: "false" }
       - run: cargo clippy --workspace --all-targets -- -D warnings
+        if: steps.meta.outputs.product == 'cli'
       - run: cargo test --workspace
-      - run: swift test
-        working-directory: app/PruneJuice
-
-      - name: the tag and the crate version agree
-        run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
-          crate="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
-          if [ "${tag#v}" != "$crate" ]; then
-            echo "tag $tag does not match the workspace version $crate" >&2
-            echo "the updater compares against the version compiled into the" >&2
-            echo "binary, so a mismatch ships a release nobody can be offered." >&2
-            exit 1
-          fi
+        if: steps.meta.outputs.product == 'cli'
 
   # One job per target triple. Each produces a .tar.gz holding a single
   # `prune-juice` executable, which is the shape `--update` extracts.
   cli:
+    if: needs.verify.outputs.product == 'cli'
     needs: verify
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -67,7 +63,7 @@ jobs:
           - { target: x86_64-unknown-linux-gnu,  runner: ubuntu-24.04 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-24.04-arm }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
       - uses: dtolnay/rust-toolchain@stable
         with: { targets: "${{ matrix.target }}" }
@@ -97,30 +93,23 @@ jobs:
       - name: package
         run: |
           version="${{ github.event.inputs.tag || github.ref_name }}"
-          version="${version#v}"
+          version="${version#cli-v}"
           name="prune-juice-$version-${{ matrix.target }}"
           # `-C` so the archive holds a bare `prune-juice`, with no directory
           # for the extractor to have to reason about.
           tar czf "$name.tar.gz" -C "target/${{ matrix.target }}/release" prune-juice
           shasum -a 256 "$name.tar.gz"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cli-${{ matrix.target }}
           path: prune-juice-*.tar.gz
           if-no-files-found: error
 
-  # The app archive Sparkle downloads: the whole bundle, helper included, so
-  # the two can never end up on different versions.
+  # The app builds its pinned helper independently of CLI releases.
   app:
-    # The cli jobs rather than `verify` directly: this job used to spend 4m26
-    # of its 5m46 building the two macOS CLI binaries that those jobs are
-    # building at the same moment, from the same commit. It now waits for them
-    # and takes theirs. Slower to start, much faster to finish, and the helper
-    # inside the app now comes from the same compilation as the published CLI
-    # archive rather than a second build that merely ought to match it. The
-    # bundle re-signs it, so the bytes are not identical — the compilation is.
-    needs: cli
+    if: needs.verify.outputs.product == 'app'
+    needs: verify
     runs-on: macos-15
     env:
       # Mapped here so the steps below can branch on presence. `secrets` is
@@ -128,30 +117,32 @@ jobs:
       HAVE_CERT: ${{ secrets.MACOS_CERTIFICATE != '' && 'yes' || '' }}
       HAVE_NOTARY: ${{ (secrets.MACOS_SIGN_ID != '' && secrets.NOTARY_APPLE_ID != '') && 'yes' || '' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
-      # No Rust toolchain and no cargo cache: nothing is compiled here any
-      # more. `swift build` and the icon script are all this job builds.
-
-      # The two macOS archives the cli jobs just produced. The executable bit
-      # does not survive upload-artifact, which is why these travel as the
-      # .tar.gz that is about to be published rather than as bare binaries:
-      # the mode lives inside the archive.
-      - uses: actions/download-artifact@v4
+      - name: read helper pin
+        id: helper
+        run: python3 scripts/release.py pin >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v7
         with:
-          pattern: cli-*-apple-darwin
-          path: helpers
-      - name: unpack the helper binaries
+          ref: ${{ steps.helper.outputs.revision }}
+          path: helper-source
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: build the pinned helper
+        working-directory: helper-source
         run: |
-          for arch in aarch64 x86_64; do
-            mkdir -p "helpers/$arch"
-            # A glob expanded through the argument list, not `ls`: one archive
-            # per target directory, and no filename parsing.
-            set -- helpers/cli-$arch-apple-darwin/*.tar.gz
-            [ -f "$1" ] || { echo "no cli archive for $arch-apple-darwin" >&2; exit 1; }
-            tar xzf "$1" -C "helpers/$arch"
-            test -x "helpers/$arch/prune-juice"
-          done
+          cargo test --locked --workspace
+          cargo build --release --locked -p prune-juice-cli --target aarch64-apple-darwin
+          cargo build --release --locked -p prune-juice-cli --target x86_64-apple-darwin
+      - name: verify app and pinned helper compatibility
+        run: python3 scripts/release.py check-helper helper-source
+      - name: test app against the pinned helper
+        working-directory: app/PruneJuice
+        env:
+          PJ_TEST_HELPER: ${{ github.workspace }}/helper-source/target/aarch64-apple-darwin/release/prune-juice
+        run: swift test
 
       - name: import the Developer ID certificate
         # Optional, and absent today. Without it the bundle is ad-hoc signed:
@@ -177,12 +168,13 @@ jobs:
       - name: assemble the bundle
         working-directory: app/PruneJuice
         env:
+          REQUIRE_PINNED_HELPER: '1'
           SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
           SIGN_ID: ${{ secrets.MACOS_SIGN_ID }}
           NOTARY_PROFILE: ""
           # Absolute: bundle.sh changes directory more than once.
-          HELPER_AARCH64: ${{ github.workspace }}/helpers/aarch64/prune-juice
-          HELPER_X86_64: ${{ github.workspace }}/helpers/x86_64/prune-juice
+          HELPER_AARCH64: ${{ github.workspace }}/helper-source/target/aarch64-apple-darwin/release/prune-juice
+          HELPER_X86_64: ${{ github.workspace }}/helper-source/target/x86_64-apple-darwin/release/prune-juice
         run: |
           if [ -z "$SPARKLE_PUBLIC_KEY" ]; then
             echo "SPARKLE_PUBLIC_KEY is not set." >&2
@@ -271,7 +263,7 @@ jobs:
           fi
           echo "signed and verified $zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: app
           path: |
@@ -280,13 +272,14 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [cli, app]
+    needs: [verify, cli, app]
+    if: always() && needs.verify.result == 'success' && (needs.cli.result == 'success' || needs.app.result == 'success')
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { path: artifacts }
 
       - name: collect
@@ -301,7 +294,7 @@ jobs:
         run: |
           tag="${{ github.event.inputs.tag || github.ref_name }}"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
+          echo "version=${tag#*-v}" >> "$GITHUB_OUTPUT"
           echo "notes=${{ github.server_url }}/${{ github.repository }}/releases/tag/$tag" >> "$GITHUB_OUTPUT"
           echo "base=${{ github.server_url }}/${{ github.repository }}/releases/download/$tag" >> "$GITHUB_OUTPUT"
 
@@ -309,6 +302,7 @@ jobs:
       # that are about to be uploaded, so the manifest cannot describe
       # something else by accident.
       - name: the update manifest
+        if: needs.verify.outputs.product == 'cli'
         run: |
           args=()
           for f in release/prune-juice-*.tar.gz; do
@@ -317,8 +311,6 @@ jobs:
             target="${target#prune-juice-${{ steps.meta.outputs.version }}-}"
             args+=(--cli "$target=$f")
           done
-          app="$(ls release/PruneJuice-*.zip 2>/dev/null | head -1)"
-          [ -n "$app" ] && args+=(--app "$app")
           cargo run -q -p xtask -- manifest \
             --version "${{ steps.meta.outputs.version }}" \
             --base-url "${{ steps.meta.outputs.base }}" \
@@ -331,6 +323,7 @@ jobs:
       # chain that has to be trusted, which is why the key never leaves a
       # secret and the signature covers the digests rather than each file.
       - name: sign the manifest
+        if: needs.verify.outputs.product == 'cli'
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
@@ -374,12 +367,15 @@ jobs:
           minisign -V -P "$pub" -m release/update-manifest.json
 
       # The document Sparkle reads. The previous feed is fetched first so the
-      # version history survives; a missing one starts a new feed.
+      # version history survives; a failed download stops publication.
       - name: the Sparkle appcast
+        if: needs.verify.outputs.product == 'app'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -fsSL -o release/previous-appcast.xml \
-            "${{ github.server_url }}/${{ github.repository }}/releases/latest/download/appcast.xml" \
-            || echo "no previous appcast; starting a new feed"
+          previous="$(gh api repos/{owner}/{repo}/releases/latest --jq .tag_name)"
+          gh release download "$previous" --pattern appcast.xml --dir release
+          mv release/appcast.xml release/previous-appcast.xml
           zip="$(ls release/PruneJuice-*.zip)"
           cargo run -q -p xtask -- appcast \
             --version "${{ steps.meta.outputs.version }}" \
@@ -392,20 +388,11 @@ jobs:
           rm -f release/previous-appcast.xml
           cat release/appcast.xml
 
-      - name: publish
+      - name: publish product and update feeds
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${{ steps.meta.outputs.tag }}" \
-            --title "${{ steps.meta.outputs.tag }}" \
-            --generate-notes --verify-tag 2>/dev/null || true
-          gh release upload "${{ steps.meta.outputs.tag }}" \
-            release/prune-juice-*.tar.gz \
-            release/PruneJuice-*.zip \
-            release/update-manifest.json \
-            release/update-manifest.json.minisig \
-            release/appcast.xml \
-            --clobber
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: python3 scripts/release.py publish "$RELEASE_TAG"
 
       # Proves the thing that actually matters: an installed copy can find and
       # verify this release at the URL it will really use. Runs after the
@@ -419,6 +406,7 @@ jobs:
       # arm64, so it is the aarch64-apple-darwin archive that gets exercised —
       # the one most people download.
       - name: an installed copy can see this release
+        if: needs.verify.outputs.product == 'cli'
         run: |
           version="${{ steps.meta.outputs.version }}"
           tar xzf "release/prune-juice-$version-aarch64-apple-darwin.tar.gz" -C /tmp

@@ -14,8 +14,8 @@
 #
 # The default run builds the app bundle and then installs *its* helper as the
 # CLI, so the two are the same bytes rather than two builds that happen to
-# agree. An app and a helper on different versions is a protocol mismatch
-# waiting to happen, and the same is true of the copy on your PATH.
+# agree. This is a development convenience: published app releases pin their
+# helper independently, and the standalone CLI may have a different version.
 set -euo pipefail
 
 # rustup and a user-level bin dir are both outside a non-login shell's PATH.

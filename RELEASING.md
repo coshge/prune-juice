@@ -1,7 +1,16 @@
 # Releasing Prune Juice
 
-A release is `git tag v0.2.0 && git push origin v0.2.0`. Everything else is
-derived from the tag by `.github/workflows/release.yml`.
+The CLI and Mac app are versioned and released independently from this repo.
+`.github/workflows/release.yml` selects one product from its tag:
+
+- `cli-vX.Y.Z`: release the Rust CLI for macOS and Linux.
+- `app-vX.Y.Z`: release the Mac app with its pinned CLI helper.
+
+The Rust crates share the workspace version in `Cargo.toml`. The app uses
+`app/PruneJuice/release.json`: `version` is the app version, `cliVersion` is
+the bundled helper version, and `cliRevision` is its full Git commit SHA.
+An app-only release does not require a new CLI release. App releases build
+the helper from that immutable source revision with its committed Cargo lockfile.
 
 There is one-time setup before the first release, and it is the part that
 matters: **the signing keys are what make an update safe.** Without them the
@@ -30,20 +39,28 @@ unverified binaries.
 | `PruneJuice-<version>.zip` | Sparkle | Sparkle EdDSA, in the appcast |
 | `appcast.xml` | Sparkle | Sparkle EdDSA per item |
 
-Both documents describe the same release and are built from the same
-artifacts. That is what keeps the app and the CLI helper inside it on the same
-version: an app update replaces the whole bundle, helper included.
+CLI releases contain the four CLI archives and signed manifest. App releases
+contain the app archive and Sparkle appcast. The app archive includes its tested
+helper; its version can differ from the app version.
 
-Two fixed URLs, and neither needs any hosting to be set up:
+The dedicated `updates` release holds both feeds:
 
 ```
-https://github.com/coshge/prune-juice/releases/latest/download/update-manifest.json
-https://github.com/coshge/prune-juice/releases/latest/download/appcast.xml
+https://github.com/coshge/prune-juice/releases/download/updates/update-manifest.json
+https://github.com/coshge/prune-juice/releases/download/updates/appcast.xml
 ```
 
-`/releases/latest/download/<asset>` always redirects to the newest release, so
-there is no feed to keep in sync by hand and no GitHub API rate limit in the
-path.
+Product releases are published with `--latest=false`. The `updates` release is
+marked Latest so existing installations using `/releases/latest/download/`
+continue to find both feeds. Each release changes only its own product's feed.
+The first independent release copies both feeds from the previous combined
+release before promoting `updates`. Missing legacy feeds stop publication.
+This migration assumes the existing combined release has both feeds; it is
+not a fresh-repository bootstrap procedure.
+
+Do not manually mark a product release Latest or delete `updates`. Installer
+downloads are on the versioned `cli-v*` and `app-v*` releases; feed entries link
+to those immutable assets. Signing secrets are unchanged.
 
 ## One-time setup
 
@@ -116,43 +133,80 @@ changes.
 
 ## Cutting a release
 
-```sh
-# 1. Bump the workspace version. Everything reads it from here.
-$EDITOR Cargo.toml          # [workspace.package] version = "0.2.0"
-cargo check --workspace     # refreshes Cargo.lock, which --locked needs
-git commit -am "chore: 0.2.0"
+### CLI
 
-# 2. Tag and push.
-git tag v0.2.0
-git push origin production --tags
+Bump `[workspace.package].version` in `Cargo.toml`, then run:
+
+```sh
+cargo check --workspace                 # refresh Cargo.lock
+cargo test --workspace
+python3 scripts/release.py validate cli-v0.3.5
 ```
 
-The workflow then:
+After committing the version and intended CLI changes, push the exact tag:
 
-1. **verify** — clippy, the Rust tests, the Swift tests, and a check that the
-   tag matches the workspace version. A mismatch fails here: the updater
-   compares against the version compiled into the binary, so a release tagged
-   `v0.2.0` built from `0.1.0` sources would be a release nobody is ever
-   offered.
-2. **cli** — four targets (Apple silicon and Intel macOS, x86-64 and arm64
-   Linux), each with the minisign public key compiled in.
-3. **app** — the bundle, its Sparkle framework, the CLI helper inside it, and
-   the update archive, signed with the EdDSA key. It waits for **cli** and
-   takes the two macOS binaries from it rather than building its own: the
-   helper then comes from the same compilation as the published CLI archive,
-   and the job stops spending four and a half minutes repeating a build
-   happening beside it.
-4. **publish** — generates and signs `update-manifest.json`, merges the new
-   item into `appcast.xml`, uploads everything, and then **checks that the
-   binary it just published can read and verify that release**. That last step
-   is the one worth watching: it is the only thing that exercises the real URL,
-   over the real network, with real verification. It unpacks the archive that
-   was uploaded rather than rebuilding from source — a rebuild tests a binary
-   nobody will ever run — and retries for up to a minute, because
-   `gh release upload` returns before the asset is reliably servable.
+```sh
+git tag cli-v0.3.5
+git push origin cli-v0.3.5
+```
 
-To re-run against an existing tag, use the workflow's manual trigger and give
-it the tag name.
+The workflow checks the tag, tests Rust, builds four targets, signs the manifest,
+publishes the CLI release, and updates only the CLI feed. It then checks that a
+published macOS binary can read and verify the live feed. It does not build or
+release the Swift app.
+
+### Mac app
+
+Bump only `version` in `app/PruneJuice/release.json`, for example to `0.3.5`.
+Leave `cliVersion` and `cliRevision` unchanged for an interface-only update.
+To include an engine change, set both helper fields to the desired CLI version
+and the full commit SHA containing it (`git rev-parse cli-v0.3.5^{commit}` for
+a local release tag). Commit SHAs must exist on the remote before app CI runs.
+
+```sh
+python3 scripts/release.py validate app-v0.3.5
+swift test --package-path app/PruneJuice
+```
+
+After committing the app version and changes:
+
+```sh
+git tag app-v0.3.5
+git push origin app-v0.3.5
+```
+
+The workflow checks out the pinned helper separately, runs its Rust tests,
+builds both Mac architectures, checks the CLI and protocol versions, and runs
+Swift tests with the pinned helper's argument parser. It then bundles, signs,
+optionally notarises, and publishes only the app and its appcast. Full Docker
+cleanup acceptance tests remain a separate check for engine changes; the
+compatibility gate is not a live Docker test.
+
+App builds require Rust because they compile the source pin. They do not depend
+on another release job or download a floating latest CLI. Local `bundle.sh`
+and `install-local.sh` keep building the current working tree for development;
+the app version still comes from `release.json`. CI supplies the pinned helper
+and sets `REQUIRE_PINNED_HELPER=1`, which requires both architectures and checks
+the bundled version. `PruneJuiceCLIVersion` in Info.plist records the actual helper.
+
+### Publication rules
+
+Use a version higher than the currently distributed version of that product.
+Bump only the product you want to release next.
+Only stable `major.minor.patch` versions are accepted. Legacy `v*` tags no longer
+trigger this workflow.
+
+Publication is serialized to protect the shared update release. GitHub allows
+one pending run in this concurrency group; additional queued releases can
+replace that pending run. Push releases one at a time, or rerun a canceled tag
+through the manual workflow trigger.
+
+The manual trigger accepts an existing product tag. Published assets are
+immutable: a retry with different rebuilt or signed bytes fails and requires a
+new version. Failed draft uploads can be retried. Feed downloads fail closed,
+and an older version is never promoted over a newer feed. A CLI manifest and
+its detached signature are separate assets, so a check during their replacement
+can briefly fail verification; clients retry through their normal update flow.
 
 ## What updates look like to a user
 
@@ -212,7 +266,7 @@ Everything a user's copy checks, you can check yourself:
 
 ```sh
 V=0.2.0
-BASE=https://github.com/coshge/prune-juice/releases/download/v$V
+BASE=https://github.com/coshge/prune-juice/releases/download/cli-v$V
 
 # 1. The manifest is signed by the release key.
 curl -fsSLO $BASE/update-manifest.json
@@ -233,9 +287,9 @@ the appcast.
 
 ## Re-releasing and rolling back
 
-Re-releasing the same version is safe: the appcast generator replaces an
-existing item for that version rather than adding a second one, and the release
-upload uses `--clobber`.
+An unpublished draft can be retried. Once published, a version's artifacts
+cannot change: an identical retry is accepted, but a rebuild producing different
+bytes needs a new version. See [Publication rules](#publication-rules).
 
 Rolling *back* is not something the update system can do — Sparkle and the CLI
 both refuse to move to an older version, which is the correct behaviour and not

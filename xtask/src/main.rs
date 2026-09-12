@@ -15,8 +15,8 @@
 //!       --out appcast.xml
 //!
 //! The manifest is what the CLI reads; the appcast is what Sparkle reads. They
-//! describe the same release and are produced from the same artifacts, which
-//! is what keeps the app and its helper on the same version.
+//! describe independently versioned products. Each app archive contains its
+//! pinned helper; a CLI release does not change an installed app.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

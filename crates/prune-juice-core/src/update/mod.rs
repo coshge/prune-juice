@@ -44,11 +44,10 @@ pub const HOST_TARGET: &str = env!("PRUNE_JUICE_TARGET");
 /// telling older copies to stand aside rather than misread it.
 pub const SCHEMA: u32 = 1;
 
-/// The default feed: a release asset served from a fixed URL that always
-/// resolves to the newest release.
+/// The default feed: an asset on the dedicated `updates` release. Publishing
+/// an app release cannot move this URL to an unrelated product release.
 ///
-/// Deliberately not the GitHub API. `/releases/latest/download/<asset>` is a
-/// plain redirect to a file we published, so it has no rate limit to be
+/// Deliberately not the GitHub API. This is a file we published, so it has no rate limit to be
 /// throttled by, no JSON shape that can change under us, and no dependence on
 /// GitHub's API remaining free to unauthenticated callers.
 pub const MANIFEST_ASSET: &str = "update-manifest.json";
@@ -87,7 +86,7 @@ fn feed_url(override_url: Option<&str>) -> String {
     match override_url.map(str::trim).filter(|u| !u.is_empty()) {
         Some(u) => u.to_string(),
         None => format!(
-            "{}/releases/latest/download/{MANIFEST_ASSET}",
+            "{}/releases/download/updates/{MANIFEST_ASSET}",
             env!("CARGO_PKG_REPOSITORY").trim_end_matches('/')
         ),
     }
@@ -1002,7 +1001,7 @@ mod tests {
         let u = feed_url(None);
         assert!(u.starts_with("https://"), "{u}");
         assert!(u.ends_with(MANIFEST_ASSET), "{u}");
-        assert!(u.contains("/releases/latest/download/"), "{u}");
+        assert!(u.contains("/releases/download/updates/"), "{u}");
         // A staging feed overrides it; an empty variable does not.
         assert_eq!(
             feed_url(Some("https://staging/m.json")),

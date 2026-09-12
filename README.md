@@ -395,7 +395,9 @@ Juice menu asks immediately, and **Settings → Updates** turns automatic
 checking off.
 
 An update replaces the whole app bundle, including the CLI helper inside it,
-so the two are always the same version.
+so the app always receives its tested helper. The app and standalone CLI have
+independent versions and release schedules. Updating the standalone CLI does
+not change the helper inside the app.
 
 Because the app is not yet signed with an Apple Developer ID, the *first*
 install of an updater-enabled build has to be opened once through right-click

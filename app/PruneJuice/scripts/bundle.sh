@@ -5,7 +5,7 @@
 # Runs here and in CI, so the release is one reproducible command rather than a
 # sequence someone remembers. The single difference is where the CLI helper
 # comes from: locally it is built, and the release workflow hands over the
-# binaries it has already built as the published archives (HELPER_* below).
+# binaries it built from release.json's immutable source pin (HELPER_* below).
 # Everything after the helper — the bundle, Sparkle, the icon, the plist, the
 # signing order — is the same code on both paths.
 #
@@ -23,14 +23,10 @@
 #   NOTARY_PROFILE      notarytool keychain profile, for --notarize.
 #   HELPER_AARCH64      a prebuilt `prune-juice` to use as the helper instead
 #   HELPER_X86_64       of building one. Set by the release workflow, which
-#                       has already built exactly these two binaries as the
-#                       archives it is about to publish — so the helper comes
-#                       from the *same compilation* as the released CLI rather
-#                       than a second build of the same source that merely
-#                       ought to agree with it. Not the same bytes: signing
-#                       below rewrites the binary, and lipo rewrites it again.
+#                       builds these from the pinned CLI source revision.
 #                       Either may be set alone; a path that does not exist is
 #                       an error, not a fallback.
+#   REQUIRE_PINNED_HELPER  require both architectures and the pinned version.
 set -euo pipefail
 
 # rustup installs outside the default PATH for a non-login shell.
@@ -49,9 +45,18 @@ NOTARIZE=0
 [ "${1:-}" = "--notarize" ] && NOTARIZE=1
 
 # The appcast Sparkle reads. A release asset rather than a separate site: the
-# URL always resolves to the newest release, it needs no extra hosting to be
+# URL belongs to the dedicated updates release, it needs no extra hosting to be
 # set up or kept alive, and it is HTTPS as Sparkle requires.
-FEED_URL="${UPDATE_FEED_URL:-https://github.com/coshge/prune-juice/releases/latest/download/appcast.xml}"
+FEED_URL="${UPDATE_FEED_URL:-https://github.com/coshge/prune-juice/releases/download/updates/appcast.xml}"
+
+VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$HERE/release.json")"
+PINNED_CLI_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cliVersion"])' "$HERE/release.json")"
+python3 "$REPO/scripts/release.py" validate "app-v$VERSION" >/dev/null
+if [ "${REQUIRE_PINNED_HELPER:-0}" = 1 ]; then
+  [ -n "${HELPER_AARCH64:-}" ] && [ -n "${HELPER_X86_64:-}" ] || {
+    echo "release builds require both pinned helper architectures" >&2; exit 1;
+  }
+fi
 
 say() { printf '  %s\n' "$*"; }
 
@@ -96,6 +101,11 @@ fi
 # route it took, because the failure is a shipped app that cannot spawn its
 # own helper.
 chmod +x "$APP/Contents/MacOS/prune-juice"
+HELPER_VERSION="$("$APP/Contents/MacOS/prune-juice" --version | awk '{print $NF}')"
+if [ "${REQUIRE_PINNED_HELPER:-0}" = 1 ] && [ "$HELPER_VERSION" != "$PINNED_CLI_VERSION" ]; then
+  echo "helper version $HELPER_VERSION does not match pin $PINNED_CLI_VERSION" >&2
+  exit 1
+fi
 # Read back off the binary rather than inferred from which branch ran: what
 # matters is what the bundle now contains, and on the supplied path there is
 # no target directory whose name could stand in for it.
@@ -149,7 +159,6 @@ fi
 mkdir -p "$APP/Contents/Resources"
 cp "$ICNS" "$APP/Contents/Resources/PruneJuice.icns"
 
-VERSION="$(grep -m1 '^version' "$REPO/Cargo.toml" | sed 's/.*"\(.*\)".*/\1/')"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -167,6 +176,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
   <key>CFBundlePackageType</key>       <string>APPL</string>
   <key>CFBundleShortVersionString</key><string>${VERSION}</string>
   <key>CFBundleVersion</key>           <string>${VERSION}</string>
+  <key>PruneJuiceCLIVersion</key>      <string>${HELPER_VERSION}</string>
   <key>LSMinimumSystemVersion</key>    <string>14.0</string>
   <key>LSApplicationCategoryType</key> <string>public.app-category.developer-tools</string>
   <key>NSHighResolutionCapable</key>   <true/>
@@ -278,8 +288,8 @@ fi
 # preserves the symlinks and extended attributes a signed bundle needs; a
 # `zip -r` here produces an archive that unpacks into a broken signature.
 #
-# The whole bundle, which is the point: the app and its CLI helper are updated
-# together and can never end up as two different versions.
+# The whole bundle: the app and its pinned helper are installed together,
+# even though they have independent version numbers.
 say "packaging the update archive"
 ditto -c -k --keepParent "$APP" "$OUT/PruneJuice-$VERSION.zip"
 

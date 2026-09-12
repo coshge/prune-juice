@@ -5,6 +5,7 @@ target/
 .DS_Store
 app/PruneJuice/.build/
 app/PruneJuice/dist/
+__pycache__/
 
 # Release signing keys. The secret halves cannot be rotated for copies already
 # installed, so a key reaching a public repository is not a mistake with a fix

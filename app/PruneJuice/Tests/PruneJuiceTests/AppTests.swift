@@ -17,6 +17,33 @@ final class StubService: PruneJuiceService, @unchecked Sendable {
 final class Counter: @unchecked Sendable { var value = 0 }
 
 final class AppTests: XCTestCase {
+    func testPinnedHelperAcceptsAppOptions() throws {
+        guard let helper = ProcessInfo.processInfo.environment["PJ_TEST_HELPER"] else {
+            throw XCTSkip("Set PJ_TEST_HELPER to test a release helper")
+        }
+        var options = ScanOptions()
+        options.context = "compatibility-test"
+        options.roots = "/tmp/project-one:/tmp/project-two"
+        options.label = "project=test"
+        options.deadline = "120"
+        options.sizes = false
+        options.probe = false
+        options.containerProbe = true
+        options.vault = false
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: helper)
+        // --help exits during argument parsing, before any Docker or disk work.
+        process.arguments = ["--json", "--no-tui"] + options.arguments + ["--help"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, String(decoding: data, as: UTF8.self))
+        XCTAssertTrue(String(decoding: data, as: UTF8.self).contains("--json"))
+    }
+
     @MainActor func settle() async { try? await Task.sleep(for: .milliseconds(100)) }
 
     func testOptionsMapEveryCLIControlWithoutShellParsing() {
