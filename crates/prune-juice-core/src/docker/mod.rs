@@ -124,8 +124,12 @@ pub trait DockerClient: Send + Sync {
 pub struct RawProbe {
     /// Top-level entries, capped.
     pub entries: Vec<String>,
-    /// Files found, capped — a floor, not a total.
-    pub file_count: u64,
+    /// Non-directory objects found, capped — a floor, not a total.
+    ///
+    /// `None` when the script produced no count at all, which is what a probe
+    /// image whose shell has no `find` looks like. Zero and "nobody counted"
+    /// are different facts, and conflating them reads every volume as empty.
+    pub file_count: Option<u64>,
     /// Newest mtime seen. Sampled rather than exhaustive on large volumes;
     /// [`Self::mtime_sampled`] says which.
     pub newest_mtime: Option<i64>,

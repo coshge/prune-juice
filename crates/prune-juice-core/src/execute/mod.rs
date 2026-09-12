@@ -781,10 +781,16 @@ mod tests {
         }
     }
 
+    /// A compose-made network — labelled, and so recreated by a file that
+    /// outlives it. That is what puts it in the tier this module applies.
     fn network(name: &str) -> ResourceSummary {
         let mut r = ResourceSummary::new(ResourceKind::Network, name, name);
         r.created_unix = Some(OLD);
         r.size = Some(Bytes(1000));
+        r.labels.insert(
+            crate::providers::COMPOSE_PROJECT.to_string(),
+            "proj".to_string(),
+        );
         r
     }
 

@@ -407,9 +407,16 @@ mod tests {
         }
     }
 
+    /// A compose-made network: the shape that is genuinely free, because the
+    /// file that would recreate it is still on disk. A network with no label
+    /// was made by hand and is not interchangeable with this one.
     fn network(name: &str) -> ResourceSummary {
         let mut r = ResourceSummary::new(ResourceKind::Network, name, name);
         r.created_unix = Some(OLD);
+        r.labels.insert(
+            crate::providers::COMPOSE_PROJECT.to_string(),
+            "proj".to_string(),
+        );
         r
     }
 
@@ -593,8 +600,7 @@ mod tests {
         // A daemon that did not compute the overlap leaves the tool with one
         // figure. Over-estimating is the honest direction to be wrong in: the
         // run reports what it actually freed either way.
-        let mut r = ResourceSummary::new(ResourceKind::Network, "proj_default", "proj_default");
-        r.created_unix = Some(OLD);
+        let mut r = network("proj_default");
         r.size = Some(Bytes(4_096));
         let rep = report_with(vec![attributed(r)], "D");
         let plan = Planner::plan(&rep, NOW);

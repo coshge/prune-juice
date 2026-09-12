@@ -627,15 +627,22 @@ impl DockerMutate for BollardClient {
 /// Constraints it has to satisfy: POSIX-ish so it works under busybox as well
 /// as coreutils; bounded so a volume with a million files cannot hang a scan;
 /// and strictly read-only.
+///
+/// It counts `! -type d` rather than `-type f` so a symlink counts as
+/// something that is there, and it emits **no count line at all** when the
+/// image has no `find` — `find ... | wc -l` would print `0`, and a zero from a
+/// counter that never ran is indistinguishable from an empty volume. No line
+/// leaves `RawProbe::file_count` at `None`, which reads as "uncounted".
 const PROBE_SCRIPT: &str = r#"
+command -v find >/dev/null 2>&1 && f=1 || f=0
 for d in /p/*; do
   [ -d "$d" ] || continue
   echo "@@@V $d"
   ls -A "$d" 2>/dev/null | head -256
   echo "@@@C"
-  find "$d" -type f 2>/dev/null | head -20000 | wc -l
+  [ "$f" = 1 ] && find "$d" ! -type d 2>/dev/null | head -20000 | wc -l
   echo "@@@M"
-  find "$d" -type f 2>/dev/null | head -200 | tr '\n' '\0' | xargs -0 stat -c %Y 2>/dev/null | sort -rn | head -1
+  [ "$f" = 1 ] && find "$d" -type f 2>/dev/null | head -200 | tr '\n' '\0' | xargs -0 stat -c %Y 2>/dev/null | sort -rn | head -1
 done
 echo "@@@END"
 "#;
@@ -896,7 +903,7 @@ fn parse_probe_output(text: &str) -> Vec<(usize, RawProbe)> {
             Section::Entries => raw.entries.push(line.to_string()),
             Section::Count => {
                 if let Ok(n) = line.trim().parse::<u64>() {
-                    raw.file_count = n;
+                    raw.file_count = Some(n);
                 }
             }
             Section::Mtime => {
@@ -953,7 +960,7 @@ node_modules
         let (i0, r0) = &got[0];
         assert_eq!(*i0, 0);
         assert_eq!(r0.entries, vec!["ibdata1", "mysql"]); // sorted
-        assert_eq!(r0.file_count, 1234);
+        assert_eq!(r0.file_count, Some(1234));
         assert_eq!(r0.newest_mtime, Some(1_700_000_000));
 
         // An empty volume: no entries, no mtime. This must survive, because it
@@ -961,7 +968,7 @@ node_modules
         let (i1, r1) = &got[1];
         assert_eq!(*i1, 1);
         assert!(r1.entries.is_empty());
-        assert_eq!(r1.file_count, 0);
+        assert_eq!(r1.file_count, Some(0));
         assert_eq!(r1.newest_mtime, None);
 
         assert_eq!(got[2].1.entries, vec!["node_modules"]);
@@ -975,7 +982,7 @@ node_modules
         let text = "@@@V /p/000\nmysql\nibdata1\n@@@C\n5\n@@@M\n";
         let got = parse_probe_output(text);
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].1.file_count, 5);
+        assert_eq!(got[0].1.file_count, Some(5));
         assert_eq!(got[0].1.newest_mtime, None);
     }
 

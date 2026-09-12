@@ -706,10 +706,14 @@ mod tests {
         }
     }
 
+    /// A compose-made network: labelled, and so recreated by a file that
+    /// outlives it, which is what puts it in the free tier these tests draw.
     fn network(name: &str) -> ResourceSummary {
         let mut r = ResourceSummary::new(ResourceKind::Network, name, name);
         r.created_unix = Some(OLD);
         r.size = Some(Bytes(1000));
+        r.labels
+            .insert("com.docker.compose.project".into(), "proj".into());
         r
     }
 
@@ -737,6 +741,10 @@ mod tests {
         // Measured empty, as `/system/df` reports a container holding
         // nothing. Leaving it unmeasured keeps it out of the safe tier.
         r.size_rw = Some(Bytes::ZERO);
+        // Compose-made, like its `project-web-1` name says: an unlabelled
+        // container is one `docker run` wrote by hand and nothing recreates.
+        r.labels
+            .insert("com.docker.compose.project".into(), "project".into());
         attributed(r, false)
     }
 

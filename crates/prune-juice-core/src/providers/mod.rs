@@ -27,6 +27,10 @@ pub const COMPOSE_WORKING_DIR: &str = "com.docker.compose.project.working_dir";
 pub const COMPOSE_CONFIG_FILES: &str = "com.docker.compose.project.config_files";
 pub const DDEV_APPROOT: &str = "com.ddev.approot";
 pub const DDEV_SITE_NAME: &str = "com.ddev.site-name";
+/// Stamped on what ddev makes for *itself* — its global network and services —
+/// which belong to no single project and so carry no site name. It is still
+/// ddev's to recreate: `ddev start` puts them back.
+pub const DDEV_PLATFORM: &str = "com.ddev.platform";
 pub const DEVCONTAINER_FOLDER: &str = "devcontainer.local_folder";
 pub const SUPABASE_PROJECT: &str = "com.supabase.cli.project";
 

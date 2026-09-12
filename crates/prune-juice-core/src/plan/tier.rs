@@ -363,7 +363,7 @@ pub fn classify(a: &Attributed, graph: &RefGraph, now_unix: i64, rs: &mut ReadSe
                 Tier::Stale
             },
             reversibility,
-            because: "deleting this would be irreversible".into(),
+            because: gone_because(r),
             referenced,
         };
     }
@@ -513,6 +513,41 @@ fn destabilises(
     None
 }
 
+/// Does a configuration file that still exists describe how to recreate this?
+///
+/// Only the tools that write a project's stack down get a yes. The label is
+/// the evidence — `com.docker.compose.project` is stamped by the compose that
+/// would recreate it — and its absence means the resource was made by hand.
+fn recreated_by_config(r: &crate::model::ResourceSummary) -> bool {
+    use crate::providers::{COMPOSE_PROJECT, DDEV_PLATFORM, DDEV_SITE_NAME, DEVCONTAINER_FOLDER};
+
+    r.label_nonempty(COMPOSE_PROJECT).is_some()
+        // ddev's own global network and services name no project, and `ddev
+        // start` recreates them just the same.
+        || r.label_nonempty(DDEV_PLATFORM).is_some()
+        || r.label_nonempty(DDEV_SITE_NAME).is_some()
+        || r.label_nonempty(DEVCONTAINER_FOLDER).is_some()
+}
+
+/// Why this cannot be undone, in the terms that actually apply to it.
+///
+/// A hand-made container or network holds no data, so "irreversible" reads as
+/// a warning about bytes that are not at stake. What is lost is the
+/// definition, and saying so is what lets someone judge the offer.
+fn gone_because(r: &crate::model::ResourceSummary) -> String {
+    let hand_made = !recreated_by_config(r);
+    match r.kind {
+        ResourceKind::Network if hand_made => {
+            "no project config declares it, so its definition exists nowhere else".into()
+        }
+        ResourceKind::Container if hand_made && r.size_rw.map(|b| b.get()) == Some(0) => {
+            "no project config declares it, so the command that created it exists nowhere else"
+                .into()
+        }
+        _ => "deleting this would be irreversible".into(),
+    }
+}
+
 fn reversibility_of(a: &Attributed, rs: &mut ReadSet) -> Reversibility {
     let r = &a.resource;
     let subject = format!("{}:{}", r.kind.as_str(), r.name);
@@ -521,7 +556,19 @@ fn reversibility_of(a: &Attributed, rs: &mut ReadSet) -> Reversibility {
         ResourceKind::BuildCache => {
             Reversibility::Rebuildable("re-derived on the next build".into())
         }
-        ResourceKind::Network => Reversibility::Rebuildable("recreated on next compose up".into()),
+        // "compose up brings it back" is a claim about a file on disk, so it
+        // may only be made about a resource compose (or ddev, or a
+        // devcontainer) actually owns. A `docker network create --subnet=…`
+        // carries no label, and its subnet, driver and options live in the
+        // daemon and nowhere else: removing it destroys the definition even
+        // though it destroys no data.
+        ResourceKind::Network => {
+            if recreated_by_config(r) {
+                Reversibility::Rebuildable("recreated on next compose up".into())
+            } else {
+                Reversibility::Gone
+            }
+        }
         ResourceKind::Image => {
             if !r.repo_digests.is_empty() {
                 rs.record(&subject, "repo_digests", r.repo_digests.len().to_string());
@@ -533,9 +580,20 @@ fn reversibility_of(a: &Attributed, rs: &mut ReadSet) -> Reversibility {
             }
         }
         ResourceKind::Container => match r.size_rw {
-            Some(rw) if rw.get() == 0 => {
+            // An empty writable layer means no *data* is lost. The container
+            // itself is another matter: compose recreates one from a file that
+            // still exists, whereas a hand-written `docker run` — its image,
+            // command, ports, environment and mounts — survives only as this
+            // container, so `docker start` after we remove it has nothing to
+            // start.
+            Some(rw) if rw.get() == 0 && recreated_by_config(r) => {
                 rs.record(&subject, "size_rw", "0");
                 Reversibility::Rebuildable("recreated on next compose up".into())
+            }
+            Some(rw) if rw.get() == 0 => {
+                rs.record(&subject, "size_rw", "0");
+                rs.record(&subject, "recreated_by_config", "false");
+                Reversibility::Gone
             }
             Some(rw) => {
                 rs.record(&subject, "size_rw", rw.get().to_string());
@@ -617,9 +675,16 @@ mod tests {
         classify(&rep.resources[idx], &g, NOW, &mut rs)
     }
 
+    /// A compose-made network. The label is load-bearing: it is the evidence
+    /// that a file on disk will recreate this, and without it the network is
+    /// something a person made by hand that nothing describes.
     fn network(name: &str, created: i64) -> ResourceSummary {
         let mut r = ResourceSummary::new(ResourceKind::Network, name, name);
         r.created_unix = Some(created);
+        r.labels.insert(
+            crate::providers::COMPOSE_PROJECT.to_string(),
+            "proj".to_string(),
+        );
         r
     }
 
@@ -627,6 +692,12 @@ mod tests {
         let mut r = ResourceSummary::new(ResourceKind::Container, name, name);
         r.state = Some(state);
         r.created_unix = Some(OLD);
+        // Compose-made, like nearly every container these tests are about:
+        // `compose up` recreates it from a file that is still there.
+        r.labels.insert(
+            crate::providers::COMPOSE_PROJECT.to_string(),
+            "proj".to_string(),
+        );
         r.mounts = mounts.iter().map(|s| s.to_string()).collect();
         // A *measured* empty writable layer, which is what `/system/df`
         // reports for a container holding nothing. `None` would mean
@@ -639,6 +710,70 @@ mod tests {
     fn an_unused_old_network_is_free() {
         let rep = report(vec![attributed(network("proj_default", OLD))]);
         assert_eq!(classify_one(&rep, 0).tier, Tier::Free);
+    }
+
+    #[test]
+    fn a_hand_made_network_is_not_free() {
+        // `docker network create --subnet=10.9.0.0/24 lab` carries no label,
+        // and its subnet and driver options live in the daemon and nowhere
+        // else. "Recreated on next compose up" was being claimed for it
+        // anyway, which is a promise about a file that does not exist.
+        let mut n = network("lab", OLD);
+        n.labels.clear();
+        let rep = report(vec![attributed(n)]);
+        let v = classify_one(&rep, 0);
+        assert_ne!(v.tier, Tier::Free);
+        assert_eq!(v.reversibility, Reversibility::Gone);
+        assert!(
+            v.because.contains("no project config declares it"),
+            "the reason must name what is actually lost: {}",
+            v.because
+        );
+    }
+
+    #[test]
+    fn a_tools_own_global_resources_are_still_recreatable() {
+        // `ddev_default` carries `com.ddev.platform` and no project name at
+        // all. It is not hand-made — `ddev start` puts it back — so the rule
+        // must read the tool's mark, not just compose's.
+        let mut n = network("ddev_default", OLD);
+        n.labels.clear();
+        n.labels
+            .insert(crate::providers::DDEV_PLATFORM.into(), "ddev".into());
+        let rep = report(vec![attributed(n)]);
+        assert_eq!(classify_one(&rep, 0).tier, Tier::Free);
+    }
+
+    #[test]
+    fn a_hand_made_container_is_not_free() {
+        // An empty writable layer means no data is at stake, but `docker run
+        // --name dev-redis -p 6379:6379 …` exists only as this container.
+        // Removing it leaves `docker start dev-redis` with nothing to start.
+        let mut c = container("dev-redis", ContainerState::Exited, &[]);
+        c.labels.clear();
+        let rep = report(vec![attributed(c)]);
+        let v = classify_one(&rep, 0);
+        assert_ne!(v.tier, Tier::Free);
+        assert!(
+            v.because.contains("the command that created it"),
+            "{}",
+            v.because
+        );
+        // And the price is stated as the definition, not as bytes that were
+        // never at risk.
+        assert!(!v.because.contains("irreversible"));
+    }
+
+    #[test]
+    fn a_volume_nobody_could_count_is_never_free() {
+        // What the probe hands over when its walk stopped short — a volume of
+        // `uploads/2024/01/…`, whose files all sit below the depth the scan
+        // reaches. It arrives as Unrecognised, and Unrecognised is not a soft
+        // no.
+        let rep = report(vec![volume("wp_uploads", Some(ContentClass::Unrecognised), None)]);
+        let v = classify_one(&rep, 0);
+        assert_ne!(v.tier, Tier::Free);
+        assert_eq!(v.reversibility, Reversibility::Gone);
     }
 
     #[test]

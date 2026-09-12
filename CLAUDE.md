@@ -26,7 +26,7 @@ could be added without rework.
 | M8 known-gap cleanup — exclusive image sizes, measured writable layers, SIGINT, remote gate, size cache | done |
 
 ```
-cargo test --workspace                  # 306 tests
+cargo test --workspace                  # 315 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -432,7 +432,29 @@ All have regression tests — if you break one, a test will tell you.
     answer. Default no-op on the trait, so a client that cannot overlap is
     unaffected and the call sequence is identical either way — still exactly
     one `df`, still degrading to a warning on failure.
-48. **Liveness comes from the filesystem; the index only counts.**
+48. **A count of zero is not a proof of emptiness.** `classify` used to read
+    "no files found" as `ContentClass::Empty`, and the scan's native probe
+    walks **two levels** — so a volume of `uploads/2024/01/photo.jpg` reached
+    none of its files, counted none, and landed in the tier that deletes with
+    no confirmation and no vault copy. It now takes `Option<u64>`: `Some(n)`
+    only from a walk that reached the bottom of a directory it could actually
+    open, and `None` — a truncated walk, an unreadable directory, a container
+    probe whose image had no `find` — resolves to `Unrecognised`. The same
+    rule covers the listing: an empty `entries` means empty only when the
+    count agrees. Symlinks count as objects (never followed), because a volume
+    of nothing but links is not an empty one, and `PROBE_SCRIPT` counts
+    `! -type d` and emits *no* count line when `find` is missing, since
+    `find | wc -l` prints `0` either way.
+49. **"Recreated on next compose up" is a claim about a file that exists.**
+    It was asserted for every network and every container with an empty
+    writable layer. A `docker network create --subnet=…` and a hand-written
+    `docker run --name dev-redis …` carry no label: their definition lives in
+    the daemon and nowhere else, so removing them destroys it even though it
+    destroys no data. `recreated_by_config` requires compose's, ddev's or a
+    devcontainer's own mark; without one the price is `Gone` and the tier is
+    opt-in, with a reason that names the definition rather than warning about
+    bytes that were never at risk.
+50. **Liveness comes from the filesystem; the index only counts.**
     `project_absences` carries a row for every project with any history, and a
     project that is present reads `absent_scans = 0`. The path-recall branch
     read that stored number as the verdict, so every project whose path was
@@ -485,7 +507,9 @@ every volume the tool calls `free` must be both empty and unreferenced:
 ./target/debug/prune-juice --json | jq -r 'select(.event=="classified"
   and .tier=="free" and .kind=="volume") | .name' \
 | while read -r v; do
-    n=$(ls -A ~/OrbStack/docker/volumes/"$v" 2>/dev/null | wc -l)
+    # `find`, not `ls`: a top level of `uploads/` alone looks empty to a
+    # listing, and the whole point is that files live below it.
+    n=$(find ~/OrbStack/docker/volumes/"$v" ! -type d 2>/dev/null | head -1 | wc -l)
     [ "$n" -gt 0 ] && echo "NOT EMPTY: $v"
   done
 ```

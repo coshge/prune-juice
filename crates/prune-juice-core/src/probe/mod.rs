@@ -103,8 +103,12 @@ pub struct ContentReport {
     pub method: ProbeMethod,
     /// Top-level entries, capped for display.
     pub entries: Vec<String>,
+    /// Non-directory objects seen. A floor, not a total, whenever
+    /// [`Self::truncated`] is set — and `0` with `truncated` set means nobody
+    /// counted, which is not the same fact as "there are none".
     pub file_count: u64,
-    /// True when the walk hit its limit, so counts are a floor.
+    /// True when the walk stopped early — its depth cap, its entry cap, or a
+    /// counter that never ran — so counts are a floor.
     pub truncated: bool,
     pub bytes: Bytes,
     /// Newest mtime anywhere in the volume, unix seconds.
@@ -223,11 +227,15 @@ impl VolumeAccess {
 /// sampled, so `truncated` is set.
 pub fn from_raw(raw: &crate::docker::RawProbe) -> ContentReport {
     ContentReport {
+        // `None` is a probe image whose shell had no `find`: the script listed
+        // the top level and counted nothing. Passed through as "uncounted", so
+        // a volume nobody could count is never read as a volume holding
+        // nothing.
         class: classify(&raw.entries, raw.file_count),
         method: ProbeMethod::Container,
         entries: raw.entries.clone(),
-        file_count: raw.file_count,
-        truncated: raw.mtime_sampled,
+        file_count: raw.file_count.unwrap_or(0),
+        truncated: raw.mtime_sampled || raw.file_count.is_none(),
         // The daemon already told us the size; a probe container should not
         // walk 35 GB to recompute it.
         bytes: Bytes(0),
@@ -243,7 +251,11 @@ pub fn probe_dir(path: &Path) -> ContentReport {
 /// Classify a directory, descending at most `max_depth` levels.
 pub fn probe_dir_to_depth(path: &Path, max_depth: u32) -> ContentReport {
     let mut entries: Vec<String> = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(path) {
+    // A directory we could not open lists as empty, which is the one reading
+    // of "no entries" that must never reach `Empty`.
+    let listed = std::fs::read_dir(path);
+    let readable = listed.is_ok();
+    if let Ok(rd) = listed {
         for e in rd.flatten() {
             entries.push(e.file_name().to_string_lossy().into_owned());
             if entries.len() >= 256 {
@@ -259,13 +271,17 @@ pub fn probe_dir_to_depth(path: &Path, max_depth: u32) -> ContentReport {
     };
     walk.run(path, 0);
 
-    let class = classify(&entries, walk.files);
+    // A truncated walk counted part of a tree, so its zero is "I did not
+    // look", never "there is nothing there". The scan walks only two levels
+    // deep, and a volume whose files all sit below that — `uploads/2024/01/`,
+    // say — counts none of them.
+    let class = classify(&entries, (readable && !walk.truncated).then_some(walk.objects));
 
     ContentReport {
         class,
         method: ProbeMethod::Native,
         entries,
-        file_count: walk.files,
+        file_count: walk.objects,
         truncated: walk.truncated,
         bytes: Bytes(walk.bytes),
         newest_mtime: walk.newest,
@@ -274,7 +290,10 @@ pub fn probe_dir_to_depth(path: &Path, max_depth: u32) -> ContentReport {
 
 #[derive(Default)]
 struct Walk {
-    files: u64,
+    /// Non-directory objects seen — files and symlinks alike. A link is not
+    /// followed, but it is still something that exists only here, so a volume
+    /// holding nothing but links is not an empty one.
+    objects: u64,
     bytes: u64,
     newest: Option<i64>,
     truncated: bool,
@@ -304,12 +323,16 @@ impl Walk {
             // as a link, never followed out of the volume.
             let Ok(md) = entry.metadata() else { continue };
             if md.is_symlink() {
+                // Counted, never followed: walking it could report someone's
+                // home directory as volume contents, but pretending it is not
+                // there is how a volume of links reads as empty.
+                self.objects += 1;
                 continue;
             }
             if md.is_dir() {
                 self.run(&entry.path(), depth + 1);
             } else {
-                self.files += 1;
+                self.objects += 1;
                 self.bytes = self.bytes.saturating_add(md.len());
                 if let Ok(m) = md.modified() {
                     if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
@@ -326,9 +349,21 @@ impl Walk {
 ///
 /// Order matters: a database signature must win over anything else, because
 /// misreading a data directory as a cache is the failure that loses data.
-fn classify(entries: &[String], file_count: u64) -> ContentClass {
+///
+/// `objects` is `Some(n)` only when the whole tree was walked and `n` is
+/// therefore the true number of things in it. `None` means the count is a
+/// floor taken from an incomplete walk — and a floor of zero proves nothing,
+/// so it must never resolve to [`ContentClass::Empty`].
+fn classify(entries: &[String], objects: Option<u64>) -> ContentClass {
     if entries.is_empty() {
-        return ContentClass::Empty;
+        // An empty listing is only evidence of emptiness when the listing
+        // actually happened and the walk agrees. A directory that could not be
+        // opened, or one whose objects were never counted, lists exactly the
+        // same way.
+        return match objects {
+            Some(0) => ContentClass::Empty,
+            _ => ContentClass::Unrecognised,
+        };
     }
     let has = |n: &str| entries.iter().any(|e| e == n);
     let any_starting = |p: &str| entries.iter().any(|e| e.starts_with(p));
@@ -390,11 +425,14 @@ fn classify(entries: &[String], file_count: u64) -> ContentClass {
         return ContentClass::UserData;
     }
 
-    if file_count == 0 {
-        // Directories but no files anywhere. Nothing to lose.
+    if objects == Some(0) {
+        // Directories, walked to the bottom, and not one file under any of
+        // them. Nothing to lose.
         return ContentClass::Empty;
     }
 
+    // Either something is here, or nobody could count what is. Both are
+    // reasons to leave it alone: `Unknown` is not a soft `No`.
     ContentClass::Unrecognised
 }
 
@@ -557,16 +595,127 @@ mod tests {
     }
 
     #[test]
-    fn symlinks_are_not_followed_out_of_the_volume() {
-        // A link pointing at the wider filesystem must not be walked, or a
-        // probe could report someone's home directory as volume contents.
+    fn symlinks_are_counted_but_never_followed_out_of_the_volume() {
+        // Two rules at once. A link pointing at the wider filesystem must not
+        // be walked, or a probe could report someone's home directory as
+        // volume contents. But it must still be *counted*: a link is a thing
+        // that exists only here, and skipping it entirely is how a volume
+        // holding nothing but links reads as empty and reaches Tier 1.
         let d = tmp("link");
         touch(&d, "real");
         #[cfg(unix)]
         std::os::unix::fs::symlink("/etc", d.join("escape")).unwrap();
         let r = probe_dir(&d);
-        assert_eq!(r.file_count, 1, "only the real file counts");
+        #[cfg(unix)]
+        assert_eq!(r.file_count, 2, "the link counts as one object");
+        assert!(
+            r.bytes.get() < 10_000,
+            "nothing behind the link may be measured, only the file in the volume"
+        );
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_volume_of_nothing_but_symlinks_is_not_empty() {
+        let d = tmp("links-only");
+        std::os::unix::fs::symlink("/etc/hosts", d.join("a")).unwrap();
+        let r = probe_dir(&d);
+        assert_ne!(r.class, ContentClass::Empty);
+        assert!(!r.class.is_reconstructible());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn deep_contents_are_not_mistaken_for_an_empty_volume() {
+        // The regression. The scan walks two levels; a volume of uploads is
+        // `uploads/2024/01/photo.jpg`, so not one of its files is reached and
+        // the count comes back zero. Reading that zero as "empty" put a
+        // volume of someone's uploads in the tier that deletes with no
+        // confirmation and no vault copy. A count nobody could take is not a
+        // count of nothing.
+        let d = tmp("deep");
+        let year = mkdir(&mkdir(&d, "uploads"), "2024");
+        touch(&mkdir(&year, "01"), "photo.jpg");
+
+        let r = probe_dir_to_depth(&d, 2);
+        assert!(r.truncated, "the walk did stop short");
+        assert_eq!(r.file_count, 0, "and so counted nothing");
+        assert_eq!(
+            r.class,
+            ContentClass::Unrecognised,
+            "which must never read as empty"
+        );
+        assert!(!r.class.is_reconstructible());
+
+        // The same tree, walked to the bottom, is recognisably not empty.
+        assert_eq!(probe_dir(&d).class, ContentClass::Unrecognised);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_walk_that_reached_the_bottom_still_reports_empty() {
+        // The other half of the fix: emptiness that was actually proven must
+        // survive it, or the tool stops reclaiming the volumes it exists to
+        // reclaim. `ivy-mariadb` on the reference machine is exactly this —
+        // directories ddev created and never filled.
+        let d = tmp("hollow");
+        mkdir(&mkdir(&d, "a"), "b");
+        let r = probe_dir_to_depth(&d, 12);
+        assert!(!r.truncated);
+        assert_eq!(r.class, ContentClass::Empty);
+        assert!(r.class.is_reconstructible());
+        std::fs::remove_dir_all(&d).ok();
+
+        // And a volume with nothing in it at all, which is the commonest case.
+        let d = tmp("bare");
+        assert_eq!(probe_dir(&d).class, ContentClass::Empty);
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_that_cannot_be_read_is_not_an_empty_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("locked");
+        touch(&d, "secret");
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&d).is_err();
+        let r = probe_dir(&d);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).ok();
+        std::fs::remove_dir_all(&d).ok();
+
+        if unreadable {
+            // Running as root reads it anyway, and then there is nothing to
+            // assert; everywhere else, a listing that failed lists the same as
+            // an empty directory and must not be read as one.
+            assert_eq!(r.class, ContentClass::Unrecognised);
+        }
+    }
+
+    #[test]
+    fn a_probe_that_counted_nothing_is_not_a_probe_that_found_nothing() {
+        // The container path, where the count comes from `find` inside the
+        // probe image. An image whose shell has no `find` emits no count line
+        // at all, and `None` must not collapse to zero.
+        let uncounted = crate::docker::RawProbe {
+            entries: vec!["uploads".into()],
+            file_count: None,
+            newest_mtime: None,
+            mtime_sampled: true,
+        };
+        let r = from_raw(&uncounted);
+        assert_eq!(r.class, ContentClass::Unrecognised);
+        assert!(r.truncated, "an uncounted probe must admit it");
+
+        // A volume the script really did look at and find nothing in.
+        let empty = crate::docker::RawProbe {
+            entries: vec![],
+            file_count: Some(0),
+            newest_mtime: None,
+            mtime_sampled: true,
+        };
+        assert_eq!(from_raw(&empty).class, ContentClass::Empty);
     }
 
     #[test]
