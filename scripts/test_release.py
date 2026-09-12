@@ -1,4 +1,5 @@
 """Publication tests use a fake GitHub CLI; never access GitHub."""
+import base64
 import importlib.util
 import json
 import os
@@ -13,8 +14,10 @@ spec.loader.exec_module(release)
 
 
 def appcast(value):
+    signature = base64.b64encode(bytes(64)).decode()
     return (f'<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle">'
-            f'<channel><item><sparkle:version>{value}</sparkle:version></item></channel></rss>').encode()
+            f'<channel><item><sparkle:version>{value}</sparkle:version>'
+            f'<enclosure length="3" sparkle:edSignature="{signature}" /></item></channel></rss>').encode()
 
 
 class ReleaseTests(unittest.TestCase):
@@ -106,6 +109,21 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(self.assets["updates"]["update-manifest.json"], self.assets["v0.3.4"]["update-manifest.json"])
         self.assertNotIn("cli-v0.4.0", self.assets)
 
+    def test_empty_app_signature_stops_publication(self):
+        self.prepare("app", "0.4.0")
+        feed = self.root / "release/appcast.xml"
+        feed.write_bytes(feed.read_bytes().replace(base64.b64encode(bytes(64)), b""))
+        with self.assertRaisesRegex(ValueError, "signature"):
+            self.publish("app-v0.4.0")
+        self.assertNotIn("app-v0.4.0", self.assets)
+
+    def test_wrong_app_archive_size_stops_publication(self):
+        self.prepare("app", "0.4.0")
+        (self.root / "release/PruneJuice-0.4.0.zip").write_bytes(b"wrong size")
+        with self.assertRaisesRegex(ValueError, "size"):
+            self.publish("app-v0.4.0")
+        self.assertNotIn("app-v0.4.0", self.assets)
+
     def test_partial_channel_draft_is_reseeded_from_legacy_feeds(self):
         self.assets["updates"] = {}
         self.drafts.add("updates")
@@ -140,7 +158,7 @@ class ReleaseTests(unittest.TestCase):
         self.prepare("app", "0.4.0")
         self.publish("app-v0.4.0")
         self.publish("app-v0.4.0")
-        (self.root / "release/PruneJuice-0.4.0.zip").write_bytes(b"different")
+        (self.root / "release/PruneJuice-0.4.0.zip").write_bytes(b"bad")
         with self.assertRaisesRegex(ValueError, "already published"):
             self.publish("app-v0.4.0")
         self.assertEqual(self.assets["app-v0.4.0"]["PruneJuice-0.4.0.zip"], b"app")

@@ -280,7 +280,15 @@ jobs:
         with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/download-artifact@v8
-        with: { path: artifacts }
+        if: needs.verify.outputs.product == 'cli'
+        with:
+          pattern: cli-*
+          path: artifacts
+      - uses: actions/download-artifact@v8
+        if: needs.verify.outputs.product == 'app'
+        with:
+          name: app
+          path: artifacts/app
 
       - name: collect
         run: |
@@ -377,11 +385,13 @@ jobs:
           gh release download "$previous" --pattern appcast.xml --dir release
           mv release/appcast.xml release/previous-appcast.xml
           zip="$(ls release/PruneJuice-*.zip)"
+          signature="$(cat artifacts/app/ed-signature.txt)"
+          swift scripts/verify-app-signature.swift "$zip" artifacts/app/ed-signature.txt
           cargo run -q -p xtask -- appcast \
             --version "${{ steps.meta.outputs.version }}" \
             --zip "$zip" \
             --url "${{ steps.meta.outputs.base }}/$(basename "$zip")" \
-            --signature "$(cat artifacts/app/ed-signature.txt)" \
+            --signature "$signature" \
             --notes-url "${{ steps.meta.outputs.notes }}" \
             --previous release/previous-appcast.xml \
             --out release/appcast.xml

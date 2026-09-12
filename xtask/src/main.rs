@@ -149,12 +149,26 @@ fn entry(kind: &str, target: &str, path: &Path, base: &str) -> Result<serde_json
 
 // --- Sparkle's appcast ----------------------------------------------------
 
+fn validate_signature(signature: &str) -> Result<()> {
+    let body = signature.strip_suffix("==").unwrap_or("");
+    if body.len() != 86
+        || !body
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+        || !matches!(body.as_bytes().last(), Some(b'A' | b'Q' | b'g' | b'w'))
+    {
+        bail!("--signature must be a base64-encoded 64-byte Ed25519 signature");
+    }
+    Ok(())
+}
+
 fn appcast(args: &[String]) -> Result<()> {
     let args = parse(args)?;
     let version = one(&args, "version")?.trim_start_matches('v').to_string();
     let zip = PathBuf::from(one(&args, "zip")?);
     let url = one(&args, "url")?.to_string();
     let signature = one(&args, "signature")?.to_string();
+    validate_signature(&signature)?;
     let out = PathBuf::from(one(&args, "out")?);
     let notes = args.get("notes-url").and_then(|v| v.first()).cloned();
 
@@ -376,6 +390,15 @@ mod tests {
     #[test]
     fn urls_and_signatures_are_escaped_into_the_xml() {
         assert_eq!(escape("a&b<c>\"d\""), "a&amp;b&lt;c&gt;&quot;d&quot;");
+    }
+
+    #[test]
+    fn appcasts_refuse_empty_and_malformed_signatures() {
+        assert!(validate_signature("").is_err());
+        assert!(validate_signature("not a signature").is_err());
+        assert!(validate_signature(&"A".repeat(88)).is_err());
+        assert!(validate_signature(&format!("{}==", "A".repeat(86))).is_ok());
+        assert!(validate_signature(&format!("{}B==", "A".repeat(85))).is_err());
     }
 
     #[test]

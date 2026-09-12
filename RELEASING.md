@@ -182,6 +182,11 @@ optionally notarises, and publishes only the app and its appcast. Full Docker
 cleanup acceptance tests remain a separate check for engine changes; the
 compatibility gate is not a live Docker test.
 
+Before publishing an appcast, CI verifies the downloaded archive's signature
+against the public key inside that app. Missing signatures and incorrect archive
+sizes stop publication. The app artifact has an explicit download directory so
+its signature file is found even when it is the workflow's only artifact.
+
 App builds require Rust because they compile the source pin. They do not depend
 on another release job or download a floating latest CLI. Local `bundle.sh`
 and `install-local.sh` keep building the current working tree for development;

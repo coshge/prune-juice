@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Independent product metadata and publication. No third-party dependencies."""
+import base64
 import hashlib
 import json
 import os
@@ -79,6 +80,23 @@ def feed_version(product, directory):
     return max(values, key=version) if values else None
 
 
+def validate_appcast(directory, value):
+    namespace = "http://www.andymatuschak.org/xml-namespaces/sparkle"
+    items = [item for item in ET.parse(directory / "appcast.xml").findall("./channel/item")
+             if item.findtext("{" + namespace + "}version") == value]
+    if len(items) != 1:
+        raise ValueError("Appcast must contain exactly one item for this release")
+    enclosure = items[0].find("enclosure")
+    if enclosure is None:
+        raise ValueError("Appcast is missing its archive enclosure")
+    signature = enclosure.get("{" + namespace + "}edSignature", "")
+    if len(base64.b64decode(signature, validate=True)) != 64:
+        raise ValueError("Appcast is missing a valid 64-byte signature")
+    archive = directory / f"PruneJuice-{value}.zip"
+    if int(enclosure.get("length", "0")) != archive.stat().st_size:
+        raise ValueError("Appcast archive size does not match")
+
+
 def publish(tag):
     product, value = validate(tag)
     # The workflow serializes publication. Never promote an older release,
@@ -110,6 +128,8 @@ def publish(tag):
         files = artifacts + [ROOT / "release" / name for name in selected]
         if feed_version(product, ROOT / "release") != value:
             raise ValueError("Generated feed version does not match the release")
+        if product == "app":
+            validate_appcast(ROOT / "release", value)
         if existing and not existing["draft"]:
             # Published artifacts are immutable. A retry may only republish
             # byte-identical artifacts; use a new version for rebuilt binaries.
