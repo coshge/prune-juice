@@ -275,7 +275,10 @@ pub fn probe_dir_to_depth(path: &Path, max_depth: u32) -> ContentReport {
     // look", never "there is nothing there". The scan walks only two levels
     // deep, and a volume whose files all sit below that — `uploads/2024/01/`,
     // say — counts none of them.
-    let class = classify(&entries, (readable && !walk.truncated).then_some(walk.objects));
+    let class = classify(
+        &entries,
+        (readable && !walk.truncated).then_some(walk.objects),
+    );
 
     ContentReport {
         class,

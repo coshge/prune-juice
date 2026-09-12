@@ -771,10 +771,7 @@ fn ask_to_update() -> bool {
 fn accepted(read: Option<usize>, line: &str) -> bool {
     match read {
         None | Some(0) => false,
-        Some(_) => matches!(
-            line.trim().to_ascii_lowercase().as_str(),
-            "" | "y" | "yes"
-        ),
+        Some(_) => matches!(line.trim().to_ascii_lowercase().as_str(), "" | "y" | "yes"),
     }
 }
 
@@ -926,7 +923,6 @@ fn run(args: &Args) -> Result<i32, Error> {
             update: news,
         });
     }
-
 
     // One index for the whole run. A failure to open it degrades the scan
     // rather than stopping it: attribution gets worse, nothing gets unsafe.

@@ -770,7 +770,11 @@ mod tests {
         // `uploads/2024/01/…`, whose files all sit below the depth the scan
         // reaches. It arrives as Unrecognised, and Unrecognised is not a soft
         // no.
-        let rep = report(vec![volume("wp_uploads", Some(ContentClass::Unrecognised), None)]);
+        let rep = report(vec![volume(
+            "wp_uploads",
+            Some(ContentClass::Unrecognised),
+            None,
+        )]);
         let v = classify_one(&rep, 0);
         assert_ne!(v.tier, Tier::Free);
         assert_eq!(v.reversibility, Reversibility::Gone);
