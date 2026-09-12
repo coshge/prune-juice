@@ -26,7 +26,7 @@ could be added without rework.
 | M8 known-gap cleanup — exclusive image sizes, measured writable layers, SIGINT, remote gate, size cache | done |
 
 ```
-cargo test --workspace                  # 315 tests
+cargo test --workspace                  # 319 tests
 cargo clippy --workspace --all-targets  # must stay at 0 warnings
 cargo build -p prune-juice-cli
 ./target/debug/prune-juice              # interactive on a TTY; one-shot otherwise
@@ -466,7 +466,37 @@ All have regression tests — if you break one, a test will tell you.
     reached from the other direction). So: `liveness_of` first, and the stored
     count refines the answer only once the directory is actually missing.
 
+51. **A timestamp nobody read is not an old one.** `Walk` took mtimes from
+    files only, and the scan's walk stops at depth 2 — so a volume of
+    `node_modules/<pkg>/<file>`, the commonest shape there is, reached no file
+    and reported `newest_mtime: None`. The tier gate read that `None` as "not
+    written recently" and passed, which left `RECENT_WRITE_SECS` inert on the
+    native path for almost every real volume while the container path, whose
+    `find` reaches full depth, held the same volume back. Invariant 48's shape
+    exactly, applied to time instead of counts. Now every entry is timestamped,
+    directories included — a subtree the walk declines to enter still reports
+    when its own contents last changed — and `written_within` is tri-state:
+    `None` means nobody looked and drops the volume to the reviewed tier with
+    that as its reason, the same treatment an unmeasured writable layer gets.
+    `mtime_known` is what separates an empty tree, which legitimately has no
+    timestamps and is idle, from an unreadable one, which has none because it
+    was never read. A `Some(false)` from a truncated walk remains a floor:
+    a file edited in place below the cap changes no directory's mtime.
+
 ## The acceptance gate
+
+`./scripts/fixture-stack.sh up` builds a stack whose answers are known in
+advance, and `./scripts/acceptance-gate.sh` grades a scan against it. Both are
+runtime-agnostic — contents are written *through* a container and the emptiness
+check reads them back the same way — so the identical test runs on OrbStack and
+on Docker Desktop, which is what makes the two comparable. The `find
+~/OrbStack/docker/volumes` check below is the OrbStack-only shortcut; on a
+VM-backed daemon there is nothing there to read, and "no files found" is exactly
+the answer invariant 48 says must never be trusted.
+
+Note that nothing newer than `MIN_AGE_SECS` (24 h) can reach the safe tier, so
+fresh fixtures sit in quarantine and the gate reports them as skipped rather
+than failed. Re-run it a day later to convert those to real passes.
 
 Run `./target/debug/prune-juice --json` against a machine carrying real project
 stacks and read the `classified` events. The project names below are the

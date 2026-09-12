@@ -115,10 +115,43 @@ pub struct ContentReport {
     ///
     /// The strongest "precious" signal there is: bytes newer than the owning
     /// project's last commit mean work that exists nowhere else.
+    ///
+    /// A floor when [`Self::truncated`] is set: nothing *seen* was newer. Read
+    /// it through [`Self::written_within`], never directly, so that "did not
+    /// look" cannot be mistaken for "found nothing".
     pub newest_mtime: Option<i64>,
+    /// Whether any timestamp could be read at all.
+    ///
+    /// `false` is a directory that would not open, or a probe image whose
+    /// shell had no `find` — nobody looked. With `newest_mtime: None` that is
+    /// a different fact from an empty tree, which also has no timestamps, and
+    /// only the empty tree may pass an idleness check.
+    pub mtime_known: bool,
 }
 
 impl ContentReport {
+    /// Was anything here written within `window` seconds of `now_unix`?
+    ///
+    /// Tri-state, for the same reason `file_count` became an `Option` in
+    /// invariant 48: a walk that reached no timestamp reports `None`, and an
+    /// unknown must never satisfy a deletion predicate. The two `None` cases
+    /// look identical in `newest_mtime` and are not the same fact —
+    /// [`Self::mtime_known`] separates them.
+    ///
+    /// `Some(false)` from a truncated walk is a floor: nothing *observed* was
+    /// recent. Directory timestamps are observed even where the walk declines
+    /// to descend, so a subtree gaining or losing a file is still seen; a file
+    /// edited in place below the cap is not.
+    pub fn written_within(&self, now_unix: i64, window: i64) -> Option<bool> {
+        match self.newest_mtime {
+            Some(m) => Some(now_unix - m < window),
+            // No timestamp, but the walk did run: the tree is empty, and an
+            // empty tree is genuinely not being written to.
+            None if self.mtime_known => Some(false),
+            None => None,
+        }
+    }
+
     /// One citable line, for the evidence list a human reads.
     pub fn summary(&self) -> String {
         if self.entries.is_empty() {
@@ -240,6 +273,9 @@ pub fn from_raw(raw: &crate::docker::RawProbe) -> ContentReport {
         // walk 35 GB to recompute it.
         bytes: Bytes(0),
         newest_mtime: raw.newest_mtime,
+        // The same script emits the count and the timestamps. No count means
+        // it had no `find`, so it read neither — not that it found neither.
+        mtime_known: raw.file_count.is_some(),
     }
 }
 
@@ -288,6 +324,10 @@ pub fn probe_dir_to_depth(path: &Path, max_depth: u32) -> ContentReport {
         truncated: walk.truncated,
         bytes: Bytes(walk.bytes),
         newest_mtime: walk.newest,
+        // A directory that would not open yields no entries and no timestamps,
+        // which is exactly how an empty one looks. Only the second may be read
+        // as "nothing is writing here".
+        mtime_known: readable,
     }
 }
 
@@ -305,6 +345,15 @@ struct Walk {
 }
 
 impl Walk {
+    fn note_mtime(&mut self, md: &std::fs::Metadata) {
+        if let Ok(m) = md.modified() {
+            if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
+                let secs = d.as_secs() as i64;
+                self.newest = Some(self.newest.map_or(secs, |n: i64| n.max(secs)));
+            }
+        }
+    }
+
     fn run(&mut self, dir: &Path, depth: u32) {
         // Depth cap as well as an entry cap: a pathological tree should slow us
         // down at most once.
@@ -332,17 +381,18 @@ impl Walk {
                 self.objects += 1;
                 continue;
             }
+            // Timestamp *every* entry, directories included. The walk is
+            // depth-capped, so files below the cap are never seen — and taking
+            // mtimes from files alone left `newest` at `None` for the shape
+            // that dominates real volumes (`node_modules/<pkg>/<file>`), which
+            // silently disarmed the recent-write gate. A directory we decline
+            // to descend into still reports when its own entries last changed.
+            self.note_mtime(&md);
             if md.is_dir() {
                 self.run(&entry.path(), depth + 1);
             } else {
                 self.objects += 1;
                 self.bytes = self.bytes.saturating_add(md.len());
-                if let Ok(m) = md.modified() {
-                    if let Ok(d) = m.duration_since(std::time::UNIX_EPOCH) {
-                        let secs = d.as_secs() as i64;
-                        self.newest = Some(self.newest.map_or(secs, |n: i64| n.max(secs)));
-                    }
-                }
             }
         }
     }
@@ -582,6 +632,64 @@ mod tests {
             "not recognising something is not a reason to delete it"
         );
         std::fs::remove_dir_all(&d).ok();
+    }
+
+    #[test]
+    fn a_depth_capped_walk_still_times_the_subtree_it_refuses_to_enter() {
+        // `node_modules/<pkg>/<file>` is the shape that dominates real
+        // volumes, and every one of its files sits below the scan's depth cap.
+        // Taking mtimes from files alone left `newest` at None, and the tier
+        // gate reads None as "no recent write" — so the check that exists to
+        // catch an invisible referrer never fired for the commonest case.
+        let dir = std::env::temp_dir().join(format!("pj-mtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("node_modules/left-pad")).unwrap();
+        std::fs::write(dir.join("node_modules/left-pad/index.js"), b"x").unwrap();
+
+        let deep = probe_dir_to_depth(&dir, 2);
+        assert!(deep.truncated, "the cap should have been reached");
+        assert!(
+            deep.newest_mtime.is_some(),
+            "a directory it declined to enter is still a timestamp it can read"
+        );
+        assert_eq!(deep.written_within(now(), 24 * 3600), Some(true));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_unwalkable_directory_cannot_be_proven_idle() {
+        // The invariant-48 shape, applied to time instead of counts: an empty
+        // tree and a tree nobody could read both carry no timestamp, and only
+        // the first is evidence that nothing is writing there.
+        let empty = ContentReport {
+            class: ContentClass::Empty,
+            method: ProbeMethod::Native,
+            entries: vec![],
+            file_count: 0,
+            truncated: false,
+            bytes: Bytes(0),
+            newest_mtime: None,
+            mtime_known: true,
+        };
+        assert_eq!(empty.written_within(now(), 24 * 3600), Some(false));
+
+        let unread = ContentReport {
+            mtime_known: false,
+            ..empty
+        };
+        assert_eq!(
+            unread.written_within(now(), 24 * 3600),
+            None,
+            "nobody looked — that must not read as idle"
+        );
+    }
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
     }
 
     #[test]

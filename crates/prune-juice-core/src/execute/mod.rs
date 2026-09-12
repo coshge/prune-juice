@@ -1229,6 +1229,7 @@ mod tests {
             truncated: false,
             bytes: Bytes(4096),
             newest_mtime: Some(OLD),
+            mtime_known: true,
         });
         a
     }

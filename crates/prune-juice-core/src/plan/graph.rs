@@ -73,7 +73,9 @@ pub enum Opacity {
     SwarmActive,
     /// A daemon we did not reach over a local socket.
     RemoteDaemon(String),
-    /// A project root that could not be read — an unmounted disk, most likely.
+    /// A project's location could not be verified — an unmounted disk, most
+    /// likely. The payload is the *reason*, not a path: sometimes there is no
+    /// path at all, which is itself one of the reasons.
     UnreadableRoot(String),
     /// Image layer stacks were not fetched, so base-image relationships are
     /// unproven.
@@ -110,7 +112,12 @@ impl Opacity {
         match self {
             Opacity::SwarmActive => "swarm is active on this daemon".into(),
             Opacity::RemoteDaemon(e) => format!("daemon is not local ({e})"),
-            Opacity::UnreadableRoot(p) => format!("project root {p} could not be read"),
+            // The payload is a reason, not a path. Reading it as one produced
+            // "project root no path is recorded for this project could not be
+            // read" — a sentence that says nothing and looks like a crash.
+            Opacity::UnreadableRoot(reason) => {
+                format!("a project's location could not be verified: {reason}")
+            }
             Opacity::ImageLayersUnknown => {
                 "image layer stacks were not fetched, so base images are unproven".into()
             }
@@ -547,6 +554,22 @@ mod tests {
         let mut rs = ReadSet::new();
         let got = g.referenced(&rep.resources[0], &mut rs);
         assert!(got.is_unknown());
+    }
+
+    #[test]
+    fn an_unverifiable_location_describes_itself_as_a_reason() {
+        // The payload has never been a path. Formatting it as one produced
+        // "project root no path is recorded for this project could not be
+        // read", which reads like a string-interpolation bug because it was.
+        for reason in [
+            "no path is recorded for this project",
+            "/Volumes/Work is not readable",
+            "path has no parent",
+        ] {
+            let d = Opacity::UnreadableRoot(reason.into()).describe();
+            assert!(d.ends_with(reason), "{d}");
+            assert!(!d.contains("could not be read"), "{d}");
+        }
     }
 
     #[test]

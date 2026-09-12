@@ -494,18 +494,26 @@ fn destabilises(
         // Bytes written in the last day mean something is using this, whatever
         // the reference graph believes. An invisible referrer is still a
         // referrer.
-        if let Some(m) = c.newest_mtime {
-            let idle = now_unix - m;
-            rs.record(
-                &subject,
-                "written_recently",
-                (idle < RECENT_WRITE_SECS).to_string(),
-            );
-            if idle < RECENT_WRITE_SECS {
+        //
+        // Tri-state, and the third state blocks. `newest_mtime: None` used to
+        // skip this check entirely, and a depth-capped walk produced exactly
+        // that for any volume whose files sit below the cap — so the gate was
+        // inert for the commonest shape there is. Unknown is not a soft no.
+        match c.written_within(now_unix, RECENT_WRITE_SECS) {
+            Some(true) => {
+                rs.record(&subject, "written_recently", "true");
+                let idle = now_unix - c.newest_mtime.unwrap_or(now_unix);
                 return Some(format!(
                     "written {} hours ago — something is still using it",
                     idle.max(0) / 3600
                 ));
+            }
+            Some(false) => rs.record(&subject, "written_recently", "false"),
+            None => {
+                rs.record(&subject, "written_recently", "unknown");
+                return Some(
+                    "no timestamp in it could be read, so it cannot be proven idle".into(),
+                );
             }
         }
     }
@@ -805,6 +813,40 @@ mod tests {
     }
 
     #[test]
+    fn a_volume_whose_contents_could_not_be_timed_is_never_free() {
+        // Companion to invariant 48. A reconstructible class plus a passed age
+        // gate used to be enough whenever `newest_mtime` was None — and None
+        // is what an unreadable tree produces, not just an idle one. The
+        // volume drops to the reviewed tier, exactly as an unmeasured writable
+        // layer does for a container.
+        let mut a = volume(
+            "untimed",
+            Some(ContentClass::Derivative("node_modules".into())),
+            None,
+        );
+        a.content.as_mut().unwrap().mtime_known = false;
+        let rep = report(vec![a]);
+        let got = classify_one(&rep, 0);
+        assert_ne!(got.tier, Tier::Free);
+        assert!(
+            got.because.contains("cannot be proven idle"),
+            "{}",
+            got.because
+        );
+
+        // The same volume, walked: an empty-of-timestamps but readable tree is
+        // genuinely idle and still reaches the safe tier.
+        let b = volume(
+            "timed",
+            Some(ContentClass::Derivative("node_modules".into())),
+            None,
+        );
+        assert!(b.content.as_ref().unwrap().mtime_known);
+        let got = classify_one(&report(vec![b]), 0);
+        assert_eq!(got.tier, Tier::Free, "{}", got.because);
+    }
+
+    #[test]
     fn no_volume_is_ever_free_without_a_content_probe() {
         // `docker run postgres` with no -v yields exactly this shape:
         // unreferenced, unlabelled, and holding a real database.
@@ -828,6 +870,9 @@ mod tests {
             truncated: false,
             bytes: Bytes(0),
             newest_mtime: mtime,
+            // These fixtures stand for walks that ran. The "nobody looked"
+            // case has its own test.
+            mtime_known: true,
         });
         a
     }
