@@ -93,4 +93,4 @@ jobs:
           test -x "dist/Prune Juice.app"/Contents/MacOS/prune-juice
           test -d "dist/Prune Juice.app"/Contents/Frameworks/Sparkle.framework
           test -f "dist/Prune Juice.app"/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate
-          codesign --verify --strict --verbose=2 "dist/Prune Juice.app"
+          codesign --verify --deep --strict --verbose=2 "dist/Prune Juice.app"

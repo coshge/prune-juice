@@ -114,8 +114,18 @@ say "helper: $(lipo -archs "$APP/Contents/MacOS/prune-juice") ($FROM)"
 # --- the app --------------------------------------------------------------
 say "building the app"
 cd "$HERE"
-swift build -c release >/dev/null
-cp "$(swift build -c release --show-bin-path)/PruneJuice" "$APP/Contents/MacOS/PruneJuice"
+if [ "${REQUIRE_PINNED_HELPER:-0}" = 1 ]; then
+  swift build -c release --arch arm64 --arch x86_64 >/dev/null
+  SWIFT_BIN="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
+else
+  swift build -c release >/dev/null
+  SWIFT_BIN="$(swift build -c release --show-bin-path)"
+fi
+cp "$SWIFT_BIN/PruneJuice" "$APP/Contents/MacOS/PruneJuice"
+if [ "${REQUIRE_PINNED_HELPER:-0}" = 1 ]; then
+  lipo "$APP/Contents/MacOS/PruneJuice" -verify_arch arm64 x86_64
+  lipo "$APP/Contents/MacOS/prune-juice" -verify_arch arm64 x86_64
+fi
 
 # --- Sparkle --------------------------------------------------------------
 #
@@ -135,11 +145,8 @@ mkdir -p "$APP/Contents/Frameworks"
 # the top-level aliases), and flattening it breaks both dyld and signing.
 ditto "$SPARKLE_SRC" "$APP/Contents/Frameworks/Sparkle.framework"
 
-# XPCServices exist so a *sandboxed* app can download and install through a
-# separate process. This app cannot be sandboxed — the helper needs the Docker
-# socket — so they are dead weight, and two fewer nested binaries to sign is
-# two fewer ways for signing to go wrong.
-rm -rf "$APP/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices"
+# Keep the complete framework: removing even unused XPC services invalidates
+# Sparkle's vendor signature, which seals those nested programs.
 
 # --- the icon -------------------------------------------------------------
 #
@@ -248,6 +255,10 @@ if [ -n "${SIGN_ID:-}" ]; then
     --sign "$SIGN_ID" "$SPARKLE/Versions/B/Autoupdate"
   codesign --force --options runtime --timestamp \
     --sign "$SIGN_ID" "$SPARKLE/Versions/B/Updater.app"
+  codesign --force --options runtime --timestamp --preserve-metadata=entitlements \
+    --sign "$SIGN_ID" "$SPARKLE/Versions/B/XPCServices/Installer.xpc"
+  codesign --force --options runtime --timestamp --preserve-metadata=entitlements \
+    --sign "$SIGN_ID" "$SPARKLE/Versions/B/XPCServices/Downloader.xpc"
   codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$SPARKLE"
   codesign --force --options runtime --timestamp \
     --sign "$SIGN_ID" "$APP/Contents/MacOS/prune-juice"
@@ -264,7 +275,7 @@ else
   say "no SIGN_ID set — ad-hoc signing (needs Gatekeeper approval elsewhere)"
   codesign --force --sign - "$APP/Contents/MacOS/prune-juice"
   codesign --force --sign - "$APP"
-  codesign --verify --strict --verbose=2 "$APP"
+  codesign --verify --deep --strict --verbose=2 "$APP"
 fi
 
 # --- notarisation ---------------------------------------------------------

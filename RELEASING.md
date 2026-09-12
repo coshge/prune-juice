@@ -186,6 +186,8 @@ Before publishing an appcast, CI verifies the downloaded archive's signature
 against the public key inside that app. Missing signatures and incorrect archive
 sizes stop publication. The app artifact has an explicit download directory so
 its signature file is found even when it is the workflow's only artifact.
+The downloaded archive is also unpacked and checked for valid nested code
+signatures and both Mac architectures in the app and helper executables.
 
 App builds require Rust because they compile the source pin. They do not depend
 on another release job or download a floating latest CLI. Local `bundle.sh`

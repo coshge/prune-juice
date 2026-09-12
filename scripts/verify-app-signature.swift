@@ -33,3 +33,27 @@ guard key.isValidSignature(signature, for: archive) else {
     fatalError("Archive signature does not match the app's public key")
 }
 print("App archive signature verified against its bundled public key")
+
+func run(_ executable: String, _ arguments: [String]) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: executable)
+    process.arguments = arguments
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        fatalError("Archive validation failed: \(executable)")
+    }
+}
+
+let temporary = FileManager.default.temporaryDirectory
+    .appendingPathComponent("prune-juice-archive-\(UUID().uuidString)")
+try FileManager.default.createDirectory(at: temporary, withIntermediateDirectories: false)
+defer { try? FileManager.default.removeItem(at: temporary) }
+try run("/usr/bin/ditto", ["-x", "-k", archiveURL.path, temporary.path])
+let app = temporary.appendingPathComponent("Prune Juice.app")
+try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+for executable in ["PruneJuice", "prune-juice"] {
+    try run("/usr/bin/lipo", [app.appendingPathComponent("Contents/MacOS/\(executable)").path,
+                             "-verify_arch", "arm64", "x86_64"])
+}
+print("Downloaded app has valid nested signatures and both Mac architectures")
