@@ -137,12 +137,19 @@ The workflow then:
 2. **cli** — four targets (Apple silicon and Intel macOS, x86-64 and arm64
    Linux), each with the minisign public key compiled in.
 3. **app** — the bundle, its Sparkle framework, the CLI helper inside it, and
-   the update archive, signed with the EdDSA key.
+   the update archive, signed with the EdDSA key. It waits for **cli** and
+   takes the two macOS binaries from it rather than building its own: the
+   helper then comes from the same compilation as the published CLI archive,
+   and the job stops spending four and a half minutes repeating a build
+   happening beside it.
 4. **publish** — generates and signs `update-manifest.json`, merges the new
-   item into `appcast.xml`, uploads everything, and then **checks that a
-   freshly built binary can read and verify the release it just published**.
-   That last step is the one worth watching: it is the only thing that
-   exercises the real URL, over the real network, with real verification.
+   item into `appcast.xml`, uploads everything, and then **checks that the
+   binary it just published can read and verify that release**. That last step
+   is the one worth watching: it is the only thing that exercises the real URL,
+   over the real network, with real verification. It unpacks the archive that
+   was uploaded rather than rebuilding from source — a rebuild tests a binary
+   nobody will ever run — and retries for up to a minute, because
+   `gh release upload` returns before the asset is reliably servable.
 
 To re-run against an existing tag, use the workflow's manual trigger and give
 it the tag name.

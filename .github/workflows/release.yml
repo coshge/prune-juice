@@ -28,7 +28,15 @@ jobs:
         with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
       - uses: dtolnay/rust-toolchain@stable
         with: { components: clippy }
+      # save-if is off in every job here, and the reason is worth writing down
+      # rather than rediscovering: GitHub scopes a cache to the ref that wrote
+      # it, a tag gets its own scope, and `ci.yml`'s caches carry a different
+      # job-id key — so every release job reports "No cache found", and the
+      # cache it then spends 5-20s writing can never be read by anything. This
+      # restores one if a matching one ever exists, and stops paying to store
+      # one that cannot.
       - uses: Swatinem/rust-cache@v2
+        with: { save-if: "false" }
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: swift test
@@ -63,7 +71,9 @@ jobs:
         with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
       - uses: dtolnay/rust-toolchain@stable
         with: { targets: "${{ matrix.target }}" }
+      # Never written; see the note in `verify`.
       - uses: Swatinem/rust-cache@v2
+        with: { save-if: "false" }
 
       # The public key is compiled in here and nowhere else, so a release
       # without it would ship binaries that can never be updated. Checked
@@ -103,7 +113,14 @@ jobs:
   # The app archive Sparkle downloads: the whole bundle, helper included, so
   # the two can never end up on different versions.
   app:
-    needs: verify
+    # The cli jobs rather than `verify` directly: this job used to spend 4m26
+    # of its 5m46 building the two macOS CLI binaries that those jobs are
+    # building at the same moment, from the same commit. It now waits for them
+    # and takes theirs. Slower to start, much faster to finish, and the helper
+    # inside the app now comes from the same compilation as the published CLI
+    # archive rather than a second build that merely ought to match it. The
+    # bundle re-signs it, so the bytes are not identical — the compilation is.
+    needs: cli
     runs-on: macos-15
     env:
       # Mapped here so the steps below can branch on presence. `secrets` is
@@ -113,9 +130,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with: { ref: "${{ github.event.inputs.tag || github.ref }}" }
-      - uses: dtolnay/rust-toolchain@stable
-        with: { targets: "aarch64-apple-darwin,x86_64-apple-darwin" }
-      - uses: Swatinem/rust-cache@v2
+      # No Rust toolchain and no cargo cache: nothing is compiled here any
+      # more. `swift build` and the icon script are all this job builds.
+
+      # The two macOS archives the cli jobs just produced. The executable bit
+      # does not survive upload-artifact, which is why these travel as the
+      # .tar.gz that is about to be published rather than as bare binaries:
+      # the mode lives inside the archive.
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*-apple-darwin
+          path: helpers
+      - name: unpack the helper binaries
+        run: |
+          for arch in aarch64 x86_64; do
+            mkdir -p "helpers/$arch"
+            # A glob expanded through the argument list, not `ls`: one archive
+            # per target directory, and no filename parsing.
+            set -- helpers/cli-$arch-apple-darwin/*.tar.gz
+            [ -f "$1" ] || { echo "no cli archive for $arch-apple-darwin" >&2; exit 1; }
+            tar xzf "$1" -C "helpers/$arch"
+            test -x "helpers/$arch/prune-juice"
+          done
 
       - name: import the Developer ID certificate
         # Optional, and absent today. Without it the bundle is ad-hoc signed:
@@ -144,6 +180,9 @@ jobs:
           SPARKLE_PUBLIC_KEY: ${{ secrets.SPARKLE_PUBLIC_KEY }}
           SIGN_ID: ${{ secrets.MACOS_SIGN_ID }}
           NOTARY_PROFILE: ""
+          # Absolute: bundle.sh changes directory more than once.
+          HELPER_AARCH64: ${{ github.workspace }}/helpers/aarch64/prune-juice
+          HELPER_X86_64: ${{ github.workspace }}/helpers/x86_64/prune-juice
         run: |
           if [ -z "$SPARKLE_PUBLIC_KEY" ]; then
             echo "SPARKLE_PUBLIC_KEY is not set." >&2
@@ -371,16 +410,43 @@ jobs:
       # Proves the thing that actually matters: an installed copy can find and
       # verify this release at the URL it will really use. Runs after the
       # upload, because there is nothing to find before it.
+      #
+      # The binary under test is unpacked from the archive that was just
+      # published, not rebuilt from the same source. A rebuild tests a binary
+      # nobody will ever run, and it tests this step's environment rather than
+      # the artifact: the public key comes from the archive's own build, so if
+      # the wrong key were compiled in, only this reads it back. The runner is
+      # arm64, so it is the aarch64-apple-darwin archive that gets exercised —
+      # the one most people download.
       - name: an installed copy can see this release
-        env:
-          PRUNE_JUICE_UPDATE_PUBKEY: ${{ secrets.MINISIGN_PUBLIC_KEY }}
         run: |
-          cargo build --release --locked -p prune-juice-cli
-          set +e
-          ./target/release/prune-juice --check-update
-          code=$?
-          set -e
-          # 0 means "you are the newest", which is the correct answer for a
-          # binary built from the tag being released. 5 would mean the feed
-          # could not be read or verified.
-          [ "$code" = 0 ] || { echo "the published release is not readable (exit $code)"; exit 1; }
+          version="${{ steps.meta.outputs.version }}"
+          tar xzf "release/prune-juice-$version-aarch64-apple-darwin.tar.gz" -C /tmp
+          /tmp/prune-juice --version
+
+          # `gh release upload` returns before the asset is reliably servable
+          # through releases/latest/download. The rebuild this step used to do
+          # was an accidental two-minute sleep that hid that race; with it gone
+          # the wait has to be deliberate, so it is bounded and says what it is
+          # waiting for. `--check-update` always refetches — it is the forced
+          # refresh, never the cached answer — so a retry is a real second
+          # look and not the first one replayed.
+          code=0
+          for attempt in $(seq 1 12); do
+            set +e
+            /tmp/prune-juice --check-update
+            code=$?
+            set -e
+            # 0 means "you are the newest", which is the correct answer for the
+            # binary built from the tag being released. 5 means the feed could
+            # not be read or verified, which is also what a release that has
+            # not finished appearing looks like. 1 would mean the feed names a
+            # version newer than the one just built, which no amount of waiting
+            # fixes — so it is not retried.
+            [ "$code" = 0 ] && { echo "verified on attempt $attempt"; exit 0; }
+            [ "$code" = 5 ] || break
+            echo "attempt $attempt: the feed is not readable yet; waiting"
+            sleep 5
+          done
+          echo "the published release is not readable (exit $code)" >&2
+          exit 1

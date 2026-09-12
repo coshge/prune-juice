@@ -2,8 +2,12 @@
 #
 # Assemble "Prune Juice.app".
 #
-# Runs identically here and in CI, so the release is one reproducible command
-# rather than a sequence someone remembers.
+# Runs here and in CI, so the release is one reproducible command rather than a
+# sequence someone remembers. The single difference is where the CLI helper
+# comes from: locally it is built, and the release workflow hands over the
+# binaries it has already built as the published archives (HELPER_* below).
+# Everything after the helper — the bundle, Sparkle, the icon, the plist, the
+# signing order — is the same code on both paths.
 #
 #   ./scripts/bundle.sh                 # ad-hoc signed, runs locally
 #   SPARKLE_PUBLIC_KEY=… ./scripts/bundle.sh          # with updates enabled
@@ -17,6 +21,16 @@
 #   UPDATE_FEED_URL     override the appcast URL (a staging feed).
 #   SIGN_ID             Developer ID Application identity, when there is one.
 #   NOTARY_PROFILE      notarytool keychain profile, for --notarize.
+#   HELPER_AARCH64      a prebuilt `prune-juice` to use as the helper instead
+#   HELPER_X86_64       of building one. Set by the release workflow, which
+#                       has already built exactly these two binaries as the
+#                       archives it is about to publish — so the helper comes
+#                       from the *same compilation* as the released CLI rather
+#                       than a second build of the same source that merely
+#                       ought to agree with it. Not the same bytes: signing
+#                       below rewrites the binary, and lipo rewrites it again.
+#                       Either may be set alone; a path that does not exist is
+#                       an error, not a fallback.
 set -euo pipefail
 
 # rustup installs outside the default PATH for a non-login shell.
@@ -45,29 +59,47 @@ rm -rf "$OUT"
 mkdir -p "$APP/Contents/MacOS"
 
 # --- the helper -----------------------------------------------------------
-#
-# Universal where both targets are installed, so one bundle runs on Apple
-# silicon and Intel. A single-arch build is not an error, just narrower.
-say "building the helper"
 cd "$REPO"
 ARCHS=()
-for t in aarch64-apple-darwin x86_64-apple-darwin; do
-  if rustup target list --installed 2>/dev/null | grep -qx "$t"; then
-    cargo build --release -p prune-juice-cli --target "$t" >/dev/null
-    ARCHS+=("target/$t/release/prune-juice")
-  fi
-done
+if [ -n "${HELPER_AARCH64:-}${HELPER_X86_64:-}" ]; then
+  # Supplied rather than built. Nothing is compiled on this path, so the
+  # helper cannot drift from the CLI archive it was taken from.
+  say "taking the helper from prebuilt binaries"
+  FROM="supplied"
+  for p in "${HELPER_AARCH64:-}" "${HELPER_X86_64:-}"; do
+    [ -n "$p" ] || continue
+    [ -f "$p" ] || { echo "error: no helper binary at $p" >&2; exit 1; }
+    ARCHS+=("$p")
+  done
+else
+  say "building the helper"
+  FROM="built here"
+  # Universal where both targets are installed, so one bundle runs on Apple
+  # silicon and Intel. A single-arch build is not an error, just narrower.
+  for t in aarch64-apple-darwin x86_64-apple-darwin; do
+    if rustup target list --installed 2>/dev/null | grep -qx "$t"; then
+      cargo build --release -p prune-juice-cli --target "$t" >/dev/null
+      ARCHS+=("target/$t/release/prune-juice")
+    fi
+  done
+fi
 if [ "${#ARCHS[@]}" -eq 0 ]; then
   cargo build --release -p prune-juice-cli >/dev/null
   cp target/release/prune-juice "$APP/Contents/MacOS/prune-juice"
-  say "helper: host architecture only"
 elif [ "${#ARCHS[@]}" -eq 1 ]; then
   cp "${ARCHS[0]}" "$APP/Contents/MacOS/prune-juice"
-  say "helper: $(basename "$(dirname "$(dirname "${ARCHS[0]}")")")"
 else
   lipo -create -output "$APP/Contents/MacOS/prune-juice" "${ARCHS[@]}"
-  say "helper: universal"
 fi
+# An artifact that has been through upload-artifact has lost its mode bits;
+# one inside a tarball has not. Asserted here rather than relying on which
+# route it took, because the failure is a shipped app that cannot spawn its
+# own helper.
+chmod +x "$APP/Contents/MacOS/prune-juice"
+# Read back off the binary rather than inferred from which branch ran: what
+# matters is what the bundle now contains, and on the supplied path there is
+# no target directory whose name could stand in for it.
+say "helper: $(lipo -archs "$APP/Contents/MacOS/prune-juice") ($FROM)"
 
 # --- the app --------------------------------------------------------------
 say "building the app"
